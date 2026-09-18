@@ -1,0 +1,58 @@
+services:
+  # Self-hosted Telegram Bot API server.
+  # This is what lets CandyDownloader send/receive files up to 2GB
+  # instead of the 50MB limit imposed by the public api.telegram.org.
+  telegram-bot-api:
+    image: aiogram/telegram-bot-api:latest
+    container_name: candy_bot_api
+    restart: unless-stopped
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
+      TELEGRAM_LOCAL: 1
+    volumes:
+      - bot_api_data:/var/lib/telegram-bot-api
+    ports:
+      - "127.0.0.1:8081:8081"
+    # No healthcheck here on purpose: this image is Alpine-based with only
+    # openssl/libstdc++ installed - no wget/curl/nc/bash available to run
+    # one. Instead, the bot itself retries on startup until this server
+    # actually answers (see bot/main.py wait_for_local_api()), which is
+    # more reliable than depending on container tooling anyway.
+
+  # PO Token provider - generates the "proof of origin" token YouTube now
+  # sometimes demands, without needing any account login/cookies. This is
+  # the primary fix for "Sign in to confirm you're not a bot" errors.
+  bgutil-provider:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    container_name: candy_pot_provider
+    restart: unless-stopped
+    # internal-only, no need to expose to the host
+
+  # CandyDownloader bot itself.
+  bot:
+    build: ./bot
+    container_name: candy_bot
+    restart: unless-stopped
+    depends_on:
+      - telegram-bot-api
+      - bgutil-provider
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      LOCAL_BOT_API_URL: http://telegram-bot-api:8081
+      BGUTIL_POT_URL: http://bgutil-provider:4416
+      ADMIN_USER_IDS: ${ADMIN_USER_IDS}
+      OWNER_USER_ID: ${OWNER_USER_ID}
+      OWNER_NAME: ${OWNER_NAME:-Candy}
+      OWNER_EMOJI: ${OWNER_EMOJI:-🍬}
+      AUTO_UPDATE_HOUR_UTC: ${AUTO_UPDATE_HOUR_UTC:-4}
+      MAX_CONCURRENT_DOWNLOADS: ${MAX_CONCURRENT_DOWNLOADS:-2}
+    volumes:
+      - ./data:/app/data           # per-user settings, small persistent DB
+      - ./tmp:/app/tmp             # scratch space for in-progress downloads (auto-cleaned)
+      - ./cookies:/app/cookies     # optional per-user cookie files for logged-in sites
+    # Bot process needs write access to a shared tmp dir with the bot-api
+    # server ONLY if you want local-mode fast file uploads (optional, see README).
+
+volumes:
+  bot_api_data:
