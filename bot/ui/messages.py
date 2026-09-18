@@ -4,10 +4,10 @@ WELCOME = f"{OWNER_EMOJI} <b>{OWNER_NAME}'s Downloader</b>\n\n→ Send me a link
 
 PICK_OPTION = "What do you want?"
 QUEUED = f"{OWNER_EMOJI} Queued"
-UPLOADING = "→ Sending..."
+UPLOADING = "Sending…"
 CANCELLED = "✕ Cancelled"
 NOTHING_TO_CANCEL = "Nothing running for you right now."
-PROBING = "… Checking link"
+PROBING = "Checking link…"
 
 PRIVATE_BOT = f"• This is {OWNER_NAME}'s private bot. Ask her to add you."
 
@@ -21,6 +21,20 @@ def with_link(text: str, url: str) -> str:
 
 def join_required(channel: str) -> str:
     return f"→ Join {channel} first to use this bot."
+
+
+def preview_failed_note(error: str) -> str:
+    """Shown when we couldn't fetch a title/thumbnail/quality preview.
+    Distinguishes a login-wall (common, worth explaining) from a plain
+    unknown hiccup, and always offers to try anyway rather than dead-ending."""
+    low = (error or "").lower()
+    if any(marker in low for marker in ("sign in", "cookies", "log in", "login", "logged-in")):
+        return (
+            "Couldn't load a preview — this needs a login to even check. "
+            "You can still try downloading, but it may fail too. "
+            "/cookies fixes this properly."
+        )
+    return "Couldn't load a preview for this link, but you can still try downloading it."
 
 
 def unsupported_link() -> str:

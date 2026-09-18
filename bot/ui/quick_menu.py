@@ -38,7 +38,7 @@ def video_menu(probe: ProbeResult) -> InlineKeyboardMarkup:
         ])
 
     # room to grow: more resolutions, formats, etc. live behind this
-    rows.append([InlineKeyboardButton("… More options", callback_data="dl|moreq")])
+    rows.append([InlineKeyboardButton("More options…", callback_data="dl|moreq")])
     rows.append(cancel_row())
     return InlineKeyboardMarkup(rows)
 

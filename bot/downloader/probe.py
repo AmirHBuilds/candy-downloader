@@ -23,12 +23,14 @@ class ProbeResult:
     heights: list[int] = field(default_factory=list)   # available video heights, descending
     has_audio: bool = True                              # any audio-bearing format at all
     is_playlist: bool = False
+    error: str = ""                                     # populated when ok=False, for a better user message
 
 
 async def probe(url: str) -> ProbeResult:
     """Fast, download-free metadata lookup. Any failure just returns
-    ok=False so the caller can fall back to a generic menu instead of
-    crashing the whole flow over a probe hiccup."""
+    ok=False (with the error message attached) so the caller can fall
+    back to a generic menu instead of crashing the whole flow over a
+    probe hiccup."""
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -48,7 +50,7 @@ async def probe(url: str) -> ProbeResult:
         info = await asyncio.wait_for(loop.run_in_executor(None, run), timeout=15)
     except Exception as exc:  # noqa: BLE001
         log.info("Probe failed for %s: %s", url, exc)
-        return ProbeResult(ok=False)
+        return ProbeResult(ok=False, error=str(exc).strip().splitlines()[0][:200] if str(exc).strip() else "")
 
     if not info:
         return ProbeResult(ok=False)

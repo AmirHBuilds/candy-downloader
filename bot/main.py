@@ -156,7 +156,7 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def update_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id not in config.ADMIN_USER_IDS:
         return
-    msg = await update.message.reply_text("… Checking for tool updates")
+    msg = await update.message.reply_text("Checking for tool updates…")
     summary = await run_update_once(context.bot, notify_admins=False)
     await msg.edit_text(summary, parse_mode=ParseMode.HTML)
 
@@ -165,7 +165,7 @@ async def potcheck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if update.effective_user.id not in config.ADMIN_USER_IDS:
         return
     test_url = context.args[0] if context.args else "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-    msg = await update.message.reply_text("… Checking PO Token provider status")
+    msg = await update.message.reply_text("Checking PO Token provider status…")
 
     cmd = ["yt-dlp", "-v", "--simulate", "--no-warnings"]
     if config.BGUTIL_POT_URL:
@@ -506,10 +506,12 @@ async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await status_msg.edit_text(caption, parse_mode=ParseMode.HTML, reply_markup=markup)
         return
 
-    caption = messages.with_link(messages.PICK_OPTION, url)
     if order[0] != "ytdlp":
+        caption = messages.with_link(messages.PICK_OPTION, url)
         await status_msg.edit_text(caption, parse_mode=ParseMode.HTML, reply_markup=simple_menu())
     else:
+        note = messages.preview_failed_note(probe_result.error if probe_result else "")
+        caption = messages.with_link(note, url)
         await status_msg.edit_text(caption, parse_mode=ParseMode.HTML, reply_markup=fallback_menu())
 
 
@@ -577,7 +579,7 @@ async def link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         except Exception:  # noqa: BLE001
             pass
         status_msg = await context.bot.send_message(
-            query.message.chat_id, messages.with_link("→ Re-fetching as a file...", url),
+            query.message.chat_id, messages.with_link("Re-fetching as a file…", url),
             parse_mode=ParseMode.HTML,
         )
         await job_manager.enqueue(

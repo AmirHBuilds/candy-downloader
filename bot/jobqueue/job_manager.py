@@ -166,7 +166,7 @@ class JobManager:
         last_percent = -100.0
 
         await self._safe_edit(
-            job, messages.with_link("→ Preparing your download...", job.url), markup=QUEUED_MARKUP,
+            job, messages.with_link("Preparing your download…", job.url), markup=QUEUED_MARKUP,
         )
 
         def progress_cb(tool_name: str, percent: float, speed: str | None, eta: str | None) -> None:
@@ -190,12 +190,11 @@ class JobManager:
             await self._send_files(job, files)
 
     async def _send_files(self, job: Job, files: list[Path]) -> None:
-        sent_video = False
         for f in files:
-            caption = messages.all_done_caption(f.stem[:100])
             suffix = f.suffix.lower()
 
             if job.force_document:
+                caption = messages.all_done_caption(f.stem[:100]) + "\n\nOriginal file — not re-compressed."
                 with open(f, "rb") as fh:
                     input_file = InputFile(fh, filename=f.name)
                     await self.bot.send_document(job.chat_id, input_file, caption=caption,
@@ -203,13 +202,17 @@ class JobManager:
                                                   read_timeout=180, write_timeout=180, connect_timeout=60)
                 continue
 
+            caption = messages.all_done_caption(f.stem[:100])
             with open(f, "rb") as fh:
                 input_file = InputFile(fh, filename=f.name)
                 if suffix in {".mp4", ".mkv", ".mov", ".webm"}:
-                    await self.bot.send_video(job.chat_id, input_file, caption=caption,
+                    # Attach the "send as file" offer right on this same
+                    # message - no separate follow-up message needed.
+                    video_caption = caption + "\n\nWant the original file instead of this compressed preview?"
+                    await self.bot.send_video(job.chat_id, input_file, caption=video_caption,
                                                parse_mode=ParseMode.HTML, supports_streaming=True,
+                                               reply_markup=send_as_file_menu(),
                                                read_timeout=120, write_timeout=120, connect_timeout=60)
-                    sent_video = True
                 elif suffix in {".mp3", ".m4a", ".opus", ".flac", ".wav"}:
                     await self.bot.send_audio(job.chat_id, input_file, caption=caption,
                                                parse_mode=ParseMode.HTML,
@@ -225,17 +228,6 @@ class JobManager:
             await self.bot.delete_message(job.chat_id, job.status_message_id)
         except TelegramError:
             pass
-
-        if sent_video and not job.force_document:
-            # Telegram re-encodes/compresses video previews - offer the
-            # original file untouched, in case that's what they actually want.
-            try:
-                await self.bot.send_message(
-                    job.chat_id, "Want the original file instead of the compressed preview?",
-                    reply_markup=send_as_file_menu(),
-                )
-            except TelegramError:
-                pass
 
     async def _safe_edit(self, job: Job, text: str, markup: InlineKeyboardMarkup | None = None,
                           clear_markup: bool = False) -> None:
