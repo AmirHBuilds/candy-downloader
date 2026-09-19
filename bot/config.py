@@ -36,6 +36,7 @@ BGUTIL_POT_URL = os.environ.get("BGUTIL_POT_URL", "").rstrip("/")
 
 DATA_DIR = "/app/data"
 TMP_DIR = "/app/tmp"
+CACHE_DIR = "/app/tmp/recent"   # short-lived cache for "send as file" - see jobqueue/job_manager.py
 COOKIES_DIR = "/app/cookies"
 DB_PATH = os.path.join(DATA_DIR, "candy.db")
 

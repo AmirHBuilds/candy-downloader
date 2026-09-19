@@ -532,9 +532,23 @@ async def link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if action == "cancel":
         if job_manager and job_manager.cancel_for_user(user_id):
             return  # the job's own handler (queued or running) updates the message
-        pending_links.pop(user_id, None)
-        pending_probes.pop(user_id, None)
-        await set_text(messages.CANCELLED)
+        url = pending_links.get(user_id)
+        if url:
+            markup = InlineKeyboardMarkup([[InlineKeyboardButton("↻ Try again", callback_data="dl|redo")]])
+            await set_text(messages.with_link(messages.CANCELLED, url), markup=markup)
+        else:
+            await set_text(messages.CANCELLED)
+        return
+
+    if action == "redo":
+        url = pending_links.get(user_id)
+        if not url:
+            await set_text("This link expired — send it again.")
+            return
+        probe_result = pending_probes.get(user_id)
+        markup = video_menu(probe_result) if probe_result else fallback_menu()
+        title = probe_result.title if probe_result and probe_result.title else messages.PICK_OPTION
+        await set_text(messages.with_link(title, url), markup=markup)
         return
 
     if action == "moreq":
@@ -555,16 +569,10 @@ async def link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await query.answer("Nothing to retry.", show_alert=True)
             return
         url, saved_settings = entry
-        try:
-            await query.edit_message_reply_markup(reply_markup=None)
-        except Exception:  # noqa: BLE001
-            pass
-        status_msg = await context.bot.send_message(
-            query.message.chat_id, messages.with_link(messages.QUEUED, url),
-            parse_mode=ParseMode.HTML, reply_markup=queued_menu(),
-        )
+        await set_text(messages.with_link(messages.QUEUED, url), markup=queued_menu())
         await job_manager.enqueue(
-            user_id, status_msg.chat_id, url, dict(saved_settings), status_msg.message_id,
+            user_id, query.message.chat_id, url, dict(saved_settings), query.message.message_id,
+            is_photo=is_photo,
         )
         return
 
@@ -578,9 +586,20 @@ async def link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await query.edit_message_reply_markup(reply_markup=None)
         except Exception:  # noqa: BLE001
             pass
+
+        if job_manager.has_cached_video(user_id, url):
+            status_msg = await context.bot.send_message(
+                query.message.chat_id, messages.with_link("Sending the file…", url), parse_mode=ParseMode.HTML,
+            )
+            sent = await job_manager.send_cached_as_document(
+                user_id, status_msg.chat_id, url, status_msg.message_id,
+            )
+            if sent:
+                return
+            # cache lookup raced or the file vanished - fall through to a fresh download
+
         status_msg = await context.bot.send_message(
-            query.message.chat_id, messages.with_link("Re-fetching as a file…", url),
-            parse_mode=ParseMode.HTML,
+            query.message.chat_id, messages.with_link("Re-fetching as a file…", url), parse_mode=ParseMode.HTML,
         )
         await job_manager.enqueue(
             user_id, status_msg.chat_id, url, dict(saved_settings), status_msg.message_id,

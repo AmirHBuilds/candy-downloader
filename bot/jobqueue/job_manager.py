@@ -17,6 +17,7 @@ every state (queued, downloading, done) so it's always there to copy.
 """
 import asyncio
 import logging
+import shutil
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -33,13 +34,14 @@ from settings import access_control as ac
 from ui import messages
 from ui.progress import render_status
 from ui.quick_menu import queued_menu, send_as_file_menu, retry_menu
-from utils.cleanup import job_workspace
+from utils.cleanup import job_workspace, new_cache_path
 
 log = logging.getLogger("candy.jobs")
 
 MIN_EDIT_INTERVAL_SEC = 1.5   # don't hammer Telegram's edit_message rate limit
 MIN_PERCENT_DELTA = 3.0
 HEARTBEAT_INTERVAL_SEC = 2.5
+RECENT_FILE_TTL_SECONDS = 5 * 60   # how long "send as file" can reuse the last download
 
 TOOL_EMOJI = {"ytdlp": "▸", "gallerydl": "▸", "generic": "▸", "spotify": "♪"}
 TOOL_LABEL = {"ytdlp": "Downloading video", "gallerydl": "Downloading gallery",
@@ -69,6 +71,7 @@ class JobManager:
         self._max_concurrent = max_concurrent
         self._workers: list[asyncio.Task] = []
         self._jobs_by_user: dict[int, Job] = {}
+        self._recent_files: dict[int, dict] = {}  # user_id -> {path, url, expires_at}
 
     def start(self) -> None:
         for i in range(self._max_concurrent):
@@ -114,6 +117,65 @@ class JobManager:
             lines.append(f"• <code>{job.url[:40]}</code> — {state}")
         return "\n".join(lines)
 
+    # ---------- short-lived cache for "send as file" ----------
+
+    async def _cache_video_file(self, user_id: int, url: str, src: Path) -> None:
+        """Keeps one copy of a just-downloaded video around briefly so
+        tapping "send as file" doesn't trigger a fresh download - it's
+        the exact same bytes at whatever quality was originally picked,
+        just delivered without Telegram's video-compression pipeline."""
+        old = self._recent_files.pop(user_id, None)
+        if old:
+            old["path"].unlink(missing_ok=True)
+
+        cached_path = new_cache_path(src.suffix)
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(None, shutil.copy2, src, cached_path)
+        except OSError as exc:
+            log.warning("Could not cache %s for reuse: %s", src, exc)
+            return
+
+        self._recent_files[user_id] = {"path": cached_path, "url": url}
+        asyncio.create_task(self._expire_cached_file(user_id, cached_path))
+
+    async def _expire_cached_file(self, user_id: int, path: Path) -> None:
+        await asyncio.sleep(RECENT_FILE_TTL_SECONDS)
+        entry = self._recent_files.get(user_id)
+        if entry and entry["path"] == path:
+            self._recent_files.pop(user_id, None)
+        path.unlink(missing_ok=True)
+
+    def has_cached_video(self, user_id: int, url: str) -> bool:
+        entry = self._recent_files.get(user_id)
+        return bool(entry and entry["url"] == url and entry["path"].exists())
+
+    async def send_cached_as_document(self, user_id: int, chat_id: int, url: str,
+                                       status_message_id: int) -> bool:
+        """Delivers the cached copy as a document with no re-download.
+        Returns False (and does nothing) if there's no valid cache hit,
+        so the caller can fall back to a fresh download."""
+        entry = self._recent_files.get(user_id)
+        if not entry or entry["url"] != url or not entry["path"].exists():
+            return False
+
+        path = entry["path"]
+        caption = messages.all_done_caption(path.stem[:100]) + "\n\nSent as a file — not re-compressed by Telegram."
+        try:
+            with open(path, "rb") as fh:
+                input_file = InputFile(fh, filename=f"video{path.suffix}")
+                await self.bot.send_document(chat_id, input_file, caption=caption, parse_mode=ParseMode.HTML,
+                                              read_timeout=180, write_timeout=180, connect_timeout=60)
+        except (OSError, TelegramError) as exc:
+            log.warning("Cached send failed for user %s, falling back to re-download: %s", user_id, exc)
+            return False
+
+        try:
+            await self.bot.delete_message(chat_id, status_message_id)
+        except TelegramError:
+            pass
+        return True
+
     async def _queued_heartbeat(self, job: Job) -> None:
         """Gives a visible sign of life while a job sits in the queue,
         before a worker has picked it up - otherwise "Queued" just sits
@@ -135,7 +197,7 @@ class JobManager:
             if job.cancelled:
                 # cancelled while still waiting in line - never actually ran
                 ac.log_download(job.user_id, job.url, "cancelled")
-                await self._safe_edit(job, messages.with_link(messages.CANCELLED, job.url), clear_markup=True)
+                await self._safe_edit(job, messages.with_link(messages.CANCELLED, job.url), markup=retry_menu())
                 self._jobs_by_user.pop(job.user_id, None)
                 self._queue.task_done()
                 continue
@@ -146,7 +208,7 @@ class JobManager:
                 ac.log_download(job.user_id, job.url, "success")
             except asyncio.CancelledError:
                 ac.log_download(job.user_id, job.url, "cancelled")
-                await self._safe_edit(job, messages.with_link(messages.CANCELLED, job.url), clear_markup=True)
+                await self._safe_edit(job, messages.with_link(messages.CANCELLED, job.url), markup=retry_menu())
             except NoToolSucceeded as exc:
                 ac.log_download(job.user_id, job.url, "failed")
                 log.exception("Job %s failed", job.job_id)
@@ -169,16 +231,18 @@ class JobManager:
             job, messages.with_link("Preparing your download…", job.url), markup=QUEUED_MARKUP,
         )
 
-        def progress_cb(tool_name: str, percent: float, speed: str | None, eta: str | None) -> None:
+        def progress_cb(tool_name: str, percent: float, speed: str | None, eta: str | None,
+                        stage: str | None = None) -> None:
             nonlocal last_edit_time, last_percent
             now = time.monotonic()
-            if (now - last_edit_time) < MIN_EDIT_INTERVAL_SEC and abs(percent - last_percent) < MIN_PERCENT_DELTA:
+            if (now - last_edit_time) < MIN_EDIT_INTERVAL_SEC and abs(percent - last_percent) < MIN_PERCENT_DELTA \
+                    and stage is None:
                 return
             last_edit_time = now
             last_percent = percent
             status = render_status(
                 TOOL_EMOJI.get(tool_name, "▸"),
-                TOOL_LABEL.get(tool_name, "Downloading"),
+                stage or TOOL_LABEL.get(tool_name, "Downloading"),
                 percent, speed, eta,
             )
             text = messages.with_link(status, job.url)
@@ -194,7 +258,7 @@ class JobManager:
             suffix = f.suffix.lower()
 
             if job.force_document:
-                caption = messages.all_done_caption(f.stem[:100]) + "\n\nOriginal file — not re-compressed."
+                caption = messages.all_done_caption(f.stem[:100]) + "\n\nSent as a file — not re-compressed by Telegram."
                 with open(f, "rb") as fh:
                     input_file = InputFile(fh, filename=f.name)
                     await self.bot.send_document(job.chat_id, input_file, caption=caption,
@@ -213,6 +277,8 @@ class JobManager:
                                                parse_mode=ParseMode.HTML, supports_streaming=True,
                                                reply_markup=send_as_file_menu(),
                                                read_timeout=120, write_timeout=120, connect_timeout=60)
+                    # keep a short-lived copy so "send as file" doesn't re-download
+                    await self._cache_video_file(job.user_id, job.url, f)
                 elif suffix in {".mp3", ".m4a", ".opus", ".flac", ".wav"}:
                     await self.bot.send_audio(job.chat_id, input_file, caption=caption,
                                                parse_mode=ParseMode.HTML,

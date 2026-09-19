@@ -61,9 +61,12 @@ Made with love for Candy. 🍭
   what you're about to download before picking an option. The original
   link message is deleted once received, so the whole exchange collapses
   into one evolving message rather than a growing chat thread.
-- **Send as file**: after a video download completes, a follow-up button
-  lets you re-fetch it as a plain file instead of Telegram's
-  compressed/streamable video preview.
+- **Send as file**: attached right on the video message itself, this
+  re-sends the exact same file (same quality you picked) as a plain
+  document instead of Telegram's compressed/streamable video preview. A
+  short-lived cache (5 minutes) means tapping it doesn't trigger a fresh
+  download — it reuses the file already sitting on disk, then it's
+  cleaned up like everything else.
 - **Cancel button** on every stage of the process, including while still
   waiting in the queue (not just once downloading starts) and a "Try
   again" button if a download fails.

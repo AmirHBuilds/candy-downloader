@@ -9,7 +9,24 @@ from config import COOKIES_DIR, DATA_DIR, BGUTIL_POT_URL
 
 log = logging.getLogger("candy.ytdlp")
 
-ProgressCB = Callable[[float, str | None, str | None], None]  # percent, speed, eta
+# percent, speed, eta, stage-label-override (used during post-processing,
+# when yt-dlp's own download-progress hook goes silent for a while)
+ProgressCB = Callable[[float, str | None, str | None, str | None], None]
+
+# A genuinely hung ffmpeg/postprocessor step (rare, but possible) would
+# otherwise freeze the UI forever with no error - bound it instead.
+DOWNLOAD_TIMEOUT_SECONDS = 20 * 60
+
+_POSTPROCESSOR_LABELS = {
+    "Merger": "Merging video & audio",
+    "FFmpegVideoConvertor": "Converting video",
+    "FFmpegExtractAudio": "Extracting audio",
+    "EmbedThumbnail": "Embedding thumbnail",
+    "FFmpegMetadata": "Adding metadata",
+    "FFmpegEmbedSubtitle": "Embedding subtitles",
+    "SponsorBlock": "Checking for sponsor segments",
+    "ModifyChapters": "Removing sponsor segments",
+}
 
 
 def _format_selector(s: dict) -> str:
@@ -27,7 +44,7 @@ def _format_selector(s: dict) -> str:
     return base
 
 
-def _build_opts(url: str, workspace: Path, s: dict, user_id: int, progress_hook) -> dict:
+def _build_opts(url: str, workspace: Path, s: dict, user_id: int, progress_hook, pp_hook) -> dict:
     outtmpl = str(workspace / s["filename_template"])
 
     opts: dict = {
@@ -35,6 +52,7 @@ def _build_opts(url: str, workspace: Path, s: dict, user_id: int, progress_hook)
         "format": _format_selector(s),
         "noplaylist": s["playlist_mode"] == "single",
         "progress_hooks": [progress_hook],
+        "postprocessor_hooks": [pp_hook],
         "quiet": True,
         "no_warnings": True,
         "concurrent_fragment_downloads": max(1, int(s["concurrent_fragments"])),
@@ -126,7 +144,13 @@ async def download(url: str, workspace: Path, settings: dict, user_id: int,
     On a "sign in to confirm you're not a bot" error, retries with
     alternate player clients before giving up - see CLIENT_FALLBACKS.
     Skipped when the user has cookies enabled, since mixing cookies with
-    some clients (notably tv) can invalidate the cookie session."""
+    some clients (notably tv) can invalidate the cookie session.
+
+    After the raw download finishes, yt-dlp's own progress hook goes
+    silent while postprocessors (merging, embedding thumbnails/metadata)
+    run - which used to make the UI look frozen at ~98-100% for however
+    long that takes. postprocessor_hooks fills that gap with a live
+    stage label instead."""
     loop = asyncio.get_running_loop()
 
     def hook(d: dict) -> None:
@@ -136,11 +160,17 @@ async def download(url: str, workspace: Path, settings: dict, user_id: int,
             percent = (downloaded / total * 100) if total else 0.0
             speed = d.get("_speed_str", "").strip() or None
             eta = d.get("_eta_str", "").strip() or None
-            loop.call_soon_threadsafe(progress_cb, percent, speed, eta)
+            loop.call_soon_threadsafe(progress_cb, percent, speed, eta, None)
         elif d.get("status") == "finished":
-            loop.call_soon_threadsafe(progress_cb, 100.0, None, None)
+            loop.call_soon_threadsafe(progress_cb, 100.0, None, None, "Finishing up...")
 
-    base_opts = _build_opts(url, workspace, settings, user_id, hook)
+    def pp_hook(d: dict) -> None:
+        if d.get("status") == "started":
+            name = d.get("postprocessor", "")
+            label = _POSTPROCESSOR_LABELS.get(name, name or "Finishing up...")
+            loop.call_soon_threadsafe(progress_cb, 100.0, None, None, label)
+
+    base_opts = _build_opts(url, workspace, settings, user_id, hook, pp_hook)
     using_cookies = "cookiefile" in base_opts
 
     def run(opts: dict) -> list[Path]:
@@ -156,8 +186,19 @@ async def download(url: str, workspace: Path, settings: dict, user_id: int,
             except OSError:
                 pass
 
+    async def run_with_timeout(opts: dict) -> list[Path]:
+        try:
+            return await asyncio.wait_for(
+                loop.run_in_executor(None, run, opts), timeout=DOWNLOAD_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                f"Timed out after {DOWNLOAD_TIMEOUT_SECONDS // 60} minutes - "
+                "something (likely a postprocessing step) got stuck."
+            )
+
     try:
-        results = await loop.run_in_executor(None, run, base_opts)
+        results = await run_with_timeout(base_opts)
     except Exception as exc:  # noqa: BLE001
         if using_cookies or not _looks_like_bot_check(exc):
             raise
@@ -171,7 +212,7 @@ async def download(url: str, workspace: Path, settings: dict, user_id: int,
             }
             try:
                 log.info("Retrying %s with player_client=%s after bot-check", url, client)
-                results = await loop.run_in_executor(None, run, retry_opts)
+                results = await run_with_timeout(retry_opts)
                 last_error = None  # type: ignore[assignment]
                 break
             except Exception as retry_exc:  # noqa: BLE001

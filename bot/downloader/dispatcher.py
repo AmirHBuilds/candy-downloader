@@ -32,7 +32,7 @@ class NoToolSucceeded(Exception):
 
 
 async def download(url: str, workspace: Path, settings: dict, user_id: int,
-                    progress_cb: Callable[[str, float, str | None, str | None], None]) -> list[Path]:
+                    progress_cb: Callable[[str, float, str | None, str | None, str | None], None]) -> list[Path]:
     """Tries each candidate tool in priority order for this URL's domain.
     On failure, moves to the next tool and reports which tool is now
     active so the UI can (optionally) show it. Raises NoToolSucceeded if
@@ -45,8 +45,8 @@ async def download(url: str, workspace: Path, settings: dict, user_id: int,
         try:
             log.info("Trying %s for %s", tool_name, url)
 
-            def cb(percent, speed, eta, _tool=tool_name):
-                progress_cb(_tool, percent, speed, eta)
+            def cb(percent, speed, eta, stage=None, _tool=tool_name):
+                progress_cb(_tool, percent, speed, eta, stage)
 
             files = await handler(url, workspace, settings, user_id, cb)
             if files:
