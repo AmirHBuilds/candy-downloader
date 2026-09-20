@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -7,14 +8,17 @@ from config import COOKIES_DIR
 
 log = logging.getLogger("candy.gallerydl")
 
-ProgressCB = Callable[[float, str | None, str | None], None]
+ProgressCB = Callable[[float | None, str | None, str | None, str | None], None]
+
+DOWNLOAD_TIMEOUT_SECONDS = 20 * 60
 
 
 async def download(url: str, workspace: Path, settings: dict, user_id: int,
                     progress_cb: ProgressCB) -> list[Path]:
-    """gallery-dl doesn't expose a granular progress API as easily as
-    yt-dlp, so we report indeterminate progress (pulses) while its CLI
-    process runs, then flip to 100% on completion."""
+    """gallery-dl doesn't expose granular byte-level progress. Rather than
+    faking a percentage that climbs regardless of whether the download is
+    actually succeeding (misleading if it's about to fail), this shows
+    real elapsed time instead - honest, and still proves it's alive."""
     cmd = [
         "gallery-dl",
         "--dest", str(workspace),
@@ -36,21 +40,26 @@ async def download(url: str, workspace: Path, settings: dict, user_id: int,
         stderr=asyncio.subprocess.PIPE,
     )
 
-    async def pulse() -> None:
-        pct = 0.0
+    async def heartbeat() -> None:
+        start = time.monotonic()
         while process.returncode is None:
-            pct = min(90.0, pct + 7.0)
-            progress_cb(pct, None, None)
-            await asyncio.sleep(1.2)
+            elapsed = int(time.monotonic() - start)
+            progress_cb(None, f"{elapsed}s elapsed", None, None)
+            await asyncio.sleep(2.0)
 
-    pulse_task = asyncio.create_task(pulse())
-    stdout, stderr = await process.communicate()
-    pulse_task.cancel()
+    heartbeat_task = asyncio.create_task(heartbeat())
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=DOWNLOAD_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.wait()
+        raise RuntimeError(f"gallery-dl timed out after {DOWNLOAD_TIMEOUT_SECONDS // 60} minutes")
+    finally:
+        heartbeat_task.cancel()
 
     if process.returncode != 0:
         raise RuntimeError(stderr.decode(errors="ignore") or stdout.decode(errors="ignore"))
 
-    progress_cb(100.0, None, None)
     files = [p for p in sorted(workspace.rglob("*")) if p.is_file()]
     if not files:
         raise RuntimeError("gallery-dl finished but produced no files")

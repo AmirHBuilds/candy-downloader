@@ -61,6 +61,16 @@ def extended_video_menu(probe: ProbeResult) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def audio_only_menu() -> InlineKeyboardMarkup:
+    """For sources that are audio-only by nature (SoundCloud, etc.) - no
+    "video" button at all, since there's no video to pick a quality for."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("♪ MP3", callback_data="dl|audio|mp3"),
+         InlineKeyboardButton("♪ Opus", callback_data="dl|audio|opus")],
+        cancel_row(),
+    ])
+
+
 def simple_menu() -> InlineKeyboardMarkup:
     """For galleries/direct files - no quality concept, just go/cancel."""
     return InlineKeyboardMarkup([

@@ -14,6 +14,13 @@ HANDLERS = {
     "spotify": spotify_handler.download,
 }
 
+FRIENDLY_TOOL = {
+    "ytdlp": "yt-dlp",
+    "gallerydl": "gallery-dl",
+    "generic": "direct download",
+    "spotify": "Spotify search",
+}
+
 
 class NoToolSucceeded(Exception):
     def __init__(self, attempts: dict[str, str], primary_tool: str):
@@ -32,16 +39,24 @@ class NoToolSucceeded(Exception):
 
 
 async def download(url: str, workspace: Path, settings: dict, user_id: int,
-                    progress_cb: Callable[[str, float, str | None, str | None, str | None], None]) -> list[Path]:
+                    progress_cb: Callable[[str, float | None, str | None, str | None, str | None], None]
+                    ) -> list[Path]:
     """Tries each candidate tool in priority order for this URL's domain.
-    On failure, moves to the next tool and reports which tool is now
-    active so the UI can (optionally) show it. Raises NoToolSucceeded if
-    every candidate fails."""
+
+    Reports each real transition as its own step via progress_cb(..., stage=...)
+    - "Trying X...", "X failed: ...", etc. - instead of letting a tool's own
+    placeholder/fake progress bar keep climbing while it's actually about
+    to fail. That mismatch (a bar showing movement while the tool is
+    already doomed) was confusing and dishonest.
+
+    Raises NoToolSucceeded if every candidate fails."""
     order = tool_order_for(url)
     attempts: dict[str, str] = {}
 
     for tool_name in order:
         handler = HANDLERS[tool_name]
+        label = FRIENDLY_TOOL.get(tool_name, tool_name)
+        progress_cb(tool_name, None, None, None, f"Trying {label}...")
         try:
             log.info("Trying %s for %s", tool_name, url)
 
@@ -52,9 +67,12 @@ async def download(url: str, workspace: Path, settings: dict, user_id: int,
             if files:
                 return files
             attempts[tool_name] = "produced no files"
+            progress_cb(tool_name, None, None, None, f"{label}: produced no files")
         except Exception as exc:  # noqa: BLE001 - we want to try the next tool regardless of cause
             log.warning("%s failed for %s: %s", tool_name, url, exc)
             attempts[tool_name] = str(exc)
+            short = str(exc).strip().splitlines()[0][:100] if str(exc).strip() else "failed"
+            progress_cb(tool_name, None, None, None, f"✕ {label}: {short}")
             # clean any partial junk before the next tool tries
             for leftover in workspace.iterdir():
                 try:

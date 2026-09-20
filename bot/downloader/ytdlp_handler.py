@@ -86,11 +86,19 @@ def _build_opts(url: str, workspace: Path, s: dict, user_id: int, progress_hook,
         opts["download_archive"] = str(Path(DATA_DIR) / f"archive_{user_id}.txt")
 
     if s["mode"] == "audio":
-        opts["postprocessors"].append({
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": s["audio_format"],
-            "preferredquality": str(s["audio_bitrate"]),
-        })
+        pp: dict = {"key": "FFmpegExtractAudio", "preferredcodec": s["audio_format"]}
+        if s["audio_format"] not in ("flac", "wav"):
+            # A bare number like "192" is ambiguous - for non-mp3 codecs
+            # ffmpeg can misread it as a VBR quality scale (0-10) instead
+            # of a bitrate, which fails outright for some codecs (opus
+            # included - this was the actual cause of "Conversion failed!").
+            # An explicit "192K" removes the ambiguity. Lossless formats
+            # (flac/wav) don't take a bitrate at all, so skip it there.
+            quality = str(s["audio_bitrate"])
+            if not quality.lower().endswith("k"):
+                quality = f"{quality}K"
+            pp["preferredquality"] = quality
+        opts["postprocessors"].append(pp)
     else:
         opts["merge_output_format"] = "mp4"
 

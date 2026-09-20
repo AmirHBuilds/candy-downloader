@@ -10,6 +10,8 @@ log = logging.getLogger("candy.generic")
 
 ProgressCB = Callable[[float, str | None, str | None], None]
 
+DOWNLOAD_TIMEOUT_SECONDS = 20 * 60
+
 # aria2c prints progress lines like:
 # [#1a2b3c 12MiB/50MiB(24%) CN:4 DL:2.1MiB ETA:18s]
 _PROGRESS_RE = re.compile(r"\((\d+)%\).*?DL:([\d.]+\w+/?s?).*?ETA:(\S+)")
@@ -53,6 +55,10 @@ async def download(url: str, workspace: Path, settings: dict, user_id: int,
         "--split=8",
         "--summary-interval=1",
         "--console-log-level=warn",
+        # native timeouts so aria2c itself can't hang forever on a bad connection
+        "--timeout=30",
+        "--connect-timeout=15",
+        "--max-tries=5",
     ]
     if settings["rate_limit_kbps"]:
         cmd.append(f"--max-download-limit={int(settings['rate_limit_kbps'])}K")
@@ -75,8 +81,13 @@ async def download(url: str, workspace: Path, settings: dict, user_id: int,
                 percent = float(match.group(1))
                 progress_cb(percent, match.group(2), match.group(3))
 
-    await read_output()
-    await process.wait()
+    try:
+        await asyncio.wait_for(read_output(), timeout=DOWNLOAD_TIMEOUT_SECONDS)
+        await asyncio.wait_for(process.wait(), timeout=30)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.wait()
+        raise RuntimeError(f"Timed out after {DOWNLOAD_TIMEOUT_SECONDS // 60} minutes - the connection was too slow/stuck")
 
     if process.returncode != 0:
         raise RuntimeError(f"aria2c exited with code {process.returncode} — link may not be a direct file")

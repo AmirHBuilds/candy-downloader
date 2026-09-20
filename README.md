@@ -70,6 +70,13 @@ Made with love for Candy. 🍭
 - **Cancel button** on every stage of the process, including while still
   waiting in the queue (not just once downloading starts) and a "Try
   again" button if a download fails.
+- **Live step log**: instead of a single static line, the status message
+  shows a rolling log of what's actually happening right now (which tool
+  is being tried, postprocessing stages like embedding a thumbnail, etc.)
+  - the last 3 events, oldest dropped as new ones come in. A failing
+  attempt is reported honestly as what it is ("gallery-dl: Unsupported
+  URL"), not a fake progress bar that keeps climbing right up to the
+  failure.
 - **Queue heartbeat**: while waiting for a free download slot, the status
   message visibly updates ("Preparing your download...", live progress
   once it starts) instead of sitting on a static "Queued" forever.

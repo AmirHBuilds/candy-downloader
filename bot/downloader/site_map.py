@@ -21,6 +21,12 @@ OVERRIDES: dict[str, list[str]] = {
     "twitter.com": ["gallerydl", "ytdlp"],
     "x.com": ["gallerydl", "ytdlp"],
     "reddit.com": ["ytdlp", "gallerydl"],
+    # Pinterest pins are usually images, not video - gallery-dl handles
+    # that correctly and gives an honest "just download it" menu; yt-dlp
+    # errors on image pins ("No video formats found") even though the
+    # content itself is perfectly downloadable via gallery-dl.
+    "pinterest.com": ["gallerydl", "ytdlp"],
+    "pin.it": ["gallerydl", "ytdlp"],
     # Spotify streams are DRM-protected - handled entirely differently
     # (search + download matching audio elsewhere), see spotify_handler.py.
     "open.spotify.com": ["spotify"],

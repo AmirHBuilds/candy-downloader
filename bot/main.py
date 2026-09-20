@@ -18,7 +18,7 @@ from settings.user_settings import get_settings, update_setting, reset_settings
 from ui import messages, admin_menu
 from ui.quick_menu import (
     video_menu, extended_video_menu, simple_menu, fallback_menu, spotify_menu,
-    queued_menu,
+    audio_only_menu, queued_menu,
 )
 from ui.settings_menu import (
     main_menu, mode_menu, quality_menu, subs_menu, playlist_menu,
@@ -464,7 +464,14 @@ async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if probe_result and probe_result.ok and not probe_result.is_playlist:
         pending_probes[user_id] = probe_result
         caption = messages.with_link(probe_result.title or messages.PICK_OPTION, url)
-        markup = video_menu(probe_result)
+        if probe_result.heights:
+            markup = video_menu(probe_result)
+        elif probe_result.has_audio:
+            # Audio-only source (SoundCloud, etc.) - no video to pick a
+            # quality for, so don't offer a "video" button at all.
+            markup = audio_only_menu()
+        else:
+            markup = simple_menu()
         if probe_result.thumbnail:
             try:
                 await context.bot.send_photo(
@@ -569,6 +576,17 @@ async def link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await query.answer("Nothing to retry.", show_alert=True)
             return
         url, saved_settings = entry
+
+        if job_manager.has_cached_video(user_id, url):
+            await set_text(messages.with_link("Sending from the local copy — no re-download needed…", url),
+                            markup=queued_menu())
+            sent = await job_manager.send_cached_as_document(
+                user_id, query.message.chat_id, url, query.message.message_id,
+            )
+            if sent:
+                return
+            # cache vanished mid-flight - fall through to a fresh download
+
         await set_text(messages.with_link(messages.QUEUED, url), markup=queued_menu())
         await job_manager.enqueue(
             user_id, query.message.chat_id, url, dict(saved_settings), query.message.message_id,
@@ -611,8 +629,17 @@ async def link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         url = pending_links.pop(user_id, None)
         pending_probes.pop(user_id, None)
         if not url:
-            await set_text("This link expired — send it again.")
-            return
+            # State was lost (restart, long gap, etc.) but the link is
+            # still right there in the message - recover it instead of
+            # dead-ending the person.
+            source_text = query.message.caption or query.message.text or ""
+            match = URL_RE.search(source_text)
+            if match:
+                url = match.group(0)
+            else:
+                markup = InlineKeyboardMarkup([[InlineKeyboardButton("↻ Try again", callback_data="dl|redo")]])
+                await set_text("This link expired — send it again.", markup=markup)
+                return
 
         value = parts[2]
         job_settings = dict(get_settings(user_id))
