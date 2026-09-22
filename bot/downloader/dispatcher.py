@@ -71,8 +71,8 @@ async def download(url: str, workspace: Path, settings: dict, user_id: int,
         except Exception as exc:  # noqa: BLE001 - we want to try the next tool regardless of cause
             log.warning("%s failed for %s: %s", tool_name, url, exc)
             attempts[tool_name] = str(exc)
-            short = str(exc).strip().splitlines()[0][:100] if str(exc).strip() else "failed"
-            progress_cb(tool_name, None, None, None, f"✕ {label}: {short}")
+            short = str(exc).strip().splitlines()[0] if str(exc).strip() else "failed"
+            progress_cb(tool_name, None, None, None, f"{label} failed: {short}")
             # clean any partial junk before the next tool tries
             for leftover in workspace.iterdir():
                 try:

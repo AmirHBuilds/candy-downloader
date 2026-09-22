@@ -20,6 +20,7 @@ climbing right up until the failure.
 """
 import asyncio
 import logging
+import re
 import shutil
 import time
 import uuid
@@ -55,6 +56,35 @@ TOOL_LABEL = {"ytdlp": "Downloading video", "gallerydl": "Downloading gallery",
               "generic": "Downloading file", "spotify": "Finding & downloading track"}
 
 QUEUED_MARKUP = queued_menu()
+
+_BRACKET_RE = re.compile(r"\[[^\]]*\]")
+_ERROR_PREFIX_RE = re.compile(r"(?i)\berror:\s*")
+# Only strips ID-like tokens (must contain a digit) such as video IDs -
+# a plain word like "gallery-dl:" or "failed:" must NOT be caught here.
+_ID_COLON_RE = re.compile(r"\b(?=[\w-]*\d)[\w-]{6,}:\s*")
+_BOILERPLATE_CUTS = (
+    "; please report", "please report this issue",
+    "Confirm you are on the latest version",
+)
+
+
+def _sanitize_step(text: str, url: str) -> str:
+    """Tool error strings are ugly and redundant by default - they often
+    repeat the link we already show separately, wrap themselves in
+    "[tool][error]"-style tags, and append long boilerplate. This turns
+    that into one clean, short line."""
+    cleaned = (text or "").replace(url, "this link")
+    for cut in _BOILERPLATE_CUTS:
+        idx = cleaned.find(cut)
+        if idx != -1:
+            cleaned = cleaned[:idx]
+    cleaned = _ERROR_PREFIX_RE.sub("", cleaned)
+    cleaned = _BRACKET_RE.sub("", cleaned)
+    cleaned = _ID_COLON_RE.sub("", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" .;")
+    if len(cleaned) > 140:
+        cleaned = cleaned[:137].rstrip() + "..."
+    return cleaned or "failed"
 
 
 def _friendly_domain(url: str) -> str:
@@ -135,12 +165,22 @@ class JobManager:
     def _render(self, job: Job) -> str:
         lines = [f"{OWNER_EMOJI} <b>{job.header}</b>"]
         if job.steps:
-            lines.append("\n".join(f"• {s}" for s in job.steps[-MAX_STEP_LINES:]))
+            recent = job.steps[-MAX_STEP_LINES:]
+            rendered = []
+            for i, s in enumerate(recent):
+                is_current = i == len(recent) - 1
+                # don't double-wrap text that already carries its own
+                # HTML formatting (e.g. the final generic_error() block)
+                text = f"<b>{s}</b>" if (is_current and "<" not in s) else s
+                rendered.append(f"• {text}")
+            lines.append("\n".join(rendered))
         lines.append(f"<code>{job.url}</code>")
         return "\n\n".join(lines)
 
     async def _emit(self, job: Job, text: str, push: bool = True,
-                     markup: InlineKeyboardMarkup | None = None) -> None:
+                     markup: InlineKeyboardMarkup | None = None, sanitize: bool = True) -> None:
+        if push and sanitize:
+            text = _sanitize_step(text, job.url)
         if push or not job.steps:
             job.steps.append(text)
             if len(job.steps) > MAX_STEP_LINES:
@@ -246,12 +286,14 @@ class JobManager:
                 ac.log_download(job.user_id, job.url, "failed")
                 log.exception("Job %s failed", job.job_id)
                 job.header = "Failed"
-                await self._emit(job, exc.primary_error, markup=retry_menu())
+                cleaned = _sanitize_step(exc.primary_error, job.url)
+                await self._emit(job, messages.generic_error(cleaned), markup=retry_menu(), sanitize=False)
             except Exception as exc:  # noqa: BLE001
                 ac.log_download(job.user_id, job.url, "failed")
                 log.exception("Job %s failed", job.job_id)
                 job.header = "Failed"
-                await self._emit(job, str(exc)[:200], markup=retry_menu())
+                cleaned = _sanitize_step(str(exc), job.url)
+                await self._emit(job, messages.generic_error(cleaned), markup=retry_menu(), sanitize=False)
             finally:
                 self._jobs_by_user.pop(job.user_id, None)
                 self._queue.task_done()
@@ -278,7 +320,12 @@ class JobManager:
 
             label = stage or TOOL_LABEL.get(tool_name, "Downloading")
             if percent is None:
-                line = label
+                meta = []
+                if speed:
+                    meta.append(speed)
+                if eta and eta not in ("~", ""):
+                    meta.append(f"ETA {eta}")
+                line = f"{label} · {' · '.join(meta)}" if meta else label
             else:
                 bar = render_bar(percent)
                 meta = []

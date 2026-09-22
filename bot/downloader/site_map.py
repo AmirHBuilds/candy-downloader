@@ -39,6 +39,12 @@ KNOWN_STREAMING_DOMAINS = [
     "youtube.com", "youtu.be", "tiktok.com", "vimeo.com", "twitch.tv",
     "soundcloud.com", "facebook.com", "dailymotion.com", "bilibili.com",
     "streamable.com", "vk.com", "rumble.com",
+    # Adult video sites yt-dlp explicitly supports - falling through to
+    # gallery-dl/generic after yt-dlp gives a real error (403, geo-block,
+    # etc.) here is pointless: gallery-dl doesn't support them and the
+    # generic downloader just hangs trying to fetch what's actually a
+    # webpage, not a file. Report yt-dlp's real error instead.
+    "pornhub.com", "xvideos.com", "xhamster.com", "xnxx.com",
 ]
 
 

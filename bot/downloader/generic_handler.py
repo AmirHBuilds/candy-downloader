@@ -37,6 +37,9 @@ async def _looks_like_a_webpage(url: str) -> bool:
         return False  # can't tell - let aria2c try, we'll sniff the bytes after
 
 
+STALL_TIMEOUT_SECONDS = 45  # no output at all for this long -> probably stuck/blocked, fail fast
+
+
 async def download(url: str, workspace: Path, settings: dict, user_id: int,
                     progress_cb: ProgressCB) -> list[Path]:
     """Last-resort downloader for plain direct file links (pdf, zip, mp4
@@ -74,7 +77,16 @@ async def download(url: str, workspace: Path, settings: dict, user_id: int,
 
     async def read_output():
         assert process.stdout
-        async for line_bytes in process.stdout:
+        while True:
+            try:
+                line_bytes = await asyncio.wait_for(process.stdout.readline(), timeout=STALL_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                raise RuntimeError(
+                    f"No response for {STALL_TIMEOUT_SECONDS}s - the server "
+                    "isn't sending anything (likely blocking direct downloads)"
+                )
+            if not line_bytes:  # EOF - process finished
+                return
             line = line_bytes.decode(errors="ignore")
             match = _PROGRESS_RE.search(line)
             if match:
@@ -88,6 +100,10 @@ async def download(url: str, workspace: Path, settings: dict, user_id: int,
         process.kill()
         await process.wait()
         raise RuntimeError(f"Timed out after {DOWNLOAD_TIMEOUT_SECONDS // 60} minutes - the connection was too slow/stuck")
+    except RuntimeError:
+        process.kill()
+        await process.wait()
+        raise
 
     if process.returncode != 0:
         raise RuntimeError(f"aria2c exited with code {process.returncode} — link may not be a direct file")
