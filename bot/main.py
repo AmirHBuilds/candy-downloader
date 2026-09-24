@@ -2,6 +2,7 @@ import asyncio
 import logging
 import re
 import time
+import uuid
 
 import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -28,6 +29,7 @@ from ui.start_menu import start_menu
 from downloader.probe import probe, ProbeResult
 from downloader import gallerydl_probe
 from downloader.site_map import tool_order_for
+from downloader.dispatcher import FRIENDLY_TOOL
 from downloader.spotify_handler import get_track_info
 from updater.auto_update import daily_update_loop, run_update_once
 from utils.cleanup import sweep_orphaned_workspaces
@@ -39,10 +41,19 @@ log = logging.getLogger("candy.main")
 URL_RE = re.compile(r"https?://\S+")
 
 job_manager: JobManager | None = None
-pending_links: dict[int, str] = {}                    # user_id -> url awaiting a quick-pick choice
-pending_probes: dict[int, ProbeResult] = {}           # user_id -> probe result, for the "more options" submenu
-pending_admin_input: dict[int, str] = {}              # user_id -> which admin panel field they're typing
-last_download: dict[int, tuple[str, dict]] = {}       # user_id -> (url, settings) for "send as file"/"retry"
+# Every one of these is keyed by a per-request token (rid), not just the
+# user's id. Two links from the same user in flight at once each get
+# their own slot - otherwise the second link would silently overwrite
+# the first's state and the first message's buttons would end up
+# operating on the wrong link.
+pending_links: dict[str, tuple[int, str]] = {}          # rid -> (user_id, url)
+pending_probes: dict[str, ProbeResult] = {}             # rid -> probe result, for "more options"
+pending_admin_input: dict[int, str] = {}                # user_id -> which admin panel field they're typing
+last_download: dict[str, tuple[int, str, dict]] = {}    # rid -> (user_id, url, settings)
+
+
+def new_rid() -> str:
+    return uuid.uuid4().hex[:10]
 
 
 async def _delete_quietly(message) -> None:
@@ -142,15 +153,15 @@ async def queue_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await gate(update, context):
         return
     await _delete_quietly(update.message)
-    await update.message.reply_text(job_manager.active_summary(), parse_mode=ParseMode.HTML)
+    await update.message.reply_text(job_manager.active_summary(update.effective_user.id), parse_mode=ParseMode.HTML)
 
 
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await gate(update, context):
         return
     await _delete_quietly(update.message)
-    ok = job_manager.cancel_for_user(update.effective_user.id)
-    await update.message.reply_text(messages.CANCELLED if ok else messages.NOTHING_TO_CANCEL)
+    count = job_manager.cancel_all_for_user(update.effective_user.id)
+    await update.message.reply_text(messages.CANCELLED if count else messages.NOTHING_TO_CANCEL)
 
 
 async def update_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -394,24 +405,24 @@ async def misc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await query.answer()
     action = (query.data or "").split("|", 1)[1]
     if action == "queue":
-        text = job_manager.active_summary()
+        text = job_manager.active_summary(update.effective_user.id)
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("← Back", callback_data="nav|home")]])
         await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
 # ---------- link handling ----------
 
-async def handle_spotify_link(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str) -> None:
+async def handle_spotify_link(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, rid: str) -> None:
     user_id = update.effective_user.id
     status_msg = await context.bot.send_message(
-        update.effective_chat.id, messages.with_link(messages.PROBING, url), parse_mode=ParseMode.HTML,
+        update.effective_chat.id, messages.with_link("Checking via Spotify search…", url), parse_mode=ParseMode.HTML,
     )
     info = await get_track_info(url)
-    pending_links[user_id] = url
+    pending_links[rid] = (user_id, url)
 
     title = (info or {}).get("title") or "Spotify track"
     thumbnail = (info or {}).get("thumbnail") or ""
-    markup = spotify_menu()
+    markup = spotify_menu(rid)
     caption = messages.with_link(title, url)
 
     if thumbnail:
@@ -449,29 +460,32 @@ async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # have it; everything from here happens in one evolving message
     await _delete_quietly(update.message)
 
+    rid = new_rid()
+
     if "spotify.com" in url:
-        await handle_spotify_link(update, context, url)
+        await handle_spotify_link(update, context, url, rid)
         return
 
     order = tool_order_for(url)
+    checking_text = f"Checking via {FRIENDLY_TOOL.get(order[0], order[0])}…"
     status_msg = await context.bot.send_message(
-        update.effective_chat.id, messages.with_link(messages.PROBING, url), parse_mode=ParseMode.HTML,
+        update.effective_chat.id, messages.with_link(checking_text, url), parse_mode=ParseMode.HTML,
     )
 
     probe_result = await probe(url) if order[0] == "ytdlp" else None
-    pending_links[user_id] = url
+    pending_links[rid] = (user_id, url)
 
     if probe_result and probe_result.ok and not probe_result.is_playlist:
-        pending_probes[user_id] = probe_result
+        pending_probes[rid] = probe_result
         caption = messages.with_link(probe_result.title or messages.PICK_OPTION, url)
         if probe_result.heights:
-            markup = video_menu(probe_result)
+            markup = video_menu(probe_result, rid)
         elif probe_result.has_audio:
             # Audio-only source (SoundCloud, etc.) - no video to pick a
             # quality for, so don't offer a "video" button at all.
-            markup = audio_only_menu()
+            markup = audio_only_menu(rid)
         else:
-            markup = simple_menu()
+            markup = simple_menu(rid)
         if probe_result.thumbnail:
             try:
                 await context.bot.send_photo(
@@ -499,7 +513,7 @@ async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if gdl_info and (gdl_info.get("title") or gdl_info.get("thumbnail")):
         caption = messages.with_link(gdl_info.get("title") or messages.PICK_OPTION, url)
-        markup = simple_menu() if order[0] != "ytdlp" else fallback_menu()
+        markup = simple_menu(rid) if order[0] != "ytdlp" else fallback_menu(rid)
         if gdl_info.get("thumbnail"):
             try:
                 await context.bot.send_photo(
@@ -515,11 +529,11 @@ async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if order[0] != "ytdlp":
         caption = messages.with_link(messages.PICK_OPTION, url)
-        await status_msg.edit_text(caption, parse_mode=ParseMode.HTML, reply_markup=simple_menu())
+        await status_msg.edit_text(caption, parse_mode=ParseMode.HTML, reply_markup=simple_menu(rid))
     else:
         note = messages.preview_failed_note(probe_result.error if probe_result else "")
         caption = messages.with_link(note, url)
-        await status_msg.edit_text(caption, parse_mode=ParseMode.HTML, reply_markup=fallback_menu())
+        await status_msg.edit_text(caption, parse_mode=ParseMode.HTML, reply_markup=fallback_menu(rid))
 
 
 async def link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -528,6 +542,7 @@ async def link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     user_id = update.effective_user.id
     parts = (query.data or "").split("|")
     action = parts[1] if len(parts) > 1 else ""
+    rid = parts[-1] if len(parts) > 2 else ""
     is_photo = bool(query.message.photo)
 
     async def set_text(text: str, markup=None) -> None:
@@ -536,81 +551,87 @@ async def link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         else:
             await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
 
+    if action == "dismiss":
+        await _delete_quietly(query.message)
+        return
+
     if action == "cancel":
-        if job_manager and job_manager.cancel_for_user(user_id):
+        if job_manager and job_manager.cancel(rid, user_id):
             return  # the job's own handler (queued or running) updates the message
-        url = pending_links.get(user_id)
-        if url:
-            markup = InlineKeyboardMarkup([[InlineKeyboardButton("↻ Try again", callback_data="dl|redo")]])
+        entry = pending_links.get(rid)
+        if entry and entry[0] == user_id:
+            url = entry[1]
+            markup = InlineKeyboardMarkup([[InlineKeyboardButton("↻ Try again", callback_data=f"dl|redo|{rid}")]])
             await set_text(messages.with_link(messages.CANCELLED, url), markup=markup)
         else:
             await set_text(messages.CANCELLED)
         return
 
     if action == "redo":
-        url = pending_links.get(user_id)
-        if not url:
+        entry = pending_links.get(rid)
+        if not entry or entry[0] != user_id:
             await set_text("This link expired — send it again.")
             return
-        probe_result = pending_probes.get(user_id)
-        markup = video_menu(probe_result) if probe_result else fallback_menu()
+        url = entry[1]
+        probe_result = pending_probes.get(rid)
+        markup = video_menu(probe_result, rid) if probe_result else fallback_menu(rid)
         title = probe_result.title if probe_result and probe_result.title else messages.PICK_OPTION
         await set_text(messages.with_link(title, url), markup=markup)
         return
 
     if action == "moreq":
-        probe_result = pending_probes.get(user_id)
-        markup = extended_video_menu(probe_result) if probe_result else fallback_menu()
+        probe_result = pending_probes.get(rid)
+        markup = extended_video_menu(probe_result, rid) if probe_result else fallback_menu(rid)
         await query.edit_message_reply_markup(reply_markup=markup)
         return
 
     if action == "backq":
-        probe_result = pending_probes.get(user_id)
-        markup = video_menu(probe_result) if probe_result else fallback_menu()
+        probe_result = pending_probes.get(rid)
+        markup = video_menu(probe_result, rid) if probe_result else fallback_menu(rid)
         await query.edit_message_reply_markup(reply_markup=markup)
         return
 
     if action == "retry":
-        entry = last_download.get(user_id)
-        if not entry:
+        entry = last_download.get(rid)
+        if not entry or entry[0] != user_id:
             await query.answer("Nothing to retry.", show_alert=True)
             return
-        url, saved_settings = entry
+        _, url, saved_settings = entry
 
-        if job_manager.has_cached_video(user_id, url):
+        if job_manager.has_cached_video(rid, url):
             await set_text(messages.with_link("Sending from the local copy — no re-download needed…", url),
-                            markup=queued_menu())
+                            markup=queued_menu(rid))
             sent = await job_manager.send_cached_as_document(
-                user_id, query.message.chat_id, url, query.message.message_id,
+                rid, query.message.chat_id, url, query.message.message_id,
             )
             if sent:
                 return
             # cache vanished mid-flight - fall through to a fresh download
 
-        await set_text(messages.with_link(messages.QUEUED, url), markup=queued_menu())
+        await set_text(messages.with_link(messages.QUEUED, url), markup=queued_menu(rid))
         await job_manager.enqueue(
-            user_id, query.message.chat_id, url, dict(saved_settings), query.message.message_id,
+            rid, user_id, query.message.chat_id, url, dict(saved_settings), query.message.message_id,
             is_photo=is_photo,
         )
         return
 
     if action == "asfile":
-        entry = last_download.get(user_id)
-        if not entry:
+        entry = last_download.get(rid)
+        if not entry or entry[0] != user_id:
             await query.answer("That download isn't available anymore.", show_alert=True)
             return
-        url, saved_settings = entry
+        _, url, saved_settings = entry
         try:
             await query.edit_message_reply_markup(reply_markup=None)
         except Exception:  # noqa: BLE001
             pass
 
-        if job_manager.has_cached_video(user_id, url):
+        if job_manager.has_cached_video(rid, url):
             status_msg = await context.bot.send_message(
                 query.message.chat_id, messages.with_link("Sending the file…", url), parse_mode=ParseMode.HTML,
             )
             sent = await job_manager.send_cached_as_document(
-                user_id, status_msg.chat_id, url, status_msg.message_id,
+                rid, status_msg.chat_id, url, status_msg.message_id,
             )
             if sent:
                 return
@@ -620,15 +641,15 @@ async def link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             query.message.chat_id, messages.with_link("Re-fetching as a file…", url), parse_mode=ParseMode.HTML,
         )
         await job_manager.enqueue(
-            user_id, status_msg.chat_id, url, dict(saved_settings), status_msg.message_id,
+            rid, user_id, status_msg.chat_id, url, dict(saved_settings), status_msg.message_id,
             is_photo=False, force_document=True,
         )
         return
 
-    if action in ("video", "audio", "simple") and len(parts) == 3:
-        url = pending_links.pop(user_id, None)
-        pending_probes.pop(user_id, None)
-        if not url:
+    if action in ("video", "audio", "simple") and len(parts) == 4:
+        entry = pending_links.pop(rid, None)
+        pending_probes.pop(rid, None)
+        if not entry or entry[0] != user_id:
             # State was lost (restart, long gap, etc.) but the link is
             # still right there in the message - recover it instead of
             # dead-ending the person.
@@ -637,9 +658,11 @@ async def link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             if match:
                 url = match.group(0)
             else:
-                markup = InlineKeyboardMarkup([[InlineKeyboardButton("↻ Try again", callback_data="dl|redo")]])
+                markup = InlineKeyboardMarkup([[InlineKeyboardButton("↻ Try again", callback_data=f"dl|redo|{rid}")]])
                 await set_text("This link expired — send it again.", markup=markup)
                 return
+        else:
+            url = entry[1]
 
         value = parts[2]
         job_settings = dict(get_settings(user_id))
@@ -651,10 +674,10 @@ async def link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             job_settings["audio_format"] = value
         # "simple" (gallery/direct file): leave settings as-is
 
-        last_download[user_id] = (url, job_settings)
-        await set_text(messages.with_link(messages.QUEUED, url), markup=queued_menu())
+        last_download[rid] = (user_id, url, job_settings)
+        await set_text(messages.with_link(messages.QUEUED, url), markup=queued_menu(rid))
         await job_manager.enqueue(
-            user_id, query.message.chat_id, url, job_settings, query.message.message_id, is_photo=is_photo,
+            rid, user_id, query.message.chat_id, url, job_settings, query.message.message_id, is_photo=is_photo,
         )
 
 

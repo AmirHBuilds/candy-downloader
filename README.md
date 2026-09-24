@@ -70,6 +70,11 @@ Made with love for Candy. 🍭
 - **Cancel button** on every stage of the process, including while still
   waiting in the queue (not just once downloading starts) and a "Try
   again" button if a download fails.
+- **Per-request tokens**: every link gets its own token from the moment
+  its quick-pick menu appears, carried through to the finished download.
+  Sending a second link before acting on the first can never make the
+  first message's buttons act on the wrong link - each has independent
+  state (this was a real bug in earlier versions, now fixed at the root).
 - **Live step log**: instead of a single static line, the status message
   shows a rolling log of what's actually happening right now (which tool
   is being tried, postprocessing stages like embedding a thumbnail, etc.)

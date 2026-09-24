@@ -169,8 +169,15 @@ async def download(url: str, workspace: Path, settings: dict, user_id: int,
             speed = d.get("_speed_str", "").strip() or None
             eta = d.get("_eta_str", "").strip() or None
             loop.call_soon_threadsafe(progress_cb, percent, speed, eta, None)
-        elif d.get("status") == "finished":
-            loop.call_soon_threadsafe(progress_cb, 100.0, None, None, "Finishing up...")
+        # Deliberately no action on "finished": video+audio are often
+        # downloaded as two separate formats, so "finished" fires once
+        # per format, not once overall. Pushing a new line here created a
+        # confusing extra "Finishing up..." bullet that then got
+        # immediately overwritten by the next format's fresh 0% tick,
+        # while the previous format's real 100% line stayed stranded in
+        # history - two "Downloading video" lines for what looked like
+        # one step. postprocessor_hooks below announces the real,
+        # meaningful transitions (merging, embedding, etc.) instead.
 
     def pp_hook(d: dict) -> None:
         if d.get("status") == "started":

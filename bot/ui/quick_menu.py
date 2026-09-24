@@ -4,48 +4,50 @@ from what the link *actually* offers (see downloader/probe.py) rather
 than a fixed guess - a 720p-max video only shows 720p and below, and
 sites with no real quality concept (galleries, direct files) skip
 quality selection entirely.
+
+Every callback_data here ends with a request token (rid) - a short id
+unique to *this specific link/message*, not just the user. Without it,
+sending a second link before acting on the first would silently make
+the first message's buttons act on the second link instead (they'd
+share one per-user slot) - this is what threading the token through
+everywhere prevents.
 """
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from downloader.probe import ProbeResult
 
 
-def cancel_row() -> list[InlineKeyboardButton]:
-    return [InlineKeyboardButton("✕ Cancel", callback_data="dl|cancel")]
+def cancel_row(rid: str) -> list[InlineKeyboardButton]:
+    return [InlineKeyboardButton("✕ Cancel", callback_data=f"dl|cancel|{rid}")]
 
 
-def video_menu(probe: ProbeResult) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton("★ Best available", callback_data="dl|video|best")]]
+def video_menu(probe: ProbeResult, rid: str) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton("★ Best available", callback_data=f"dl|video|best|{rid}")]]
 
-    # Only offer specific resolutions that actually exist for this link,
-    # capped to a handful so the menu stays short.
     shown = [h for h in probe.heights if h]
     picks = []
     for h in shown:
-        if not picks or (picks[-1] - h) >= 120:  # skip near-duplicate resolutions
+        if not picks or (picks[-1] - h) >= 120:
             picks.append(h)
         if len(picks) == 3:
             break
     if picks:
         rows.append([
-            InlineKeyboardButton(f"{h}p", callback_data=f"dl|video|{h}p") for h in picks
+            InlineKeyboardButton(f"{h}p", callback_data=f"dl|video|{h}p|{rid}") for h in picks
         ])
 
     if probe.has_audio:
         rows.append([
-            InlineKeyboardButton("♪ MP3", callback_data="dl|audio|mp3"),
-            InlineKeyboardButton("♪ Opus", callback_data="dl|audio|opus"),
+            InlineKeyboardButton("♪ MP3", callback_data=f"dl|audio|mp3|{rid}"),
+            InlineKeyboardButton("♪ Opus", callback_data=f"dl|audio|opus|{rid}"),
         ])
 
-    # room to grow: more resolutions, formats, etc. live behind this
-    rows.append([InlineKeyboardButton("More options…", callback_data="dl|moreq")])
-    rows.append(cancel_row())
+    rows.append([InlineKeyboardButton("More options…", callback_data=f"dl|moreq|{rid}")])
+    rows.append(cancel_row(rid))
     return InlineKeyboardMarkup(rows)
 
 
-def extended_video_menu(probe: ProbeResult) -> InlineKeyboardMarkup:
-    """The fuller quality list, one level deeper than the default menu -
-    reachable via "More options" and returns to it via "Back"."""
+def extended_video_menu(probe: ProbeResult, rid: str) -> InlineKeyboardMarkup:
     rows = []
     picks = []
     for h in probe.heights or []:
@@ -53,63 +55,62 @@ def extended_video_menu(probe: ProbeResult) -> InlineKeyboardMarkup:
             picks.append(h)
     for i in range(0, len(picks), 3):
         rows.append([
-            InlineKeyboardButton(f"{h}p", callback_data=f"dl|video|{h}p") for h in picks[i:i + 3]
+            InlineKeyboardButton(f"{h}p", callback_data=f"dl|video|{h}p|{rid}") for h in picks[i:i + 3]
         ])
-    rows.append([InlineKeyboardButton("↓ Smallest size", callback_data="dl|video|worst")])
-    rows.append([InlineKeyboardButton("← Back", callback_data="dl|backq")])
-    rows.append(cancel_row())
+    rows.append([InlineKeyboardButton("↓ Smallest size", callback_data=f"dl|video|worst|{rid}")])
+    rows.append([InlineKeyboardButton("← Back", callback_data=f"dl|backq|{rid}")])
+    rows.append(cancel_row(rid))
     return InlineKeyboardMarkup(rows)
 
 
-def audio_only_menu() -> InlineKeyboardMarkup:
-    """For sources that are audio-only by nature (SoundCloud, etc.) - no
-    "video" button at all, since there's no video to pick a quality for."""
+def audio_only_menu(rid: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("♪ MP3", callback_data="dl|audio|mp3"),
-         InlineKeyboardButton("♪ Opus", callback_data="dl|audio|opus")],
-        cancel_row(),
+        [InlineKeyboardButton("♪ MP3", callback_data=f"dl|audio|mp3|{rid}"),
+         InlineKeyboardButton("♪ Opus", callback_data=f"dl|audio|opus|{rid}")],
+        cancel_row(rid),
     ])
 
 
-def simple_menu() -> InlineKeyboardMarkup:
-    """For galleries/direct files - no quality concept, just go/cancel."""
+def simple_menu(rid: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("↓ Download", callback_data="dl|simple|download")],
-        cancel_row(),
+        [InlineKeyboardButton("↓ Download", callback_data=f"dl|simple|download|{rid}")],
+        cancel_row(rid),
     ])
 
 
-def fallback_menu() -> InlineKeyboardMarkup:
-    """Used only if probing the link failed - three plain choices, no
-    fake specific-resolution options we can't actually confirm exist."""
+def fallback_menu(rid: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("★ Best quality", callback_data="dl|video|best")],
-        [InlineKeyboardButton("↓ Smallest size", callback_data="dl|video|worst"),
-         InlineKeyboardButton("♪ Audio only", callback_data="dl|audio|mp3")],
-        cancel_row(),
+        [InlineKeyboardButton("★ Best quality", callback_data=f"dl|video|best|{rid}")],
+        [InlineKeyboardButton("↓ Smallest size", callback_data=f"dl|video|worst|{rid}"),
+         InlineKeyboardButton("♪ Audio only", callback_data=f"dl|audio|mp3|{rid}")],
+        cancel_row(rid),
     ])
 
 
-def spotify_menu() -> InlineKeyboardMarkup:
-    """Spotify has no video/quality concept at all - just one button."""
+def spotify_menu(rid: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("♪ Download MP3", callback_data="dl|audio|mp3")],
-        cancel_row(),
+        [InlineKeyboardButton("♪ Download MP3", callback_data=f"dl|audio|mp3|{rid}")],
+        cancel_row(rid),
     ])
 
 
-def send_as_file_menu() -> InlineKeyboardMarkup:
-    """Offered after a video download completes, in case Telegram's video
-    compression/preview isn't what the person wants - re-fetches and sends
-    the same content as a plain file instead."""
+def send_as_file_menu(rid: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("▤ Send as file instead", callback_data="dl|asfile|x")],
+        [InlineKeyboardButton("▤ Send as file instead", callback_data=f"dl|asfile|{rid}")],
     ])
 
 
-def retry_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("↻ Try again", callback_data="dl|retry")]])
+def retry_menu(rid: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("↻ Try again", callback_data=f"dl|retry|{rid}")]])
 
 
-def queued_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([cancel_row()])
+def cancelled_menu(rid: str) -> InlineKeyboardMarkup:
+    """Cancelled state: offer both a retry and a clean way to dismiss."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("↻ Try again", callback_data=f"dl|retry|{rid}"),
+         InlineKeyboardButton("🗑 Delete", callback_data=f"dl|dismiss|{rid}")],
+    ])
+
+
+def queued_menu(rid: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([cancel_row(rid)])
