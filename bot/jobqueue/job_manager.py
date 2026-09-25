@@ -20,13 +20,11 @@ lines behind.
 """
 import asyncio
 import logging
-import re
 import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlparse
 
 from telegram import Bot, InputFile, InlineKeyboardMarkup
 from telegram.constants import ParseMode
@@ -34,11 +32,13 @@ from telegram.error import TelegramError
 
 from config import OWNER_EMOJI
 from downloader.dispatcher import download as dispatch_download, NoToolSucceeded
+from downloader.errors import JobCancelled
 from settings import access_control as ac
 from ui import messages
 from ui.progress import render_bar
-from ui.quick_menu import queued_menu, send_as_file_menu, retry_menu, cancelled_menu
+from ui.quick_menu import queued_menu, send_as_file_menu, sent_menu, retry_menu, cancelled_menu
 from utils.cleanup import job_workspace, new_cache_path
+from utils.text import esc, sanitize_step as _sanitize_step, friendly_domain as _friendly_domain
 
 log = logging.getLogger("candy.jobs")
 
@@ -48,39 +48,24 @@ HEARTBEAT_INTERVAL_SEC = 2.5
 RECENT_FILE_TTL_SECONDS = 5 * 60
 MAX_STEP_LINES = 3
 
-VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".webm"}
-
-_BRACKET_RE = re.compile(r"\[[^\]]*\]")
-_ERROR_PREFIX_RE = re.compile(r"(?i)\berror:\s*")
-_ID_COLON_RE = re.compile(r"\b(?=[\w-]*\d)[\w-]{6,}:\s*")
-_BOILERPLATE_CUTS = (
-    "; please report", "please report this issue",
-    "Confirm you are on the latest version",
-)
+# Extensions that are never the actual media - sidecar/thumbnail files
+# that can end up in the workspace alongside the real output. Everything
+# ELSE produced by a video-mode job is treated as the media to cache,
+# regardless of container (.mp4/.mkv/.webm/.ts/...): hardcoding a fixed
+# list of "video" extensions here previously meant that whenever yt-dlp
+# picked a container we hadn't enumerated (e.g. falling back to mkv
+# because a height-capped format paired VP9 video with Opus audio - a
+# combination that can't remux cleanly into mp4), the file silently never
+# got cached, so "Send as file instead" would find no cache and quietly
+# have to fall through to a slower re-download instead of behaving
+# identically to the max-quality case.
+_NON_MEDIA_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".part", ".ytdl", ".json", ".txt"}
 _UNSUPPORTED_MARKERS = ("unsupported url", "produced no files", "not a downloadable file", "no extractor")
-
-
-def _sanitize_step(text: str, url: str) -> str:
-    cleaned = (text or "").replace(url, "this link")
-    for cut in _BOILERPLATE_CUTS:
-        idx = cleaned.find(cut)
-        if idx != -1:
-            cleaned = cleaned[:idx]
-    cleaned = _ERROR_PREFIX_RE.sub("", cleaned)
-    cleaned = _BRACKET_RE.sub("", cleaned)
-    cleaned = _ID_COLON_RE.sub("", cleaned)
-    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" .;")
-    if len(cleaned) > 140:
-        cleaned = cleaned[:137].rstrip() + "..."
-    return cleaned or "failed"
-
-
-def _friendly_domain(url: str) -> str:
-    try:
-        host = urlparse(url).netloc
-        return host[4:] if host.startswith("www.") else host or "this link"
-    except Exception:  # noqa: BLE001
-        return "this link"
+# Containers Telegram will actually render as an inline, scrubbable video
+# preview via sendVideo. Anything else we get (e.g. yt-dlp falling back to
+# mkv because a capped height forced a VP9+Opus pairing) goes straight out
+# as a document instead of a preview that likely wouldn't play anyway.
+_STREAMABLE_VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".webm"}
 
 
 @dataclass
@@ -97,6 +82,7 @@ class Job:
     header: str = "Working"
     task: Optional[asyncio.Task] = field(default=None)
     cancelled: bool = False
+    cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 class JobManager:
@@ -137,6 +123,7 @@ class JobManager:
         if not job or job.cancelled or job.user_id != user_id:
             return False
         job.cancelled = True
+        job.cancel_event.set()
         if job.task and not job.task.done():
             job.task.cancel()
         return True
@@ -149,6 +136,7 @@ class JobManager:
         for job in list(self._jobs_by_rid.values()):
             if job.user_id == user_id and not job.cancelled:
                 job.cancelled = True
+                job.cancel_event.set()
                 if job.task and not job.task.done():
                     job.task.cancel()
                 count += 1
@@ -161,7 +149,7 @@ class JobManager:
         lines = [f"{OWNER_EMOJI} <b>Current queue</b>"]
         for job in jobs:
             state = "running" if job.task and not job.task.done() else "waiting"
-            lines.append(f"• <code>{job.url[:40]}</code> — {state}")
+            lines.append(f"• <code>{esc(job.url[:40])}</code> — {state}")
         return "\n".join(lines)
 
     def _render(self, job: Job) -> str:
@@ -174,7 +162,7 @@ class JobManager:
                 text = f"<b>{s}</b>" if (is_current and "<" not in s) else s
                 rendered.append(f"• {text}")
             lines.append("\n".join(rendered))
-        lines.append(f"<code>{job.url}</code>")
+        lines.append(f"<code>{esc(job.url)}</code>")
         return "\n\n".join(lines)
 
     async def _emit(self, job: Job, text: str, push: bool = True,
@@ -233,6 +221,7 @@ class JobManager:
             with open(path, "rb") as fh:
                 input_file = InputFile(fh, filename=f"{title}{path.suffix}")
                 await self.bot.send_document(chat_id, input_file, caption=caption, parse_mode=ParseMode.HTML,
+                                              reply_markup=sent_menu(url),
                                               read_timeout=180, write_timeout=180, connect_timeout=60)
         except (OSError, TelegramError) as exc:
             log.warning("Cached send failed for rid %s, falling back to re-download: %s", rid, exc)
@@ -271,7 +260,7 @@ class JobManager:
             try:
                 await self._run_job(job)
                 ac.log_download(job.user_id, job.url, "success")
-            except asyncio.CancelledError:
+            except (asyncio.CancelledError, JobCancelled):
                 ac.log_download(job.user_id, job.url, "cancelled")
                 job.header = "Cancelled"
                 await self._emit(job, "Cancelled", markup=cancelled_menu(job.rid))
@@ -322,7 +311,14 @@ class JobManager:
                     meta.append(speed)
                 if eta and eta not in ("~", ""):
                     meta.append(f"ETA {eta}")
-                line = f"{stage} · {' · '.join(meta)}" if (stage and meta) else (stage or "Working...")
+                if stage and meta:
+                    line = f"{stage} · {' · '.join(meta)}"
+                elif meta:
+                    line = " · ".join(meta)
+                elif stage:
+                    line = stage
+                else:
+                    line = "Working..."
             else:
                 bar = render_bar(percent)
                 meta = []
@@ -337,11 +333,13 @@ class JobManager:
             asyncio.create_task(self._emit(job, line, push=push, markup=queued_menu(job.rid)))
 
         with job_workspace() as workspace:
-            files = await dispatch_download(job.url, workspace, job.settings, job.user_id, progress_cb)
+            files = await dispatch_download(job.url, workspace, job.settings, job.user_id, progress_cb,
+                                             cancel_event=job.cancel_event)
 
-            for f in files:
-                if f.suffix.lower() in VIDEO_EXTS:
-                    await self._cache_video_file(job.rid, job.url, f)
+            if job.settings.get("mode") == "video":
+                for f in files:
+                    if f.suffix.lower() not in _NON_MEDIA_EXTS:
+                        await self._cache_video_file(job.rid, job.url, f)
 
             job.header = "Sending"
             await self._emit(job, "Uploading to Telegram...", markup=queued_menu(job.rid))
@@ -359,37 +357,38 @@ class JobManager:
                     input_file = InputFile(fh, filename=f.name)
                     await self.bot.send_document(
                         job.chat_id, input_file, caption=caption, parse_mode=ParseMode.HTML,
+                        reply_markup=sent_menu(job.url),
                         read_timeout=180, write_timeout=180, connect_timeout=60,
                     )
                 continue
 
             caption = messages.all_done_caption(f.stem[:100])
-            if suffix in VIDEO_EXTS:
+            if suffix in _STREAMABLE_VIDEO_EXTS:
                 await self._emit(job, f"Sending {size_mb:.1f} MB...", markup=None)
                 video_caption = caption + "\n\nWant the original file instead of this compressed preview?"
                 with open(f, "rb") as fh:
                     input_file = InputFile(fh, filename=f.name)
                     await self.bot.send_video(
                         job.chat_id, input_file, caption=video_caption, parse_mode=ParseMode.HTML,
-                        supports_streaming=True, reply_markup=send_as_file_menu(job.rid),
+                        supports_streaming=True, reply_markup=send_as_file_menu(job.rid, job.url),
                         read_timeout=120, write_timeout=120, connect_timeout=60,
                     )
             elif suffix in {".mp3", ".m4a", ".opus", ".flac", ".wav"}:
                 with open(f, "rb") as fh:
                     input_file = InputFile(fh, filename=f.name)
                     await self.bot.send_audio(job.chat_id, input_file, caption=caption,
-                                               parse_mode=ParseMode.HTML,
+                                               parse_mode=ParseMode.HTML, reply_markup=sent_menu(job.url),
                                                read_timeout=120, write_timeout=120, connect_timeout=60)
             elif suffix in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
                 with open(f, "rb") as fh:
                     input_file = InputFile(fh, filename=f.name)
                     await self.bot.send_photo(job.chat_id, input_file, caption=caption,
-                                               parse_mode=ParseMode.HTML)
+                                               parse_mode=ParseMode.HTML, reply_markup=sent_menu(job.url))
             else:
                 with open(f, "rb") as fh:
                     input_file = InputFile(fh, filename=f.name)
                     await self.bot.send_document(job.chat_id, input_file, caption=caption,
-                                                  parse_mode=ParseMode.HTML,
+                                                  parse_mode=ParseMode.HTML, reply_markup=sent_menu(job.url),
                                                   read_timeout=120, write_timeout=120, connect_timeout=60)
         try:
             await self.bot.delete_message(job.chat_id, job.status_message_id)

@@ -6,6 +6,7 @@ from typing import Callable
 import yt_dlp
 
 from config import COOKIES_DIR, DATA_DIR, BGUTIL_POT_URL
+from downloader.errors import JobCancelled
 
 log = logging.getLogger("candy.ytdlp")
 
@@ -34,14 +35,29 @@ def _format_selector(s: dict) -> str:
         return "bestaudio/best"
 
     quality = s["quality"]
+    if quality == "worst":
+        return "worstvideo+worstaudio/worst"
+
+    # Prefer an H.264+AAC pairing first - it remuxes into mp4 with zero
+    # re-encoding and zero surprises. VP9/AV1 video paired with Opus
+    # audio (yt-dlp's other common combo, especially once you cap the
+    # height below the site's absolute best) doesn't fit cleanly in an
+    # mp4 container; yt-dlp then keeps it as mkv instead despite
+    # merge_output_format, which is what made "send as file" behave
+    # inconsistently between quality picks - the cached/sent file simply
+    # wasn't the plain mp4 the rest of the pipeline expected. Falling
+    # back to "whatever's available" keeps every video downloadable even
+    # when no h264 rendition exists at that height.
     if quality == "best":
-        base = "bestvideo+bestaudio/best"
-    elif quality == "worst":
-        base = "worstvideo+worstaudio/worst"
-    else:
-        height = quality.rstrip("p")
-        base = f"bestvideo[height<={height}]+bestaudio/best[height<={height}]"
-    return base
+        return (
+            "bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]/"
+            "bestvideo+bestaudio/best"
+        )
+    height = quality.rstrip("p")
+    return (
+        f"bestvideo[height<={height}][vcodec^=avc1]+bestaudio[acodec^=mp4a]/"
+        f"bestvideo[height<={height}]+bestaudio/best[height<={height}]"
+    )
 
 
 def _build_opts(url: str, workspace: Path, s: dict, user_id: int, progress_hook, pp_hook) -> dict:
@@ -145,7 +161,7 @@ def _looks_like_bot_check(error: Exception) -> bool:
 
 
 async def download(url: str, workspace: Path, settings: dict, user_id: int,
-                    progress_cb: ProgressCB) -> list[Path]:
+                    progress_cb: ProgressCB, cancel_event: asyncio.Event | None = None) -> list[Path]:
     """Runs yt-dlp in a worker thread (it's blocking) and reports progress
     back onto the asyncio event loop via progress_cb.
 
@@ -158,10 +174,23 @@ async def download(url: str, workspace: Path, settings: dict, user_id: int,
     silent while postprocessors (merging, embedding thumbnails/metadata)
     run - which used to make the UI look frozen at ~98-100% for however
     long that takes. postprocessor_hooks fills that gap with a live
-    stage label instead."""
+    stage label instead.
+
+    cancel_event: yt-dlp runs in a worker thread, so asyncio.Task.cancel()
+    alone can't touch it - the task just gets cancelled once yt-dlp
+    eventually returns control, letting the download run to completion in
+    the background regardless. Checking this event from inside the hooks
+    (which yt-dlp calls from that same thread) and raising
+    DownloadCancelled is yt-dlp's own documented way to abort a download
+    that's actually in progress."""
     loop = asyncio.get_running_loop()
 
+    def _check_cancelled() -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise yt_dlp.utils.DownloadCancelled("Cancelled by user")
+
     def hook(d: dict) -> None:
+        _check_cancelled()
         if d.get("status") == "downloading":
             total = d.get("total_bytes") or d.get("total_bytes_estimate")
             downloaded = d.get("downloaded_bytes", 0)
@@ -180,6 +209,7 @@ async def download(url: str, workspace: Path, settings: dict, user_id: int,
         # meaningful transitions (merging, embedding, etc.) instead.
 
     def pp_hook(d: dict) -> None:
+        _check_cancelled()
         if d.get("status") == "started":
             name = d.get("postprocessor", "")
             label = _POSTPROCESSOR_LABELS.get(name, name or "Finishing up...")
@@ -214,11 +244,14 @@ async def download(url: str, workspace: Path, settings: dict, user_id: int,
 
     try:
         results = await run_with_timeout(base_opts)
+    except yt_dlp.utils.DownloadCancelled as exc:
+        raise JobCancelled(str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         if using_cookies or not _looks_like_bot_check(exc):
             raise
         last_error: Exception = exc
         for client in CLIENT_FALLBACKS:
+            _check_cancelled()
             clear_partial_output()
             retry_opts = dict(base_opts)
             retry_opts["extractor_args"] = {
@@ -230,6 +263,8 @@ async def download(url: str, workspace: Path, settings: dict, user_id: int,
                 results = await run_with_timeout(retry_opts)
                 last_error = None  # type: ignore[assignment]
                 break
+            except yt_dlp.utils.DownloadCancelled as retry_exc:
+                raise JobCancelled(str(retry_exc)) from retry_exc
             except Exception as retry_exc:  # noqa: BLE001
                 last_error = retry_exc
                 continue

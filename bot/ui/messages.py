@@ -1,3 +1,5 @@
+from html import escape as _esc
+
 from config import OWNER_NAME, OWNER_EMOJI
 
 WELCOME = f"{OWNER_EMOJI} <b>{OWNER_NAME}'s Downloader</b>\n\n→ Send me a link to get started."
@@ -16,7 +18,7 @@ def with_link(text: str, url: str) -> str:
     """Keeps the link visible (and easily copyable, via Telegram's
     tap-to-copy on <code> blocks) throughout the message's lifecycle,
     since we delete the person's original message."""
-    return f"{text}\n\n<code>{url}</code>"
+    return f"{text}\n\n<code>{_esc(url)}</code>"
 
 
 def join_required(channel: str) -> str:
@@ -42,7 +44,11 @@ def unsupported_link() -> str:
 
 
 def generic_error(detail: str) -> str:
-    short = (detail or "").strip()[:200] or "Unknown error"
+    # detail is tool/error output - inherently untrusted (a page's title,
+    # an error string echoed from a remote server, etc.) - escape before
+    # it goes into <code>, or a stray '<' makes Telegram reject the whole
+    # message ("can't parse entities") and the person just sees nothing.
+    short = _esc((detail or "").strip()[:200]) or "Unknown error"
     if any(marker in short.lower() for marker in ("sign in", "cookies", "log in", "login", "logged-in")):
         return (
             f"✕ Didn't work:\n<code>{short}</code>\n\n"
@@ -52,4 +58,4 @@ def generic_error(detail: str) -> str:
 
 
 def all_done_caption(title: str) -> str:
-    return f"{OWNER_EMOJI} {title}"
+    return f"{OWNER_EMOJI} {_esc(title)}"

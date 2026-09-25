@@ -19,11 +19,11 @@ from settings.user_settings import get_settings, update_setting, reset_settings
 from ui import messages, admin_menu
 from ui.quick_menu import (
     video_menu, extended_video_menu, simple_menu, fallback_menu, spotify_menu,
-    audio_only_menu, queued_menu,
+    audio_only_menu, queued_menu, redo_menu,
 )
 from ui.settings_menu import (
     main_menu, mode_menu, quality_menu, subs_menu, playlist_menu,
-    advanced_menu, confirm_reset_menu, back_to_main,
+    advanced_menu, confirm_reset_menu, back_to_main, ADVANCED_TEXT_FIELDS, SETTINGS_LEGEND,
 )
 from ui.start_menu import start_menu
 from downloader.probe import probe, ProbeResult
@@ -33,6 +33,7 @@ from downloader.dispatcher import FRIENDLY_TOOL
 from downloader.spotify_handler import get_track_info
 from updater.auto_update import daily_update_loop, run_update_once
 from utils.cleanup import sweep_orphaned_workspaces
+from utils.text import esc
 from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -49,7 +50,36 @@ job_manager: JobManager | None = None
 pending_links: dict[str, tuple[int, str]] = {}          # rid -> (user_id, url)
 pending_probes: dict[str, ProbeResult] = {}             # rid -> probe result, for "more options"
 pending_admin_input: dict[int, str] = {}                # user_id -> which admin panel field they're typing
+pending_setting_input: dict[int, str] = {}              # user_id -> which advanced-settings field they're typing
 last_download: dict[str, tuple[int, str, dict]] = {}    # rid -> (user_id, url, settings)
+
+# None of the rid-keyed dicts above ever had anything removing an entry
+# once its message was long gone (deleted, or from a chat the person left)
+# - a heavily-used bot would accumulate one entry per link forever. This
+# tracks when each rid was last touched so a background sweep can drop
+# anything old enough that it can no longer be reached from any live
+# button (Telegram callback buttons on a message don't expire, but a
+# multi-hour-old "Queued"/quality-pick button is realistically dead).
+_rid_last_touch: dict[str, float] = {}
+RID_STATE_TTL_SECONDS = 2 * 60 * 60
+
+
+def _touch_rid(rid: str) -> None:
+    _rid_last_touch[rid] = time.time()
+
+
+async def _sweep_stale_link_state_loop() -> None:
+    while True:
+        await asyncio.sleep(15 * 60)
+        now = time.time()
+        stale = [rid for rid, ts in _rid_last_touch.items() if now - ts > RID_STATE_TTL_SECONDS]
+        for rid in stale:
+            pending_links.pop(rid, None)
+            pending_probes.pop(rid, None)
+            last_download.pop(rid, None)
+            _rid_last_touch.pop(rid, None)
+        if stale:
+            log.info("Pruned %d stale link state entries", len(stale))
 
 
 def new_rid() -> str:
@@ -94,6 +124,20 @@ async def gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
             await update.message.reply_text(messages.join_required(channel), reply_markup=kb)
             return False
 
+    return True
+
+
+async def gate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """gate(), but for a CallbackQuery - old dl|/nav|/s| buttons from
+    before someone was removed, or from before Private mode was turned
+    on, kept working forever because nothing checked access on the
+    callback path at all (only the /command handlers did). Skips the
+    force-join UI here (there's no good way to show it inline on someone
+    else's message) and just checks the allow-list."""
+    user_id = update.effective_user.id
+    if not ac.is_allowed(user_id):
+        await update.callback_query.answer(messages.PRIVATE_BOT, show_alert=True)
+        return False
     return True
 
 
@@ -249,11 +293,14 @@ async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
+    if not await gate_callback(update, context):
+        return
     user_id = update.effective_user.id
     data = query.data or ""
 
     if data.startswith("nav|"):
         screen = data.split("|", 1)[1]
+        pending_setting_input.pop(user_id, None)
 
         if screen == "cookies":
             await query.edit_message_text(COOKIES_HELP, parse_mode=ParseMode.HTML, reply_markup=back_to_main())
@@ -263,9 +310,16 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await query.edit_message_text(messages.WELCOME, parse_mode=ParseMode.HTML, reply_markup=start_menu())
             return
 
+        if screen in ADVANCED_TEXT_FIELDS:
+            pending_setting_input[user_id] = screen
+            field = ADVANCED_TEXT_FIELDS[screen]
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("← Cancel", callback_data="nav|advanced")]])
+            await query.edit_message_text(field["prompt"], reply_markup=kb)
+            return
+
         s = get_settings(user_id)
         screens = {
-            "main": (main_menu, settings_title()),
+            "main": (main_menu, settings_title() + "\n\n" + SETTINGS_LEGEND),
             "mode": (mode_menu, "Pick a mode"),
             "quality": (quality_menu, "Pick quality/format"),
             "subs": (subs_menu, "Subtitles"),
@@ -398,11 +452,32 @@ async def handle_admin_text_input(update: Update, user_id: int, text: str) -> No
         await update.message.reply_text(f"✓ Force-join set to {channel}.")
 
 
+async def handle_setting_text_input(update: Update, user_id: int, text: str) -> None:
+    screen = pending_setting_input.pop(user_id)
+    field = ADVANCED_TEXT_FIELDS[screen]
+    try:
+        value, confirmation = field["parser"](text)
+    except ValueError as exc:
+        # Bad input - keep waiting rather than silently dropping back to
+        # the menu, so a typo doesn't make the person start over.
+        pending_setting_input[user_id] = screen
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("← Cancel", callback_data="nav|advanced")]])
+        await update.message.reply_text(str(exc), reply_markup=kb)
+        return
+
+    update_setting(user_id, field["setting_key"], value)
+    s = get_settings(user_id)
+    await update.message.reply_text(f"✓ {confirmation}", parse_mode=ParseMode.HTML,
+                                     reply_markup=advanced_menu(s))
+
+
 # ---------- misc buttons (from /start) ----------
 
 async def misc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
+    if not await gate_callback(update, context):
+        return
     action = (query.data or "").split("|", 1)[1]
     if action == "queue":
         text = job_manager.active_summary(update.effective_user.id)
@@ -419,11 +494,12 @@ async def handle_spotify_link(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
     info = await get_track_info(url)
     pending_links[rid] = (user_id, url)
+    _touch_rid(rid)
 
     title = (info or {}).get("title") or "Spotify track"
     thumbnail = (info or {}).get("thumbnail") or ""
     markup = spotify_menu(rid)
-    caption = messages.with_link(title, url)
+    caption = messages.with_link(esc(title), url)
 
     if thumbnail:
         try:
@@ -436,7 +512,12 @@ async def handle_spotify_link(update: Update, context: ContextTypes.DEFAULT_TYPE
         except Exception:  # noqa: BLE001
             log.debug("Spotify thumbnail send failed, falling back to text", exc_info=True)
 
-    await status_msg.edit_text(caption, parse_mode=ParseMode.HTML, reply_markup=markup)
+    try:
+        await status_msg.edit_text(caption, parse_mode=ParseMode.HTML, reply_markup=markup)
+    except Exception:  # noqa: BLE001
+        log.warning("Falling back to plain text after HTML edit failed", exc_info=True)
+        await status_msg.edit_text(messages.with_link(messages.PICK_OPTION, url), parse_mode=ParseMode.HTML,
+                                    reply_markup=markup)
 
 
 async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -445,6 +526,10 @@ async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if user_id in pending_admin_input:
         await handle_admin_text_input(update, user_id, raw_text)
+        return
+
+    if user_id in pending_setting_input:
+        await handle_setting_text_input(update, user_id, raw_text)
         return
 
     match = URL_RE.search(raw_text)
@@ -474,10 +559,12 @@ async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     probe_result = await probe(url) if order[0] == "ytdlp" else None
     pending_links[rid] = (user_id, url)
+    _touch_rid(rid)
 
     if probe_result and probe_result.ok and not probe_result.is_playlist:
         pending_probes[rid] = probe_result
-        caption = messages.with_link(probe_result.title or messages.PICK_OPTION, url)
+        _touch_rid(rid)
+        caption = messages.with_link(esc(probe_result.title) if probe_result.title else messages.PICK_OPTION, url)
         if probe_result.heights:
             markup = video_menu(probe_result, rid)
         elif probe_result.has_audio:
@@ -498,7 +585,12 @@ async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 return
             except Exception:  # noqa: BLE001
                 log.debug("Thumbnail send failed, falling back to text menu", exc_info=True)
-        await status_msg.edit_text(caption, parse_mode=ParseMode.HTML, reply_markup=markup)
+        try:
+            await status_msg.edit_text(caption, parse_mode=ParseMode.HTML, reply_markup=markup)
+        except Exception:  # noqa: BLE001
+            log.warning("Falling back to plain text after HTML edit failed", exc_info=True)
+            await status_msg.edit_text(messages.with_link(messages.PICK_OPTION, url), parse_mode=ParseMode.HTML,
+                                        reply_markup=markup)
         return
 
     # Primary probe failed (or this domain never uses yt-dlp first). For
@@ -512,7 +604,7 @@ async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         gdl_info = await gallerydl_probe.probe(url)
 
     if gdl_info and (gdl_info.get("title") or gdl_info.get("thumbnail")):
-        caption = messages.with_link(gdl_info.get("title") or messages.PICK_OPTION, url)
+        caption = messages.with_link(esc(gdl_info["title"]) if gdl_info.get("title") else messages.PICK_OPTION, url)
         markup = simple_menu(rid) if order[0] != "ytdlp" else fallback_menu(rid)
         if gdl_info.get("thumbnail"):
             try:
@@ -524,7 +616,12 @@ async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 return
             except Exception:  # noqa: BLE001
                 log.debug("gallery-dl thumbnail send failed, falling back to text menu", exc_info=True)
-        await status_msg.edit_text(caption, parse_mode=ParseMode.HTML, reply_markup=markup)
+        try:
+            await status_msg.edit_text(caption, parse_mode=ParseMode.HTML, reply_markup=markup)
+        except Exception:  # noqa: BLE001
+            log.warning("Falling back to plain text after HTML edit failed", exc_info=True)
+            await status_msg.edit_text(messages.with_link(messages.PICK_OPTION, url), parse_mode=ParseMode.HTML,
+                                        reply_markup=markup)
         return
 
     if order[0] != "ytdlp":
@@ -539,6 +636,8 @@ async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
+    if not await gate_callback(update, context):
+        return
     user_id = update.effective_user.id
     parts = (query.data or "").split("|")
     action = parts[1] if len(parts) > 1 else ""
@@ -561,8 +660,7 @@ async def link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         entry = pending_links.get(rid)
         if entry and entry[0] == user_id:
             url = entry[1]
-            markup = InlineKeyboardMarkup([[InlineKeyboardButton("↻ Try again", callback_data=f"dl|redo|{rid}")]])
-            await set_text(messages.with_link(messages.CANCELLED, url), markup=markup)
+            await set_text(messages.with_link(messages.CANCELLED, url), markup=redo_menu(rid))
         else:
             await set_text(messages.CANCELLED)
         return
@@ -575,7 +673,7 @@ async def link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         url = entry[1]
         probe_result = pending_probes.get(rid)
         markup = video_menu(probe_result, rid) if probe_result else fallback_menu(rid)
-        title = probe_result.title if probe_result and probe_result.title else messages.PICK_OPTION
+        title = esc(probe_result.title) if probe_result and probe_result.title else messages.PICK_OPTION
         await set_text(messages.with_link(title, url), markup=markup)
         return
 
@@ -675,6 +773,7 @@ async def link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         # "simple" (gallery/direct file): leave settings as-is
 
         last_download[rid] = (user_id, url, job_settings)
+        _touch_rid(rid)
         await set_text(messages.with_link(messages.QUEUED, url), markup=queued_menu(rid))
         await job_manager.enqueue(
             rid, user_id, query.message.chat_id, url, job_settings, query.message.message_id, is_photo=is_photo,
@@ -743,6 +842,7 @@ async def post_init(application: Application) -> None:
     job_manager.start()
     asyncio.create_task(run_update_once(application.bot, notify_admins=False))
     asyncio.create_task(daily_update_loop(application.bot, config.AUTO_UPDATE_HOUR_UTC))
+    asyncio.create_task(_sweep_stale_link_state_loop())
     log.info("%s is ready %s", config.OWNER_NAME, config.OWNER_EMOJI)
 
 

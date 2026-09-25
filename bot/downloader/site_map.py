@@ -48,13 +48,33 @@ KNOWN_STREAMING_DOMAINS = [
 ]
 
 
+def _hostname(url: str) -> str:
+    from urllib.parse import urlsplit
+    try:
+        host = (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        host = ""
+    return host[4:] if host.startswith("www.") else host
+
+
+def _matches(host: str, domain: str) -> bool:
+    """True if `host` IS `domain`, or a subdomain of it (m.youtube.com
+    matches youtube.com). Deliberately NOT a substring check - that used
+    to match "x.com" inside "dropbox.com"/"box.com"/"netflix.com", or
+    any domain name appearing later in the URL (e.g. inside a redirect's
+    query string), routing those links to the wrong tools entirely."""
+    return host == domain or host.endswith("." + domain)
+
+
 def tool_order_for(url: str) -> list[str]:
+    host = _hostname(url)
+
     for domain, order in OVERRIDES.items():
-        if domain in url:
+        if _matches(host, domain):
             return order
 
     for domain in KNOWN_STREAMING_DOMAINS:
-        if domain in url:
+        if _matches(host, domain):
             return ["ytdlp"]
 
     # Truly unrecognized domain: could be a video site yt-dlp still knows

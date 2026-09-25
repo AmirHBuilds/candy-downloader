@@ -42,7 +42,7 @@ async def get_track_info(url: str) -> dict | None:
 
 
 async def download(url: str, workspace: Path, settings: dict, user_id: int,
-                    progress_cb: ProgressCB) -> list[Path]:
+                    progress_cb: ProgressCB, cancel_event=None) -> list[Path]:
     title = await get_track_title(url)
     if not title:
         raise RuntimeError(
@@ -54,4 +54,5 @@ async def download(url: str, workspace: Path, settings: dict, user_id: int,
     audio_settings["mode"] = "audio"
     search_query = f"ytsearch1:{title} audio"
     log.info("Spotify track %r -> searching YouTube: %s", title, search_query)
-    return await ytdlp_handler.download(search_query, workspace, audio_settings, user_id, progress_cb)
+    return await ytdlp_handler.download(search_query, workspace, audio_settings, user_id, progress_cb,
+                                         cancel_event=cancel_event)

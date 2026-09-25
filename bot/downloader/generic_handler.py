@@ -6,6 +6,8 @@ from typing import Callable
 
 import httpx
 
+from downloader.errors import JobCancelled
+
 log = logging.getLogger("candy.generic")
 
 ProgressCB = Callable[[float, str | None, str | None], None]
@@ -41,7 +43,7 @@ STALL_TIMEOUT_SECONDS = 45  # no output at all for this long -> probably stuck/b
 
 
 async def download(url: str, workspace: Path, settings: dict, user_id: int,
-                    progress_cb: ProgressCB) -> list[Path]:
+                    progress_cb: ProgressCB, cancel_event: asyncio.Event | None = None) -> list[Path]:
     """Last-resort downloader for plain direct file links (pdf, zip, mp4
     hosted directly, etc.) using aria2c for fast multi-connection fetching.
     Refuses to accept an HTML page as a "successful" download."""
@@ -93,17 +95,38 @@ async def download(url: str, workspace: Path, settings: dict, user_id: int,
                 percent = float(match.group(1))
                 progress_cb(percent, match.group(2), match.group(3))
 
+    cancelled = False
+
+    async def cancel_watcher() -> None:
+        nonlocal cancelled
+        if cancel_event is None:
+            return
+        await cancel_event.wait()
+        cancelled = True
+        if process.returncode is None:
+            process.kill()
+
+    watcher_task = asyncio.create_task(cancel_watcher())
     try:
         await asyncio.wait_for(read_output(), timeout=DOWNLOAD_TIMEOUT_SECONDS)
         await asyncio.wait_for(process.wait(), timeout=30)
     except asyncio.TimeoutError:
         process.kill()
         await process.wait()
+        if cancelled:
+            raise JobCancelled("Cancelled by user")
         raise RuntimeError(f"Timed out after {DOWNLOAD_TIMEOUT_SECONDS // 60} minutes - the connection was too slow/stuck")
     except RuntimeError:
         process.kill()
         await process.wait()
+        if cancelled:
+            raise JobCancelled("Cancelled by user")
         raise
+    finally:
+        watcher_task.cancel()
+
+    if cancelled:
+        raise JobCancelled("Cancelled by user")
 
     if process.returncode != 0:
         raise RuntimeError(f"aria2c exited with code {process.returncode} — link may not be a direct file")

@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Callable
 
 from downloader import ytdlp_handler, gallerydl_handler, generic_handler, spotify_handler
+from downloader.errors import JobCancelled  # noqa: F401 - re-exported for callers
 from downloader.site_map import tool_order_for
 
 log = logging.getLogger("candy.dispatcher")
@@ -39,7 +40,8 @@ class NoToolSucceeded(Exception):
 
 
 async def download(url: str, workspace: Path, settings: dict, user_id: int,
-                    progress_cb: Callable[[str, float | None, str | None, str | None, str | None], None]
+                    progress_cb: Callable[[str, float | None, str | None, str | None, str | None], None],
+                    cancel_event=None,
                     ) -> list[Path]:
     """Tries each candidate tool in priority order for this URL's domain.
 
@@ -63,11 +65,13 @@ async def download(url: str, workspace: Path, settings: dict, user_id: int,
             def cb(percent, speed, eta, stage=None, _tool=tool_name):
                 progress_cb(_tool, percent, speed, eta, stage)
 
-            files = await handler(url, workspace, settings, user_id, cb)
+            files = await handler(url, workspace, settings, user_id, cb, cancel_event=cancel_event)
             if files:
                 return files
             attempts[tool_name] = "produced no files"
             progress_cb(tool_name, None, None, None, f"{label}: produced no files")
+        except JobCancelled:
+            raise
         except Exception as exc:  # noqa: BLE001 - we want to try the next tool regardless of cause
             log.warning("%s failed for %s: %s", tool_name, url, exc)
             attempts[tool_name] = str(exc)

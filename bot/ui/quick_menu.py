@@ -12,7 +12,7 @@ the first message's buttons act on the second link instead (they'd
 share one per-user slot) - this is what threading the token through
 everywhere prevents.
 """
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup
 
 from downloader.probe import ProbeResult
 
@@ -94,22 +94,58 @@ def spotify_menu(rid: str) -> InlineKeyboardMarkup:
     ])
 
 
-def send_as_file_menu(rid: str) -> InlineKeyboardMarkup:
+def link_row(url: str) -> list[InlineKeyboardButton]:
+    """A tap-to-copy button for the original source link. Telegram deletes
+    the person's own message once we've picked up its URL (see
+    link_handler), and the status message that shows it as <code> text
+    also gets deleted once the file is delivered - without this, the link
+    is gone from the chat entirely the moment the download finishes."""
+    # Telegram limits a copy-text payload to 256 characters - fall back to
+    # a plain (non-copy) link-styled button rather than crashing if some
+    # unusually long URL ever exceeds that.
+    if len(url) > 256:
+        return [InlineKeyboardButton("🔗 Video link", url=url)]
+    return [InlineKeyboardButton("🔗 Video link", copy_text=CopyTextButton(text=url))]
+
+
+def send_as_file_menu(rid: str, url: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("▤ Send as file instead", callback_data=f"dl|asfile|{rid}")],
+        link_row(url),
+    ])
+
+
+def sent_menu(url: str) -> InlineKeyboardMarkup:
+    """Attached to audio/document sends, which have no "send as file"
+    choice of their own - just keeps the source link copyable."""
+    return InlineKeyboardMarkup([link_row(url)])
+
+
+def redo_menu(rid: str) -> InlineKeyboardMarkup:
+    """Same Try-again + Delete shape as retry_menu, but for cancelling
+    before a quality pick was even made - there's no completed download
+    settings to retry yet, so this re-shows the quality picker instead."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("↻ Try again", callback_data=f"dl|redo|{rid}"),
+         InlineKeyboardButton("✕ Delete", callback_data=f"dl|dismiss|{rid}")],
     ])
 
 
 def retry_menu(rid: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("↻ Try again", callback_data=f"dl|retry|{rid}")]])
-
-
-def cancelled_menu(rid: str) -> InlineKeyboardMarkup:
-    """Cancelled state: offer both a retry and a clean way to dismiss."""
+    """Used for every terminal non-success state (cancelled, failed,
+    expired) so "Try again" and "Delete" are always both offered together
+    - previously a couple of code paths built their own ad-hoc
+    Try-again-only markup, so the delete button only showed up
+    sometimes."""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("↻ Try again", callback_data=f"dl|retry|{rid}"),
-         InlineKeyboardButton("🗑 Delete", callback_data=f"dl|dismiss|{rid}")],
+         InlineKeyboardButton("✕ Delete", callback_data=f"dl|dismiss|{rid}")],
     ])
+
+
+# Same shape, kept as a separate name where the call site is specifically
+# about a cancellation rather than a failure - purely for readability.
+cancelled_menu = retry_menu
 
 
 def queued_menu(rid: str) -> InlineKeyboardMarkup:

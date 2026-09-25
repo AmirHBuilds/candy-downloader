@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Callable
 
 from config import COOKIES_DIR
+from downloader.errors import JobCancelled
 
 log = logging.getLogger("candy.gallerydl")
 
@@ -14,7 +15,7 @@ DOWNLOAD_TIMEOUT_SECONDS = 20 * 60
 
 
 async def download(url: str, workspace: Path, settings: dict, user_id: int,
-                    progress_cb: ProgressCB) -> list[Path]:
+                    progress_cb: ProgressCB, cancel_event: asyncio.Event | None = None) -> list[Path]:
     """gallery-dl doesn't expose granular byte-level progress. Rather than
     faking a percentage that climbs regardless of whether the download is
     actually succeeding (misleading if it's about to fail), this shows
@@ -47,7 +48,19 @@ async def download(url: str, workspace: Path, settings: dict, user_id: int,
             progress_cb(None, f"{elapsed}s elapsed", None, None)
             await asyncio.sleep(2.0)
 
+    cancelled = False
+
+    async def cancel_watcher() -> None:
+        nonlocal cancelled
+        if cancel_event is None:
+            return
+        await cancel_event.wait()
+        cancelled = True
+        if process.returncode is None:
+            process.kill()
+
     heartbeat_task = asyncio.create_task(heartbeat())
+    watcher_task = asyncio.create_task(cancel_watcher())
     try:
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=DOWNLOAD_TIMEOUT_SECONDS)
     except asyncio.TimeoutError:
@@ -56,6 +69,10 @@ async def download(url: str, workspace: Path, settings: dict, user_id: int,
         raise RuntimeError(f"gallery-dl timed out after {DOWNLOAD_TIMEOUT_SECONDS // 60} minutes")
     finally:
         heartbeat_task.cancel()
+        watcher_task.cancel()
+
+    if cancelled:
+        raise JobCancelled("Cancelled by user")
 
     if process.returncode != 0:
         raise RuntimeError(stderr.decode(errors="ignore") or stdout.decode(errors="ignore"))
