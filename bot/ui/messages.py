@@ -15,10 +15,13 @@ PRIVATE_BOT = f"• This is {OWNER_NAME}'s private bot. Ask her to add you."
 
 
 def with_link(text: str, url: str) -> str:
-    """Keeps the link visible (and easily copyable, via Telegram's
-    tap-to-copy on <code> blocks) throughout the message's lifecycle,
-    since we delete the person's original message."""
-    return f"{text}\n\n<code>{_esc(url)}</code>"
+    """Historical name kept so call sites don't all need touching - no
+    longer actually inlines the link. The raw URL used to appear as
+    <code>text</code> on every single status message, which was
+    unnecessary now that the specific screens where someone might
+    actually want to copy the link back out (cancelled, failed, and
+    delivered) attach a dedicated copy-link button instead."""
+    return text
 
 
 def join_required(channel: str) -> str:

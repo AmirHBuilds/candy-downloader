@@ -121,25 +121,29 @@ def sent_menu(url: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([link_row(url)])
 
 
-def redo_menu(rid: str) -> InlineKeyboardMarkup:
+def redo_menu(rid: str, url: str) -> InlineKeyboardMarkup:
     """Same Try-again + Delete shape as retry_menu, but for cancelling
     before a quality pick was even made - there's no completed download
     settings to retry yet, so this re-shows the quality picker instead."""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("↻ Try again", callback_data=f"dl|redo|{rid}"),
          InlineKeyboardButton("✕ Delete", callback_data=f"dl|dismiss|{rid}")],
+        link_row(url),
     ])
 
 
-def retry_menu(rid: str) -> InlineKeyboardMarkup:
+def retry_menu(rid: str, url: str) -> InlineKeyboardMarkup:
     """Used for every terminal non-success state (cancelled, failed,
     expired) so "Try again" and "Delete" are always both offered together
     - previously a couple of code paths built their own ad-hoc
     Try-again-only markup, so the delete button only showed up
-    sometimes."""
+    sometimes. Also the only place the source link survives on a
+    cancelled/failed download, now that it's no longer inlined into the
+    message text."""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("↻ Try again", callback_data=f"dl|retry|{rid}"),
          InlineKeyboardButton("✕ Delete", callback_data=f"dl|dismiss|{rid}")],
+        link_row(url),
     ])
 
 

@@ -51,8 +51,14 @@ services:
       - ./data:/app/data           # per-user settings, small persistent DB
       - ./tmp:/app/tmp             # scratch space for in-progress downloads (auto-cleaned)
       - ./cookies:/app/cookies     # optional per-user cookie files for logged-in sites
-    # Bot process needs write access to a shared tmp dir with the bot-api
-    # server ONLY if you want local-mode fast file uploads (optional, see README).
+      - bot_api_data:/var/lib/telegram-bot-api:ro
+    # That last mount is NOT optional, unlike the comment used to say here:
+    # with TELEGRAM_LOCAL=1 above, the bot-api server's HTTP file-serving
+    # endpoint is switched off entirely, and any file the user sends TO the
+    # bot (cookies.txt, and anything else in future) can only be read by
+    # reaching directly into the bot-api server's own storage - which is
+    # exactly what this shared, read-only mount lets python-telegram-bot's
+    # download_to_drive() do automatically.
 
 volumes:
   bot_api_data:

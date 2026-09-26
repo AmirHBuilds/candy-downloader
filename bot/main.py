@@ -22,8 +22,7 @@ from ui.quick_menu import (
     audio_only_menu, queued_menu, redo_menu,
 )
 from ui.settings_menu import (
-    main_menu, mode_menu, quality_menu, subs_menu, playlist_menu,
-    advanced_menu, confirm_reset_menu, back_to_main, ADVANCED_TEXT_FIELDS, SETTINGS_LEGEND,
+    main_menu, advanced_menu, confirm_reset_menu, back_to_main, ADVANCED_TEXT_FIELDS, SETTINGS_LEGEND,
 )
 from ui.start_menu import start_menu
 from downloader.probe import probe, ProbeResult
@@ -184,6 +183,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"{config.OWNER_EMOJI} <b>{config.OWNER_NAME}'s Downloader</b>",
         "Paste a link, pick from the buttons.",
         "",
+        "/adhd_on — skip the picker, always grab best quality, no questions",
+        "/adhd_off — turn that back off",
         "/settings — your saved defaults (cookies help is in there too)",
         "/queue — what's running",
         "/cancel — stop your current download",
@@ -269,8 +270,23 @@ async def cookies_file_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     Path(config.COOKIES_DIR).mkdir(parents=True, exist_ok=True)
     dest = Path(config.COOKIES_DIR) / f"{user_id}.txt"
 
-    tg_file = await doc.get_file()
-    await tg_file.download_to_drive(custom_path=str(dest))
+    try:
+        tg_file = await doc.get_file()
+        await tg_file.download_to_drive(custom_path=str(dest))
+    except Exception:  # noqa: BLE001
+        log.exception("Couldn't fetch the uploaded cookies file")
+        hint = ""
+        if config.LOCAL_BOT_API_URL:
+            hint = (
+                "\n\nThis usually means the bot container can't reach the local Bot API "
+                "server's storage - check that docker-compose.yml mounts the same "
+                "<code>bot_api_data</code> volume into both the <code>telegram-bot-api</code> "
+                "and <code>bot</code> services."
+            )
+        await update.message.reply_text(
+            f"✕ Couldn't read that file — try sending it again.{hint}", parse_mode=ParseMode.HTML,
+        )
+        return
 
     update_setting(user_id, "cookies_enabled", True)
     await update.message.reply_text("Cookies saved and turned on — just for you.")
@@ -287,7 +303,25 @@ async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     await _delete_quietly(update.message)
     s = get_settings(update.effective_user.id)
-    await update.message.reply_text(settings_title(), parse_mode=ParseMode.HTML, reply_markup=main_menu(s))
+    await update.message.reply_text(settings_title() + "\n\n" + SETTINGS_LEGEND, parse_mode=ParseMode.HTML,
+                                     reply_markup=main_menu(s))
+
+
+async def adhd_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await gate(update, context):
+        return
+    update_setting(update.effective_user.id, "adhd_mode", True)
+    await update.message.reply_text(
+        "🧠⚡ ADHD Mode is ON. Send a link — you'll get the file, best "
+        "quality, no questions asked. /adhd_off to turn it back off."
+    )
+
+
+async def adhd_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await gate(update, context):
+        return
+    update_setting(update.effective_user.id, "adhd_mode", False)
+    await update.message.reply_text("🧠 ADHD Mode is off. You'll get the quality picker again.")
 
 
 async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -320,16 +354,12 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         s = get_settings(user_id)
         screens = {
             "main": (main_menu, settings_title() + "\n\n" + SETTINGS_LEGEND),
-            "mode": (mode_menu, "Pick a mode"),
-            "quality": (quality_menu, "Pick quality/format"),
-            "subs": (subs_menu, "Subtitles"),
-            "playlist": (playlist_menu, "Playlist handling"),
-            "advanced": (advanced_menu, "Advanced settings"),
+            "advanced": (advanced_menu, "⚙️ Advanced settings"),
             "reset": (confirm_reset_menu, "Reset ALL your settings to default?"),
         }
         if screen in screens:
             builder, title = screens[screen]
-            markup = builder(s) if builder not in (mode_menu, confirm_reset_menu) else builder()
+            markup = builder() if builder is confirm_reset_menu else builder(s)
             await query.edit_message_text(title, parse_mode=ParseMode.HTML, reply_markup=markup)
         return
 
@@ -338,13 +368,14 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         if key == "__reset__":
             reset_settings(user_id)
         elif key in {"embed_thumbnail", "embed_metadata", "sponsorblock", "use_archive",
-                     "embed_subtitles", "cookies_enabled"}:
+                     "embed_subtitles", "cookies_enabled", "adhd_mode"}:
             update_setting(user_id, key, value == "1")
         else:
             update_setting(user_id, key, value)
 
         s = get_settings(user_id)
-        await query.edit_message_text(settings_title(), parse_mode=ParseMode.HTML, reply_markup=main_menu(s))
+        await query.edit_message_text(settings_title() + "\n\n" + SETTINGS_LEGEND, parse_mode=ParseMode.HTML,
+                                       reply_markup=main_menu(s))
 
 
 # ---------- owner admin panel ----------
@@ -487,6 +518,28 @@ async def misc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 # ---------- link handling ----------
 
+async def handle_adhd_download(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, rid: str,
+                                user_id: int) -> None:
+    """ADHD Mode: no probing, no quality picker, no confirmation - just
+    queue the best-quality download straight away. Spotify links still
+    need spotify_handler's own title lookup during the actual download
+    (that's unavoidable - it has to search YouTube for a matching track),
+    but skip our own confirmation menu for it too."""
+    job_settings = dict(get_settings(user_id))
+    if "spotify.com" in url:
+        job_settings["mode"] = "audio"
+    else:
+        job_settings["mode"] = "video"
+        job_settings["quality"] = "best"
+
+    last_download[rid] = (user_id, url, job_settings)
+    _touch_rid(rid)
+    status_msg = await context.bot.send_message(
+        update.effective_chat.id, messages.QUEUED, parse_mode=ParseMode.HTML, reply_markup=queued_menu(rid),
+    )
+    await job_manager.enqueue(rid, user_id, status_msg.chat_id, url, job_settings, status_msg.message_id)
+
+
 async def handle_spotify_link(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, rid: str) -> None:
     user_id = update.effective_user.id
     status_msg = await context.bot.send_message(
@@ -546,6 +599,10 @@ async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await _delete_quietly(update.message)
 
     rid = new_rid()
+
+    if get_settings(user_id).get("adhd_mode"):
+        await handle_adhd_download(update, context, url, rid, user_id)
+        return
 
     if "spotify.com" in url:
         await handle_spotify_link(update, context, url, rid)
@@ -660,7 +717,7 @@ async def link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         entry = pending_links.get(rid)
         if entry and entry[0] == user_id:
             url = entry[1]
-            await set_text(messages.with_link(messages.CANCELLED, url), markup=redo_menu(rid))
+            await set_text(messages.with_link(messages.CANCELLED, url), markup=redo_menu(rid, url))
         else:
             await set_text(messages.CANCELLED)
         return
@@ -835,6 +892,26 @@ def wait_for_pot_provider(url: str, timeout_seconds: int = 20) -> None:
     log.warning("PO Token provider didn't respond within %ss - continuing anyway.", timeout_seconds)
 
 
+async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Without this, PTB's default behavior for ANY unhandled exception in
+    ANY handler is to log it server-side and tell the user nothing at all -
+    which is exactly what happened with the cookies-upload crash: a full
+    traceback in the logs, and total silence in the chat. This can't fix
+    the underlying error, but it makes sure a person is never just left
+    staring at a bot that stopped responding with no explanation."""
+    log.error("Unhandled exception while processing update: %s", update, exc_info=context.error)
+    if not isinstance(update, Update):
+        return
+    text = "✕ Something went wrong on my end. Try again in a moment."
+    try:
+        if update.callback_query:
+            await update.callback_query.answer(text, show_alert=True)
+        elif update.effective_message:
+            await update.effective_message.reply_text(text)
+    except Exception:  # noqa: BLE001
+        log.debug("Couldn't even deliver the generic error message", exc_info=True)
+
+
 async def post_init(application: Application) -> None:
     global job_manager
     sweep_orphaned_workspaces()
@@ -857,10 +934,13 @@ def main() -> None:
     wait_for_pot_provider(config.BGUTIL_POT_URL, timeout_seconds=20)
     app = build_application()
     app.post_init = post_init
+    app.add_error_handler(global_error_handler)
 
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("settings", settings_cmd))
+    app.add_handler(CommandHandler("adhd_on", adhd_on_cmd))
+    app.add_handler(CommandHandler("adhd_off", adhd_off_cmd))
     app.add_handler(CommandHandler("queue", queue_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CommandHandler("update", update_cmd))

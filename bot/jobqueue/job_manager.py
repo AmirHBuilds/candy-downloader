@@ -116,6 +116,8 @@ class JobManager:
         self._jobs_by_rid[rid] = job
         await self._queue.put(job)
         asyncio.create_task(self._queued_heartbeat(job))
+        log.info("Enqueued job rid=%s force_document=%s quality=%s mode=%s",
+                 rid, force_document, settings.get("quality"), settings.get("mode"))
         return job
 
     def cancel(self, rid: str, user_id: int) -> bool:
@@ -204,8 +206,11 @@ class JobManager:
     def has_cached_video(self, rid: str, url: str) -> bool:
         entry = self._recent_files.get(rid)
         hit = bool(entry and entry["url"] == url and entry["path"].exists())
-        if entry and not hit:
-            log.info("Cache miss for rid %s: have url=%r, wanted url=%r", rid, entry.get("url"), url)
+        if not entry:
+            log.info("No cache entry at all for rid %s (wanted url=%r)", rid, url)
+        elif not hit:
+            log.info("Cache miss for rid %s: have url=%r, wanted url=%r, exists=%s",
+                      rid, entry.get("url"), url, entry["path"].exists())
         return hit
 
     async def send_cached_as_document(self, rid: str, chat_id: int, url: str,
@@ -226,6 +231,8 @@ class JobManager:
         except (OSError, TelegramError) as exc:
             log.warning("Cached send failed for rid %s, falling back to re-download: %s", rid, exc)
             return False
+
+        log.info("Sent cached document for rid %s (%s)", rid, path)
 
         try:
             await self.bot.delete_message(chat_id, status_message_id)
@@ -251,7 +258,7 @@ class JobManager:
             if job.cancelled:
                 ac.log_download(job.user_id, job.url, "cancelled")
                 job.header = "Cancelled"
-                await self._emit(job, "Cancelled before it started", markup=cancelled_menu(job.rid))
+                await self._emit(job, "Cancelled before it started", markup=cancelled_menu(job.rid, job.url))
                 self._jobs_by_rid.pop(job.rid, None)
                 self._queue.task_done()
                 continue
@@ -263,24 +270,24 @@ class JobManager:
             except (asyncio.CancelledError, JobCancelled):
                 ac.log_download(job.user_id, job.url, "cancelled")
                 job.header = "Cancelled"
-                await self._emit(job, "Cancelled", markup=cancelled_menu(job.rid))
+                await self._emit(job, "Cancelled", markup=cancelled_menu(job.rid, job.url))
             except NoToolSucceeded as exc:
                 ac.log_download(job.user_id, job.url, "failed")
                 log.exception("Job %s failed", job.rid)
                 job.header = "Failed"
                 if all(any(m in v.lower() for m in _UNSUPPORTED_MARKERS) for v in exc.attempts.values()):
                     await self._emit(job, "None of our downloaders support this link.",
-                                      markup=retry_menu(job.rid), sanitize=False)
+                                      markup=retry_menu(job.rid, job.url), sanitize=False)
                 else:
                     cleaned = _sanitize_step(exc.primary_error, job.url)
-                    await self._emit(job, messages.generic_error(cleaned), markup=retry_menu(job.rid),
+                    await self._emit(job, messages.generic_error(cleaned), markup=retry_menu(job.rid, job.url),
                                       sanitize=False)
             except Exception as exc:  # noqa: BLE001
                 ac.log_download(job.user_id, job.url, "failed")
                 log.exception("Job %s failed", job.rid)
                 job.header = "Failed"
                 cleaned = _sanitize_step(str(exc), job.url)
-                await self._emit(job, messages.generic_error(cleaned), markup=retry_menu(job.rid), sanitize=False)
+                await self._emit(job, messages.generic_error(cleaned), markup=retry_menu(job.rid, job.url), sanitize=False)
             finally:
                 self._jobs_by_rid.pop(job.rid, None)
                 self._queue.task_done()
@@ -349,6 +356,8 @@ class JobManager:
         for f in files:
             suffix = f.suffix.lower()
             size_mb = f.stat().st_size / 1_000_000
+            log.info("Sending rid=%s file=%s suffix=%s force_document=%s",
+                      job.rid, f.name, suffix, job.force_document)
 
             if job.force_document:
                 caption = messages.all_done_caption(f.stem[:100]) + "\n\nSent as a file — not re-compressed by Telegram."

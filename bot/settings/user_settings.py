@@ -37,6 +37,9 @@ DEFAULTS: dict[str, Any] = {
     "sponsorblock": False,           # auto-skip sponsor segments (YouTube)
     "use_archive": False,            # skip re-downloading items already sent before
 
+    # --- ADHD mode: skip every prompt, always grab the best video quality ---
+    "adhd_mode": False,
+
     # --- Network / performance ---
     "rate_limit_kbps": 0,            # 0 = unlimited
     "concurrent_fragments": 4,
