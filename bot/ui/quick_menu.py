@@ -152,5 +152,5 @@ def retry_menu(rid: str, url: str) -> InlineKeyboardMarkup:
 cancelled_menu = retry_menu
 
 
-def queued_menu(rid: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([cancel_row(rid)])
+def queued_menu(rid: str, url: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([cancel_row(rid), link_row(url)])

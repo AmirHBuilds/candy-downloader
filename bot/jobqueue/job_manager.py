@@ -155,6 +155,8 @@ class JobManager:
         return "\n".join(lines)
 
     def _render(self, job: Job) -> str:
+        if job.settings.get("adhd_mode"):
+            return self._render_adhd(job)
         lines = [f"{OWNER_EMOJI} <b>{job.header}</b>"]
         if job.steps:
             recent = job.steps[-MAX_STEP_LINES:]
@@ -164,8 +166,24 @@ class JobManager:
                 text = f"<b>{s}</b>" if (is_current and "<" not in s) else s
                 rendered.append(f"• {text}")
             lines.append("\n".join(rendered))
-        lines.append(f"<code>{esc(job.url)}</code>")
         return "\n\n".join(lines)
+
+    _ADHD_HEADERS = {
+        "Queued": "🍬 On it...",
+        "Downloading": "🍬 Grabbing your video...",
+        "Sending": "🍬 Almost there...",
+        "Cancelled": "✕ Cancelled",
+        "Failed": "✕ Didn't work",
+    }
+
+    def _render_adhd(self, job: Job) -> str:
+        """ADHD Mode's whole point is no clutter: one friendly line, one
+        bar, nothing technical (no tool names, no "Trying gallery-dl...",
+        no speed/ETA breakdown) - the step-by-step log above is exactly
+        what this mode exists to skip."""
+        header = self._ADHD_HEADERS.get(job.header, f"🍬 {job.header}")
+        body = job.steps[-1] if job.steps else "Starting…"
+        return f"<b>{header}</b>\n\n{body}"
 
     async def _emit(self, job: Job, text: str, push: bool = True,
                      markup: InlineKeyboardMarkup | None = None, sanitize: bool = True) -> None:
@@ -249,7 +267,7 @@ class JobManager:
                 break
             i = (i + 1) % len(dots)
             await self._emit(job, f"Waiting for a free slot{dots[i]}", push=False,
-                              markup=queued_menu(job.rid))
+                              markup=queued_menu(job.rid, job.url))
 
     async def _worker_loop(self, worker_index: int) -> None:
         while True:
@@ -294,8 +312,12 @@ class JobManager:
 
     async def _run_job(self, job: Job) -> None:
         job.header = "Downloading"
-        provider = _friendly_domain(job.url)
-        await self._emit(job, f"Link: {provider}", markup=queued_menu(job.rid))
+        adhd = job.settings.get("adhd_mode", False)
+        if adhd:
+            await self._emit(job, "Fetching…", markup=queued_menu(job.rid, job.url))
+        else:
+            provider = _friendly_domain(job.url)
+            await self._emit(job, f"Link: {provider}", markup=queued_menu(job.rid, job.url))
 
         last_edit_time = 0.0
         last_percent = -100.0
@@ -303,7 +325,7 @@ class JobManager:
         def progress_cb(tool_name: str, percent: float | None, speed: str | None, eta: str | None,
                         stage: str | None = None) -> None:
             nonlocal last_edit_time, last_percent
-            push = stage is not None
+            push = stage is not None and not adhd
 
             if not push:
                 now = time.monotonic()
@@ -312,7 +334,12 @@ class JobManager:
                 last_edit_time = now
                 last_percent = percent or 0
 
-            if percent is None:
+            if adhd:
+                # No tool names, no "Trying gallery-dl...", no speed/ETA
+                # breakdown - just a bar (or a friendly holding line while
+                # percent is unknown, e.g. during merging/converting).
+                line = f"<code>{render_bar(percent)}</code> {percent:.0f}%" if percent is not None else "Working its magic…"
+            elif percent is None:
                 meta = []
                 if speed:
                     meta.append(speed)
@@ -337,7 +364,7 @@ class JobManager:
                 prefix = f"{stage} " if stage else ""
                 line = f"{prefix}<code>{bar}</code> {percent:.0f}%{meta_str}"
 
-            asyncio.create_task(self._emit(job, line, push=push, markup=queued_menu(job.rid)))
+            asyncio.create_task(self._emit(job, line, push=push, markup=queued_menu(job.rid, job.url)))
 
         with job_workspace() as workspace:
             files = await dispatch_download(job.url, workspace, job.settings, job.user_id, progress_cb,
@@ -349,7 +376,7 @@ class JobManager:
                         await self._cache_video_file(job.rid, job.url, f)
 
             job.header = "Sending"
-            await self._emit(job, "Uploading to Telegram...", markup=queued_menu(job.rid))
+            await self._emit(job, "Uploading to Telegram...", markup=queued_menu(job.rid, job.url))
             await self._send_files(job, files)
 
     async def _send_files(self, job: Job, files: list[Path]) -> None:

@@ -62,6 +62,13 @@ last_download: dict[str, tuple[int, str, dict]] = {}    # rid -> (user_id, url, 
 _rid_last_touch: dict[str, float] = {}
 RID_STATE_TTL_SECONDS = 2 * 60 * 60
 
+# Populated only by the "cancel" action while a link is still being probed
+# (no job exists yet to cancel) - probe()/get_track_info() keep running in
+# the background regardless, so link_handler/handle_spotify_link check
+# this once they come back to avoid clobbering the Cancelled message with
+# a freshly-finished quality picker.
+cancelled_pre_job_rids: set[str] = set()
+
 
 def _touch_rid(rid: str) -> None:
     _rid_last_touch[rid] = time.time()
@@ -76,6 +83,7 @@ async def _sweep_stale_link_state_loop() -> None:
             pending_links.pop(rid, None)
             pending_probes.pop(rid, None)
             last_download.pop(rid, None)
+            cancelled_pre_job_rids.discard(rid)
             _rid_last_touch.pop(rid, None)
         if stale:
             log.info("Pruned %d stale link state entries", len(stale))
@@ -535,19 +543,22 @@ async def handle_adhd_download(update: Update, context: ContextTypes.DEFAULT_TYP
     last_download[rid] = (user_id, url, job_settings)
     _touch_rid(rid)
     status_msg = await context.bot.send_message(
-        update.effective_chat.id, messages.QUEUED, parse_mode=ParseMode.HTML, reply_markup=queued_menu(rid),
+        update.effective_chat.id, messages.QUEUED, parse_mode=ParseMode.HTML, reply_markup=queued_menu(rid, url),
     )
     await job_manager.enqueue(rid, user_id, status_msg.chat_id, url, job_settings, status_msg.message_id)
 
 
 async def handle_spotify_link(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, rid: str) -> None:
     user_id = update.effective_user.id
-    status_msg = await context.bot.send_message(
-        update.effective_chat.id, messages.with_link("Checking via Spotify search…", url), parse_mode=ParseMode.HTML,
-    )
-    info = await get_track_info(url)
     pending_links[rid] = (user_id, url)
     _touch_rid(rid)
+    status_msg = await context.bot.send_message(
+        update.effective_chat.id, "Checking via Spotify search…", reply_markup=queued_menu(rid, url),
+    )
+    info = await get_track_info(url)
+    if rid in cancelled_pre_job_rids:
+        cancelled_pre_job_rids.discard(rid)
+        return
 
     title = (info or {}).get("title") or "Spotify track"
     thumbnail = (info or {}).get("thumbnail") or ""
@@ -610,13 +621,16 @@ async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     order = tool_order_for(url)
     checking_text = f"Checking via {FRIENDLY_TOOL.get(order[0], order[0])}…"
+    pending_links[rid] = (user_id, url)
+    _touch_rid(rid)
     status_msg = await context.bot.send_message(
-        update.effective_chat.id, messages.with_link(checking_text, url), parse_mode=ParseMode.HTML,
+        update.effective_chat.id, checking_text, reply_markup=queued_menu(rid, url),
     )
 
     probe_result = await probe(url) if order[0] == "ytdlp" else None
-    pending_links[rid] = (user_id, url)
-    _touch_rid(rid)
+    if rid in cancelled_pre_job_rids:
+        cancelled_pre_job_rids.discard(rid)
+        return
 
     if probe_result and probe_result.ok and not probe_result.is_playlist:
         pending_probes[rid] = probe_result
@@ -717,6 +731,7 @@ async def link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         entry = pending_links.get(rid)
         if entry and entry[0] == user_id:
             url = entry[1]
+            cancelled_pre_job_rids.add(rid)
             await set_text(messages.with_link(messages.CANCELLED, url), markup=redo_menu(rid, url))
         else:
             await set_text(messages.CANCELLED)
@@ -755,7 +770,7 @@ async def link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
         if job_manager.has_cached_video(rid, url):
             await set_text(messages.with_link("Sending from the local copy — no re-download needed…", url),
-                            markup=queued_menu(rid))
+                            markup=queued_menu(rid, url))
             sent = await job_manager.send_cached_as_document(
                 rid, query.message.chat_id, url, query.message.message_id,
             )
@@ -763,7 +778,7 @@ async def link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 return
             # cache vanished mid-flight - fall through to a fresh download
 
-        await set_text(messages.with_link(messages.QUEUED, url), markup=queued_menu(rid))
+        await set_text(messages.with_link(messages.QUEUED, url), markup=queued_menu(rid, url))
         await job_manager.enqueue(
             rid, user_id, query.message.chat_id, url, dict(saved_settings), query.message.message_id,
             is_photo=is_photo,
@@ -831,7 +846,7 @@ async def link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
         last_download[rid] = (user_id, url, job_settings)
         _touch_rid(rid)
-        await set_text(messages.with_link(messages.QUEUED, url), markup=queued_menu(rid))
+        await set_text(messages.with_link(messages.QUEUED, url), markup=queued_menu(rid, url))
         await job_manager.enqueue(
             rid, user_id, query.message.chat_id, url, job_settings, query.message.message_id, is_photo=is_photo,
         )
