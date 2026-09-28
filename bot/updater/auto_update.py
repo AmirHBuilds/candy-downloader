@@ -16,6 +16,7 @@ version bump is enough to pick it up automatically within a few seconds.
 import asyncio
 import logging
 import os
+import re
 import sys
 
 from telegram import Bot
@@ -25,20 +26,26 @@ from config import OWNER_USER_ID
 
 log = logging.getLogger("candy.updater")
 
-PACKAGES = ["yt-dlp", "gallery-dl"]
+# (name shown / matched in pip output, spec passed to pip). yt-dlp needs its
+# [default] extra - that's what carries yt-dlp-ejs, the YouTube challenge
+# solver scripts that the Deno runtime in the image actually runs.
+PACKAGES = [("yt-dlp", "yt-dlp[default]"), ("gallery-dl", "gallery-dl")]
 
 
 async def run_update_once(bot: Bot | None = None, notify_admins: bool = True) -> str:
     results = []
     ytdlp_changed = False
-    for pkg in PACKAGES:
+    for pkg, spec in PACKAGES:
         proc = await asyncio.create_subprocess_exec(
-            "pip", "install", "--no-cache-dir", "--upgrade", pkg,
+            "pip", "install", "--no-cache-dir", "--upgrade", spec,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         )
         out, _ = await proc.communicate()
         output = out.decode(errors="ignore")
-        changed = "Successfully installed" in output
+        # Match the package's own new version ("yt-dlp-2026.9.1"), not just
+        # any "Successfully installed" - with the [default] extra, pip can
+        # report that for a helper like yt-dlp-ejs alone.
+        changed = re.search(rf"\b{re.escape(pkg)}-\d", output) is not None
         if pkg == "yt-dlp" and changed:
             ytdlp_changed = True
         results.append(f"{'✓' if changed else '·'} {pkg}: {'updated' if changed else 'already latest'}")

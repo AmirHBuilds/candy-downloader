@@ -153,4 +153,8 @@ cancelled_menu = retry_menu
 
 
 def queued_menu(rid: str, url: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([cancel_row(rid), link_row(url)])
+    """Cancel only, deliberately - no copy-link button while a job's still
+    in flight. It only makes sense once there's a final state to act on
+    (see retry_menu/cancelled_menu and sent_menu/send_as_file_menu)."""
+    del url  # kept in the signature so call sites don't need touching if this changes again
+    return InlineKeyboardMarkup([cancel_row(rid)])

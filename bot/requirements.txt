@@ -1,6 +1,6 @@
 python-telegram-bot[job-queue]==21.10
 httpx==0.27.2
-yt-dlp
+yt-dlp[default]
 gallery-dl
 bgutil-ytdlp-pot-provider
 mutagen

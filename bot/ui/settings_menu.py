@@ -8,6 +8,7 @@ Kept short because Telegram limits callback_data to 64 bytes.
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from settings.user_settings import DEFAULTS
+from ui.progress import BAR_STYLES
 
 
 def _row(*buttons):
@@ -20,6 +21,7 @@ def main_menu(s: dict) -> InlineKeyboardMarkup:
         _row(InlineKeyboardButton(
             f"{'🧠⚡ ADHD Mode: ON' if adhd_on else '🧠 ADHD Mode: off'}",
             callback_data="s|adhd_mode|" + ("0" if adhd_on else "1"))),
+        _row(InlineKeyboardButton("🎨 Progress bar style", callback_data="nav|bars")),
         _row(InlineKeyboardButton("⚙️ Advanced (speed / proxy)", callback_data="nav|advanced")),
         _row(InlineKeyboardButton("🔑 Cookies help", callback_data="nav|cookies")),
         _row(InlineKeyboardButton("↻ Reset to defaults", callback_data="nav|reset")),
@@ -28,13 +30,23 @@ def main_menu(s: dict) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-SETTINGS_LEGEND = (
-    "<b>ADHD Mode</b> — send a link, get the file. No quality picker, no "
-    "questions: always grabs the best video quality it can. Toggle any "
-    "time with /adhd_on or /adhd_off.\n\n"
-    "Everything else (quality, format, playlist range...) is just asked "
-    "when you send a link."
-)
+def bars_title() -> str:
+    samples = [f"{label}\n{fn(60)}" for label, fn in BAR_STYLES.values()]
+    return ("<b>Progress bar style</b>\n\n" + "\n\n".join(samples)
+            + "\n\nAuto = moons in ADHD Mode, candy otherwise.")
+
+
+def bars_menu(s: dict) -> InlineKeyboardMarkup:
+    current = s.get("bar_style", "auto")
+    rows = [[InlineKeyboardButton(("✓ " if current == "auto" else "") + "Auto", callback_data="s|bar_style|auto")]]
+    names = list(BAR_STYLES.items())
+    for i in range(0, len(names), 2):
+        rows.append([
+            InlineKeyboardButton(("✓ " if current == key else "") + label, callback_data=f"s|bar_style|{key}")
+            for key, (label, _fn) in names[i:i + 2]
+        ])
+    rows.append([InlineKeyboardButton("← Back", callback_data="nav|main")])
+    return InlineKeyboardMarkup(rows)
 
 
 def back_to_main() -> InlineKeyboardMarkup:

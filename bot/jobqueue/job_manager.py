@@ -35,7 +35,7 @@ from downloader.dispatcher import download as dispatch_download, NoToolSucceeded
 from downloader.errors import JobCancelled
 from settings import access_control as ac
 from ui import messages
-from ui.progress import render_bar
+from ui.progress import render_progress, resolve_style
 from ui.quick_menu import queued_menu, send_as_file_menu, sent_menu, retry_menu, cancelled_menu
 from utils.cleanup import job_workspace, new_cache_path
 from utils.text import esc, sanitize_step as _sanitize_step, friendly_domain as _friendly_domain
@@ -313,9 +313,12 @@ class JobManager:
     async def _run_job(self, job: Job) -> None:
         job.header = "Downloading"
         adhd = job.settings.get("adhd_mode", False)
+        bar_style = resolve_style(job.settings.get("bar_style"), adhd)
         if adhd:
             await self._emit(job, "Fetching…", markup=queued_menu(job.rid, job.url))
         else:
+            type_label = "🎵 Audio" if job.settings.get("mode") == "audio" else "🎬 Video"
+            await self._emit(job, type_label, markup=queued_menu(job.rid, job.url))
             provider = _friendly_domain(job.url)
             await self._emit(job, f"Link: {provider}", markup=queued_menu(job.rid, job.url))
 
@@ -334,35 +337,30 @@ class JobManager:
                 last_edit_time = now
                 last_percent = percent or 0
 
-            if adhd:
-                # No tool names, no "Trying gallery-dl...", no speed/ETA
-                # breakdown - just a bar (or a friendly holding line while
-                # percent is unknown, e.g. during merging/converting).
-                line = f"<code>{render_bar(percent)}</code> {percent:.0f}%" if percent is not None else "Working its magic…"
-            elif percent is None:
-                meta = []
-                if speed:
-                    meta.append(speed)
-                if eta and eta not in ("~", ""):
-                    meta.append(f"ETA {eta}")
-                if stage and meta:
-                    line = f"{stage} · {' · '.join(meta)}"
-                elif meta:
-                    line = " · ".join(meta)
-                elif stage:
-                    line = stage
+            if percent is None:
+                if adhd:
+                    # No tool names, no speed/ETA - just a friendly holding
+                    # line while progress is unknown (merging, converting...).
+                    line = "Working its magic…"
                 else:
-                    line = "Working..."
+                    meta = []
+                    if speed:
+                        meta.append(speed)
+                    if eta and eta not in ("~", ""):
+                        meta.append(f"ETA {eta}")
+                    if stage and meta:
+                        line = f"{stage} · {' · '.join(meta)}"
+                    elif meta:
+                        line = " · ".join(meta)
+                    elif stage:
+                        line = stage
+                    else:
+                        line = "Working..."
             else:
-                bar = render_bar(percent)
-                meta = []
-                if speed:
-                    meta.append(speed)
-                if eta and eta not in ("~", ""):
-                    meta.append(f"ETA {eta}")
-                meta_str = f" · {' · '.join(meta)}" if meta else ""
-                prefix = f"{stage} " if stage else ""
-                line = f"{prefix}<code>{bar}</code> {percent:.0f}%{meta_str}"
+                # "42% • 🍬🍬🍬🍬⚪⚪⚪⚪⚪⚪ • 2.1MB/s" - ADHD Mode leaves the speed off.
+                line = render_progress(bar_style, percent, None if adhd else speed)
+                if stage and not adhd:
+                    line = f"{stage} · {line}"
 
             asyncio.create_task(self._emit(job, line, push=push, markup=queued_menu(job.rid, job.url)))
 
@@ -370,7 +368,7 @@ class JobManager:
             files = await dispatch_download(job.url, workspace, job.settings, job.user_id, progress_cb,
                                              cancel_event=job.cancel_event)
 
-            if job.settings.get("mode") == "video":
+            if job.settings.get("mode") in ("video", "audio"):
                 for f in files:
                     if f.suffix.lower() not in _NON_MEDIA_EXTS:
                         await self._cache_video_file(job.rid, job.url, f)
@@ -410,10 +408,11 @@ class JobManager:
                         read_timeout=120, write_timeout=120, connect_timeout=60,
                     )
             elif suffix in {".mp3", ".m4a", ".opus", ".flac", ".wav"}:
+                audio_caption = caption + "\n\nWant it sent as a plain file instead?"
                 with open(f, "rb") as fh:
                     input_file = InputFile(fh, filename=f.name)
-                    await self.bot.send_audio(job.chat_id, input_file, caption=caption,
-                                               parse_mode=ParseMode.HTML, reply_markup=sent_menu(job.url),
+                    await self.bot.send_audio(job.chat_id, input_file, caption=audio_caption,
+                                               parse_mode=ParseMode.HTML, reply_markup=send_as_file_menu(job.rid, job.url),
                                                read_timeout=120, write_timeout=120, connect_timeout=60)
             elif suffix in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
                 with open(f, "rb") as fh:

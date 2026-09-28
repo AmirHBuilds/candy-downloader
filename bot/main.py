@@ -22,11 +22,13 @@ from ui.quick_menu import (
     audio_only_menu, queued_menu, redo_menu,
 )
 from ui.settings_menu import (
-    main_menu, advanced_menu, confirm_reset_menu, back_to_main, ADVANCED_TEXT_FIELDS, SETTINGS_LEGEND,
+    main_menu, advanced_menu, confirm_reset_menu, back_to_main, ADVANCED_TEXT_FIELDS,
+    bars_menu, bars_title,
 )
 from ui.start_menu import start_menu
 from downloader.probe import probe, ProbeResult
 from downloader import gallerydl_probe
+from downloader.cookies import inspect_cookie_file
 from downloader.site_map import tool_order_for
 from downloader.dispatcher import FRIENDLY_TOOL
 from downloader.spotify_handler import get_track_info
@@ -254,7 +256,10 @@ COOKIES_HELP = (
     "private content. Fix: export your browser's cookies and send the "
     "file here.\n\n"
     "1. Install a \"cookies.txt\" export extension for your browser\n"
-    "2. While logged in on the site, export cookies for that domain\n"
+    "2. For YouTube: open a <b>private/incognito window</b>, log in, then "
+    "open youtube.com/robots.txt in that same tab and export cookies from "
+    "there. Close the window right after. (YouTube rotates cookies from "
+    "normal tabs, which silently breaks the exported file.)\n"
     "3. Send me the exported <code>.txt</code> file right here\n\n"
     "• This is private to you — every person using this bot has their "
     "own cookies file, and no one else can see or use yours.\n\n"
@@ -297,7 +302,22 @@ async def cookies_file_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     update_setting(user_id, "cookies_enabled", True)
-    await update.message.reply_text("Cookies saved and turned on — just for you.")
+    check = inspect_cookie_file(dest)
+    if not check["netscape"] and not check["youtube"]:
+        note = (
+            "✕ Saved, but this doesn't look like a cookies.txt export "
+            "(Netscape format). Use a \"cookies.txt\" browser extension and "
+            "send the file again. /cookies has the steps."
+        )
+    elif check["youtube"] and not check["logged_in"]:
+        note = (
+            "Saved — but there's no YouTube login in this file, so it "
+            "won't help with YouTube. Log in first, then export again "
+            "from a private window. /cookies has the steps."
+        )
+    else:
+        note = "Cookies saved and turned on — just for you."
+    await update.message.reply_text(note)
 
 
 # ---------- settings menu ----------
@@ -311,7 +331,7 @@ async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     await _delete_quietly(update.message)
     s = get_settings(update.effective_user.id)
-    await update.message.reply_text(settings_title() + "\n\n" + SETTINGS_LEGEND, parse_mode=ParseMode.HTML,
+    await update.message.reply_text(settings_title(), parse_mode=ParseMode.HTML,
                                      reply_markup=main_menu(s))
 
 
@@ -361,7 +381,8 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
         s = get_settings(user_id)
         screens = {
-            "main": (main_menu, settings_title() + "\n\n" + SETTINGS_LEGEND),
+            "main": (main_menu, settings_title()),
+            "bars": (bars_menu, bars_title()),
             "advanced": (advanced_menu, "⚙️ Advanced settings"),
             "reset": (confirm_reset_menu, "Reset ALL your settings to default?"),
         }
@@ -382,7 +403,11 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             update_setting(user_id, key, value)
 
         s = get_settings(user_id)
-        await query.edit_message_text(settings_title() + "\n\n" + SETTINGS_LEGEND, parse_mode=ParseMode.HTML,
+        if key == "bar_style":
+            # stay on the picker so the ✓ moves and they can compare styles
+            await query.edit_message_text(bars_title(), parse_mode=ParseMode.HTML, reply_markup=bars_menu(s))
+            return
+        await query.edit_message_text(settings_title(), parse_mode=ParseMode.HTML,
                                        reply_markup=main_menu(s))
 
 
@@ -627,7 +652,7 @@ async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         update.effective_chat.id, checking_text, reply_markup=queued_menu(rid, url),
     )
 
-    probe_result = await probe(url) if order[0] == "ytdlp" else None
+    probe_result = await probe(url, user_id) if order[0] == "ytdlp" else None
     if rid in cancelled_pre_job_rids:
         cancelled_pre_job_rids.discard(rid)
         return

@@ -47,6 +47,14 @@ def unsupported_link() -> str:
 
 
 def generic_error(detail: str) -> str:
+    if "needs to be reloaded" in (detail or "").lower():
+        # YouTube rejecting a logged-in session - the raw text tells the
+        # person nothing about what to actually do.
+        return (
+            "✕ YouTube rejected the login session.\n\n"
+            "Re-export your cookies from a private/incognito window "
+            "(close it right after) and send the file again. /cookies has the steps."
+        )
     # detail is tool/error output - inherently untrusted (a page's title,
     # an error string echoed from a remote server, etc.) - escape before
     # it goes into <code>, or a stray '<' makes Telegram reject the whole

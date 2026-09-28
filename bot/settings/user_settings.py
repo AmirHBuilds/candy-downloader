@@ -40,6 +40,10 @@ DEFAULTS: dict[str, Any] = {
     # --- ADHD mode: skip every prompt, always grab the best video quality ---
     "adhd_mode": False,
 
+    # --- Progress bar look: auto | candy | jar | pacman | slider | moon ---
+    # "auto" = moon in ADHD Mode, candy otherwise (see ui/progress.py).
+    "bar_style": "auto",
+
     # --- Network / performance ---
     "rate_limit_kbps": 0,            # 0 = unlimited
     "concurrent_fragments": 4,

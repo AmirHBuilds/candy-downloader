@@ -1,4 +1,13 @@
+# Deno is the JavaScript runtime yt-dlp uses to solve YouTube's signature and
+# "n" challenges. Without one, logged-in (cookie) extraction fails outright
+# on current YouTube ("The page needs to be reloaded"). Only the binary is
+# copied over from the official image.
+ARG DENO_VERSION=2.9.3
+FROM denoland/deno:bin-${DENO_VERSION} AS deno
+
 FROM python:3.12-slim
+
+COPY --from=deno /deno /usr/local/bin/deno
 
 # System tools CandyDownloader relies on:
 # - ffmpeg: muxing/audio extraction/thumbnail embedding for yt-dlp

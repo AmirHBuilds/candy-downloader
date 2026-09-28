@@ -5,7 +5,8 @@ from typing import Callable
 
 import yt_dlp
 
-from config import COOKIES_DIR, DATA_DIR, BGUTIL_POT_URL
+from config import DATA_DIR, BGUTIL_POT_URL
+from downloader.cookies import apply_cookies, cookie_file_for
 from downloader.errors import JobCancelled
 
 log = logging.getLogger("candy.ytdlp")
@@ -28,6 +29,25 @@ _POSTPROCESSOR_LABELS = {
     "SponsorBlock": "Checking for sponsor segments",
     "ModifyChapters": "Removing sponsor segments",
 }
+
+
+def _fmt_speed(bytes_per_sec) -> str | None:
+    if not bytes_per_sec:
+        return None
+    if bytes_per_sec >= 1_000_000:
+        return f"{bytes_per_sec / 1_000_000:.1f}MB/s"
+    return f"{bytes_per_sec / 1000:.0f}KB/s"
+
+
+def _rename_opus_ogg(f: Path) -> Path:
+    if f.suffix.lower() != ".ogg":
+        return f
+    target = f.with_suffix(".opus")
+    try:
+        f.rename(target)
+        return target
+    except OSError:
+        return f  # not fatal - worst case the file just keeps its .ogg name
 
 
 def _format_selector(s: dict) -> str:
@@ -93,10 +113,9 @@ def _build_opts(url: str, workspace: Path, s: dict, user_id: int, progress_hook,
     if s["proxy"]:
         opts["proxy"] = s["proxy"]
 
-    if s["cookies_enabled"]:
-        cookie_file = Path(COOKIES_DIR) / f"{user_id}.txt"
-        if cookie_file.exists():
-            opts["cookiefile"] = str(cookie_file)
+    cookie_path = cookie_file_for(user_id, s)
+    if cookie_path:
+        apply_cookies(opts, cookie_path)
 
     if s["use_archive"]:
         opts["download_archive"] = str(Path(DATA_DIR) / f"archive_{user_id}.txt")
@@ -184,19 +203,24 @@ async def download(url: str, workspace: Path, settings: dict, user_id: int,
     DownloadCancelled is yt-dlp's own documented way to abort a download
     that's actually in progress."""
     loop = asyncio.get_running_loop()
+    size_announced = False
 
     def _check_cancelled() -> None:
         if cancel_event is not None and cancel_event.is_set():
             raise yt_dlp.utils.DownloadCancelled("Cancelled by user")
 
     def hook(d: dict) -> None:
+        nonlocal size_announced
         _check_cancelled()
         if d.get("status") == "downloading":
             total = d.get("total_bytes") or d.get("total_bytes_estimate")
             downloaded = d.get("downloaded_bytes", 0)
             percent = (downloaded / total * 100) if total else 0.0
-            speed = d.get("_speed_str", "").strip() or None
+            speed = _fmt_speed(d.get("speed"))
             eta = d.get("_eta_str", "").strip() or None
+            if total and not size_announced:
+                size_announced = True
+                loop.call_soon_threadsafe(progress_cb, None, None, None, f"📦 Size: {total / 1_000_000:.0f} MB")
             loop.call_soon_threadsafe(progress_cb, percent, speed, eta, None)
         # Deliberately no action on "finished": video+audio are often
         # downloaded as two separate formats, so "finished" fires once
@@ -221,7 +245,10 @@ async def download(url: str, workspace: Path, settings: dict, user_id: int,
     def run(opts: dict) -> list[Path]:
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([url])
-        return sorted(workspace.glob("*"))
+        files = sorted(workspace.glob("*"))
+        if settings.get("mode") == "audio" and settings.get("audio_format") == "opus":
+            files = [_rename_opus_ogg(f) for f in files]
+        return files
 
     def clear_partial_output() -> None:
         for leftover in workspace.iterdir():

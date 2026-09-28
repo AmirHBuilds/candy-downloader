@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 import yt_dlp
 
 from config import BGUTIL_POT_URL
+from downloader.cookies import apply_cookies, cookie_file_for
+from settings.user_settings import get_settings
 
 log = logging.getLogger("candy.probe")
 
@@ -26,7 +28,7 @@ class ProbeResult:
     error: str = ""                                     # populated when ok=False, for a better user message
 
 
-async def probe(url: str) -> ProbeResult:
+async def probe(url: str, user_id: int | None = None) -> ProbeResult:
     """Fast, download-free metadata lookup. Any failure just returns
     ok=False (with the error message attached) so the caller can fall
     back to a generic menu instead of crashing the whole flow over a
@@ -41,13 +43,20 @@ async def probe(url: str) -> ProbeResult:
     if BGUTIL_POT_URL:
         opts["extractor_args"] = {"youtubepot-bgutilhttp": {"base_url": [BGUTIL_POT_URL]}}
 
+    # Use the person's cookies for the preview too - without this the
+    # preview always ran logged-out and kept asking for a login even after
+    # cookies were uploaded.
+    cookie_path = cookie_file_for(user_id, get_settings(user_id)) if user_id is not None else None
+    if cookie_path:
+        apply_cookies(opts, cookie_path)
+
     def run() -> dict:
         with yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(url, download=False)
 
     try:
         loop = asyncio.get_running_loop()
-        info = await asyncio.wait_for(loop.run_in_executor(None, run), timeout=15)
+        info = await asyncio.wait_for(loop.run_in_executor(None, run), timeout=25 if cookie_path else 15)
     except Exception as exc:  # noqa: BLE001
         log.info("Probe failed for %s: %s", url, exc)
         return ProbeResult(ok=False, error=str(exc).strip().splitlines()[0][:200] if str(exc).strip() else "")

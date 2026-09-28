@@ -1,36 +1,74 @@
 """
-Candy-style progress bar, kept inside a <code> block so it renders as
-fixed-width monospace on every device instead of drifting/wrapping
-unevenly. Uses the owner's chosen emoji as the "filled" segment so the
-whole bot feels personalized, not just the welcome text.
+Progress bar rendering. Five styles, chosen per user in /settings:
 
-🍬 Downloading
-<code>🍬🍬🍬🍬🍬🍬-------</code>  52%
-⚡ 2.1MB/s · ⏳ 18s
+  candy   🍬🍬🍬🍬⚪⚪⚪⚪⚪⚪     10 slots, each candy = 10%  (default)
+  jar     🫙🍬🍬🍬🍬······        a candy jar filling up
+  pacman  ・・・・😋🍬🍬🍬🍬🍬     eats its way through the candies
+  slider  ····🍬·····            one candy sliding along a track
+  moon    🌕🌕🌓🌑🌑             five moons, each waxing through 4 phases
+
+"auto" (the default setting) means moon in ADHD Mode and candy otherwise.
 """
-from config import OWNER_EMOJI
 
-FILLED = OWNER_EMOJI
-EMPTY = "-"
-BAR_LENGTH = 14
+SLOTS = 10
+_MOON_PHASES = ["🌑", "🌒", "🌓", "🌔", "🌕"]
 
 
-def render_bar(percent: float) -> str:
-    percent = max(0.0, min(100.0, percent))
-    filled_count = round((percent / 100) * BAR_LENGTH)
-    return FILLED * filled_count + EMPTY * (BAR_LENGTH - filled_count)
+def _clamp(percent: float) -> float:
+    return max(0.0, min(100.0, percent))
 
 
-def render_status(stage_emoji: str, stage_text: str, percent: float | None,
-                   speed: str | None = None, eta: str | None = None) -> str:
-    lines = [f"{stage_emoji} <b>{stage_text}</b>"]
-    if percent is not None:
-        lines.append(f"<code>{render_bar(percent)}</code>  {percent:.0f}%")
-    meta = []
+def _candy(percent: float) -> str:
+    filled = int(_clamp(percent) // (100 / SLOTS))
+    return "🍬" * filled + "⚪" * (SLOTS - filled)
+
+
+def _jar(percent: float) -> str:
+    filled = int(_clamp(percent) // (100 / SLOTS))
+    return "🫙" + "🍬" * filled + "·" * (SLOTS - filled)
+
+
+def _pacman(percent: float) -> str:
+    eaten = int(_clamp(percent) // (100 / SLOTS))
+    if eaten >= SLOTS:
+        return "・" * SLOTS + "😋"
+    return "・" * eaten + "😋" + "🍬" * (SLOTS - eaten - 1)
+
+
+def _slider(percent: float) -> str:
+    pos = min(SLOTS - 1, int(_clamp(percent) // (100 / SLOTS)))
+    return "·" * pos + "🍬" + "·" * (SLOTS - 1 - pos)
+
+
+def _moon(percent: float) -> str:
+    # 5 moons x 4 steps each = 20 steps, so it advances every 5%.
+    units = int(_clamp(percent) // 5)
+    moons = []
+    for i in range(5):
+        moons.append(_MOON_PHASES[max(0, min(4, units - i * 4))])
+    return "".join(moons)
+
+
+BAR_STYLES = {
+    "candy": ("Candy", _candy),
+    "jar": ("Candy jar", _jar),
+    "pacman": ("Pac-Man", _pacman),
+    "slider": ("Sliding candy", _slider),
+    "moon": ("Moons", _moon),
+}
+
+
+def resolve_style(setting: str | None, adhd: bool) -> str:
+    """Turn the stored setting ("auto" or a style name) into a real style."""
+    if setting in BAR_STYLES:
+        return setting
+    return "moon" if adhd else "candy"
+
+
+def render_progress(style: str, percent: float, speed: str | None = None) -> str:
+    """'42% • 🍬🍬🍬🍬⚪⚪⚪⚪⚪⚪ • 2.1MB/s' - speed omitted when unknown."""
+    bar = BAR_STYLES.get(style, BAR_STYLES["candy"])[1](percent)
+    parts = [f"{_clamp(percent):.0f}%", bar]
     if speed:
-        meta.append(speed)
-    if eta and eta not in ("~", ""):
-        meta.append(f"ETA {eta}")
-    if meta:
-        lines.append(" · ".join(meta))
-    return "\n".join(lines)
+        parts.append(speed)
+    return " • ".join(parts)
