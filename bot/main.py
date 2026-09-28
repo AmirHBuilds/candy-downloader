@@ -25,6 +25,7 @@ from ui.settings_menu import (
     main_menu, advanced_menu, confirm_reset_menu, back_to_main, ADVANCED_TEXT_FIELDS,
     bars_menu, bars_title,
 )
+from ui.history_menu import history_text, history_menu, confirm_clear_menu, PAGE_SIZE
 from ui.start_menu import start_menu
 from downloader.probe import probe, ProbeResult
 from downloader import gallerydl_probe
@@ -560,6 +561,57 @@ async def misc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         text = job_manager.active_summary(update.effective_user.id)
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("← Back", callback_data="nav|home")]])
         await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    elif action == "history":
+        text, markup = _render_history_page(update.effective_user.id, 1)
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+
+def _render_history_page(user_id: int, page: int) -> tuple[str, InlineKeyboardMarkup]:
+    total = ac.count_user_downloads(user_id)
+    total_pages = max(1, -(-total // PAGE_SIZE))   # ceiling division
+    page = max(1, min(page, total_pages))
+    rows = ac.list_user_downloads(user_id, (page - 1) * PAGE_SIZE, PAGE_SIZE)
+    return history_text(rows, page, total_pages, total), history_menu(page, total_pages)
+
+
+async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await gate(update, context):
+        return
+    await _delete_quietly(update.message)
+    text, markup = _render_history_page(update.effective_user.id, 1)
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+
+async def history_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not await gate_callback(update, context):
+        return
+    user_id = update.effective_user.id
+    parts = (query.data or "").split("|")
+    action = parts[1] if len(parts) > 1 else ""
+
+    if action == "close":
+        s = get_settings(user_id)
+        await query.edit_message_text(settings_title(), parse_mode=ParseMode.HTML, reply_markup=main_menu(s))
+        return
+
+    if action == "page":
+        page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
+        text, markup = _render_history_page(user_id, page)
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        return
+
+    if action == "clear":
+        page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
+        await query.edit_message_reply_markup(reply_markup=confirm_clear_menu(page))
+        return
+
+    if action == "clear_yes":
+        deleted = ac.clear_user_downloads(user_id)
+        note = f"🗑 Cleared {deleted} entr{'y' if deleted == 1 else 'ies'}." if deleted else "Nothing to clear."
+        text, markup = _render_history_page(user_id, 1)
+        await query.edit_message_text(f"{note}\n\n{text}", parse_mode=ParseMode.HTML, reply_markup=markup)
 
 
 # ---------- link handling ----------
@@ -992,6 +1044,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("settings", settings_cmd))
+    app.add_handler(CommandHandler("history", history_cmd))
     app.add_handler(CommandHandler("adhd_on", adhd_on_cmd))
     app.add_handler(CommandHandler("adhd_off", adhd_off_cmd))
     app.add_handler(CommandHandler("queue", queue_cmd))
@@ -1006,6 +1059,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(misc_callback, pattern=r"^misc\|"))
     app.add_handler(CallbackQueryHandler(link_callback, pattern=r"^dl\|"))
     app.add_handler(CallbackQueryHandler(settings_callback, pattern=r"^(s\||nav\|)"))
+    app.add_handler(CallbackQueryHandler(history_callback, pattern=r"^hist\|"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, link_handler))
 
     log.info("Owner admin command: /%s", config.OWNER_ADMIN_COMMAND)

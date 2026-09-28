@@ -122,14 +122,10 @@ def sent_menu(url: str) -> InlineKeyboardMarkup:
 
 
 def redo_menu(rid: str, url: str) -> InlineKeyboardMarkup:
-    """Same Try-again + Delete shape as retry_menu, but for cancelling
-    before a quality pick was even made - there's no completed download
-    settings to retry yet, so this re-shows the quality picker instead."""
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("↻ Try again", callback_data=f"dl|redo|{rid}"),
-         InlineKeyboardButton("✕ Delete", callback_data=f"dl|dismiss|{rid}")],
-        link_row(url),
-    ])
+    """Cancelled before a quality pick was even made, so there's no
+    completed download settings to retry - re-shows the quality picker
+    instead. No Delete: see cancelled_menu for why."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton("↻ Try again", callback_data=f"dl|redo|{rid}")] + link_row(url)])
 
 
 def retry_menu(rid: str, url: str) -> InlineKeyboardMarkup:
@@ -149,7 +145,12 @@ def retry_menu(rid: str, url: str) -> InlineKeyboardMarkup:
 
 # Same shape, kept as a separate name where the call site is specifically
 # about a cancellation rather than a failure - purely for readability.
-cancelled_menu = retry_menu
+def cancelled_menu(rid: str, url: str) -> InlineKeyboardMarkup:
+    """Cancelled (as opposed to Failed - see retry_menu): just Try again
+    and the link. No Delete button here - a Cancelled message already
+    reads as "this went away"; a Failed one still looks like a live
+    problem someone might want to clear, which is the difference."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton("↻ Try again", callback_data=f"dl|retry|{rid}")] + link_row(url)])
 
 
 def queued_menu(rid: str, url: str) -> InlineKeyboardMarkup:

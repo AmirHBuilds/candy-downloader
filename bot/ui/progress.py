@@ -1,17 +1,27 @@
 """
-Progress bar rendering. Five styles, chosen per user in /settings:
+Progress bar rendering. Five styles, chosen per user in /settings.
 
-  candy   🍬🍬🍬🍬◾️◾️◾️◾️◾️◾️     10 slots, each candy = 10%  (default)
-  jar     🫙🍬🍬🍬🍬······        a candy jar filling up
-  pacman  ・・・・😋🍬🍬🍬🍬🍬     eats its way through the candies
-  slider  ····🍬·····            one candy sliding along a track
+Four of the five ("candy", "jar", "pacman", "slider") fill using
+config.OWNER_EMOJI, not a hardcoded 🍬 - this bot is templated per owner
+(OWNER_NAME/OWNER_EMOJI in .env), and a bar that only ever drew candy
+regardless of that config would be a lie for anyone who isn't literally
+running "Candy". Their display names follow OWNER_NAME the same way
+(BAR_STYLES is built once at import time): "Candy" / "Candy Jar" /
+"Sliding candy" become "<name>" / "<name> Jar" / "Sliding <name>". Pac-Man
+and the moon are genuinely their own thing and stay as they are.
+
+  candy   🍬🍬🍬🍬◾️◾️◾️◾️◾️◾️     10 slots, each = 10%  (default)
+  jar     🫙🍬🍬🍬🍬······        a jar filling up
+  pacman  ・・・・😋🍬🍬🍬🍬🍬     eats its way through
+  slider  ····🍬·····            one piece sliding along a track
   moon    🌕🌕🌓🌑🌑             five moons, each waxing through 4 phases
 
-"auto" (the default setting) means moon in ADHD Mode and candy otherwise.
+"auto" (the default setting) means moon in ADHD Mode, "candy" otherwise.
 """
+from config import OWNER_EMOJI, OWNER_NAME
 
 SLOTS = 10
-EMPTY_SLOT = "◾️"   # candy bar's unfilled slot (black square + emoji variation selector)
+EMPTY_SLOT = "◾️"   # unfilled slot - a neutral glyph, deliberately not owner-branded
 _MOON_PHASES = ["🌑", "🌒", "🌓", "🌔", "🌕"]
 
 
@@ -21,24 +31,24 @@ def _clamp(percent: float) -> float:
 
 def _candy(percent: float) -> str:
     filled = int(_clamp(percent) // (100 / SLOTS))
-    return "🍬" * filled + EMPTY_SLOT * (SLOTS - filled)
+    return OWNER_EMOJI * filled + EMPTY_SLOT * (SLOTS - filled)
 
 
 def _jar(percent: float) -> str:
     filled = int(_clamp(percent) // (100 / SLOTS))
-    return "🫙" + "🍬" * filled + "·" * (SLOTS - filled)
+    return "🫙" + OWNER_EMOJI * filled + "·" * (SLOTS - filled)
 
 
 def _pacman(percent: float) -> str:
     eaten = int(_clamp(percent) // (100 / SLOTS))
     if eaten >= SLOTS:
         return "・" * SLOTS + "😋"
-    return "・" * eaten + "😋" + "🍬" * (SLOTS - eaten - 1)
+    return "・" * eaten + "😋" + OWNER_EMOJI * (SLOTS - eaten - 1)
 
 
 def _slider(percent: float) -> str:
     pos = min(SLOTS - 1, int(_clamp(percent) // (100 / SLOTS)))
-    return "·" * pos + "🍬" + "·" * (SLOTS - 1 - pos)
+    return "·" * pos + OWNER_EMOJI + "·" * (SLOTS - 1 - pos)
 
 
 def _moon(percent: float) -> str:
@@ -51,10 +61,10 @@ def _moon(percent: float) -> str:
 
 
 BAR_STYLES = {
-    "candy": ("Candy", _candy),
-    "jar": ("Candy jar", _jar),
+    "candy": (OWNER_NAME, _candy),
+    "jar": (f"{OWNER_NAME} Jar", _jar),
     "pacman": ("Pac-Man", _pacman),
-    "slider": ("Sliding candy", _slider),
+    "slider": (f"Sliding {OWNER_NAME}", _slider),
     "moon": ("Moons", _moon),
 }
 

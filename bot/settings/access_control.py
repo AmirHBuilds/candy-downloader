@@ -46,11 +46,26 @@ def _connect() -> sqlite3.Connection:
             user_id INTEGER NOT NULL,
             url TEXT NOT NULL,
             status TEXT NOT NULL,
-            at TEXT NOT NULL
+            at TEXT NOT NULL,
+            mode TEXT NOT NULL DEFAULT '',
+            quality TEXT NOT NULL DEFAULT ''
         )"""
     )
+    _add_column_if_missing(conn, "downloads_log", "mode", "TEXT NOT NULL DEFAULT ''")
+    _add_column_if_missing(conn, "downloads_log", "quality", "TEXT NOT NULL DEFAULT ''")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_downloads_log_user ON downloads_log(user_id, id DESC)")
     conn.commit()
     return conn
+
+
+def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, decl: str) -> None:
+    """SQLite has no 'ADD COLUMN IF NOT EXISTS' - this lets an existing
+    deployment's database (created before mode/quality existed) pick up the
+    new columns in place, instead of needing the person to delete their
+    whole data volume just to get a history feature."""
+    cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
 
 def record_known_user(user_id: int) -> None:
@@ -149,15 +164,51 @@ def list_known_users(limit: int = 50) -> list[tuple[int, str]]:
         conn.close()
 
 
-def log_download(user_id: int, url: str, status: str) -> None:
-    """status: 'success' or 'failed'. Powers the owner's activity feed."""
+def log_download(user_id: int, url: str, status: str, mode: str = "", quality: str = "") -> None:
+    """status: 'success', 'failed', or 'cancelled'. Powers both the owner's
+    activity feed and each person's own /history."""
     conn = _connect()
     try:
         conn.execute(
-            "INSERT INTO downloads_log (user_id, url, status, at) VALUES (?, ?, ?, ?)",
-            (user_id, url[:300], status, datetime.now(timezone.utc).isoformat()),
+            "INSERT INTO downloads_log (user_id, url, status, at, mode, quality) VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, url[:300], status, datetime.now(timezone.utc).isoformat(), mode[:20], quality[:20]),
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def count_user_downloads(user_id: int) -> int:
+    conn = _connect()
+    try:
+        return conn.execute(
+            "SELECT COUNT(*) FROM downloads_log WHERE user_id = ?", (user_id,)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def list_user_downloads(user_id: int, offset: int, limit: int) -> list[dict]:
+    """Newest first. Each row: {url, status, at, mode, quality}."""
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            """SELECT url, status, at, mode, quality FROM downloads_log
+               WHERE user_id = ? ORDER BY id DESC LIMIT ? OFFSET ?""",
+            (user_id, limit, offset),
+        ).fetchall()
+        return [{"url": r[0], "status": r[1], "at": r[2], "mode": r[3], "quality": r[4]} for r in rows]
+    finally:
+        conn.close()
+
+
+def clear_user_downloads(user_id: int) -> int:
+    """Returns how many rows were deleted, so the confirmation can say."""
+    conn = _connect()
+    try:
+        cur = conn.execute("DELETE FROM downloads_log WHERE user_id = ?", (user_id,))
+        conn.commit()
+        return cur.rowcount
     finally:
         conn.close()
 

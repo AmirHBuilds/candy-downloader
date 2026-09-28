@@ -22,6 +22,7 @@ def main_menu(s: dict) -> InlineKeyboardMarkup:
             f"{'🧠⚡ ADHD Mode: ON' if adhd_on else '🧠 ADHD Mode: off'}",
             callback_data="s|adhd_mode|" + ("0" if adhd_on else "1"))),
         _row(InlineKeyboardButton("🎨 Progress bar style", callback_data="nav|bars")),
+        _row(InlineKeyboardButton("📜 History", callback_data="misc|history")),
         _row(InlineKeyboardButton("⚙️ Advanced (speed / proxy)", callback_data="nav|advanced")),
         _row(InlineKeyboardButton("🔑 Cookies help", callback_data="nav|cookies")),
         _row(InlineKeyboardButton("↻ Reset to defaults", callback_data="nav|reset")),

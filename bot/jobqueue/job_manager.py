@@ -175,6 +175,15 @@ class JobManager:
             lines.append("\n".join(rendered))
         return "\n\n".join(lines)
 
+    @staticmethod
+    def _history_quality(settings: dict) -> str:
+        """What /history shows in the quality column: the audio format for
+        an audio job (there's no "quality" concept there, just a codec), or
+        the picked video quality otherwise."""
+        if settings.get("mode") == "audio":
+            return settings.get("audio_format", "audio")
+        return settings.get("quality", "best")
+
     # One place to change the icons on the info line.
     _TYPE_ICONS = {"Audio": "🎵", "Video": "🎬", "File": "📄"}
 
@@ -190,7 +199,7 @@ class JobManager:
             parts.append(f"📦 {mb / 1000:.1f} GB" if mb >= 1000 else f"📦 {mb:.0f} MB")
         if job.info.get("site"):
             parts.append(f"🔗 {esc(job.info['site'])}")
-        return ("• " + " | ".join(parts)) if parts else ""
+        return ("↳ " + " | ".join(parts)) if parts else ""
 
     async def _refresh(self, job: Job) -> None:
         """Re-render without touching the steps - used when only the info line changed."""
@@ -302,7 +311,7 @@ class JobManager:
             job = await self._queue.get()
 
             if job.cancelled:
-                ac.log_download(job.user_id, job.url, "cancelled")
+                ac.log_download(job.user_id, job.url, "cancelled", job.settings.get("mode", ""), self._history_quality(job.settings))
                 job.header = "Cancelled"
                 await self._emit(job, "Cancelled before it started", markup=cancelled_menu(job.rid, job.url))
                 self._jobs_by_rid.pop(job.rid, None)
@@ -312,13 +321,13 @@ class JobManager:
             job.task = asyncio.current_task()
             try:
                 await self._run_job(job)
-                ac.log_download(job.user_id, job.url, "success")
+                ac.log_download(job.user_id, job.url, "success", job.settings.get("mode", ""), self._history_quality(job.settings))
             except (asyncio.CancelledError, JobCancelled):
-                ac.log_download(job.user_id, job.url, "cancelled")
+                ac.log_download(job.user_id, job.url, "cancelled", job.settings.get("mode", ""), self._history_quality(job.settings))
                 job.header = "Cancelled"
                 await self._emit(job, "Cancelled", markup=cancelled_menu(job.rid, job.url))
             except NoToolSucceeded as exc:
-                ac.log_download(job.user_id, job.url, "failed")
+                ac.log_download(job.user_id, job.url, "failed", job.settings.get("mode", ""), self._history_quality(job.settings))
                 log.exception("Job %s failed", job.rid)
                 job.header = "Failed"
                 if all(any(m in v.lower() for m in _UNSUPPORTED_MARKERS) for v in exc.attempts.values()):
@@ -329,7 +338,7 @@ class JobManager:
                     await self._emit(job, messages.generic_error(cleaned), markup=retry_menu(job.rid, job.url),
                                       sanitize=False)
             except Exception as exc:  # noqa: BLE001
-                ac.log_download(job.user_id, job.url, "failed")
+                ac.log_download(job.user_id, job.url, "failed", job.settings.get("mode", ""), self._history_quality(job.settings))
                 log.exception("Job %s failed", job.rid)
                 job.header = "Failed"
                 cleaned = _sanitize_step(str(exc), job.url)
@@ -394,7 +403,7 @@ class JobManager:
                 if adhd:
                     # No tool names, no speed/ETA - just a friendly holding
                     # line while progress is unknown (merging, converting...).
-                    line = "Working its magic…"
+                    line = "One moment…"
                 else:
                     meta = []
                     if speed:
