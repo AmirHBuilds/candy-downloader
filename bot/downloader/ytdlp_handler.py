@@ -31,6 +31,20 @@ _POSTPROCESSOR_LABELS = {
 }
 
 
+def _stream_label(info: dict, settings: dict) -> str:
+    """Which stream a progress event belongs to. yt-dlp usually fetches a
+    video-only and an audio-only format separately, then merges them."""
+    if settings.get("mode") == "audio":
+        return "Audio"   # even if the site only offers a combined stream
+    has_video = info.get("vcodec") not in (None, "none")
+    has_audio = info.get("acodec") not in (None, "none")
+    if has_audio and not has_video:
+        return "Audio"
+    if has_video:
+        return "Video"
+    return "Audio" if settings.get("mode") == "audio" else "Video"
+
+
 def _fmt_speed(bytes_per_sec) -> str | None:
     if not bytes_per_sec:
         return None
@@ -203,34 +217,42 @@ async def download(url: str, workspace: Path, settings: dict, user_id: int,
     DownloadCancelled is yt-dlp's own documented way to abort a download
     that's actually in progress."""
     loop = asyncio.get_running_loop()
-    size_announced = False
+    stream_sizes: dict[str, int] = {}   # per-stream totals seen so far -> running overall size
 
     def _check_cancelled() -> None:
         if cancel_event is not None and cancel_event.is_set():
             raise yt_dlp.utils.DownloadCancelled("Cancelled by user")
 
+    # progress_cb positional args: (percent, speed, eta, stage, label, size)
+    # - positional because loop.call_soon_threadsafe can't pass kwargs.
     def hook(d: dict) -> None:
-        nonlocal size_announced
         _check_cancelled()
-        if d.get("status") == "downloading":
-            total = d.get("total_bytes") or d.get("total_bytes_estimate")
-            downloaded = d.get("downloaded_bytes", 0)
-            percent = (downloaded / total * 100) if total else 0.0
-            speed = _fmt_speed(d.get("speed"))
-            eta = d.get("_eta_str", "").strip() or None
-            if total and not size_announced:
-                size_announced = True
-                loop.call_soon_threadsafe(progress_cb, None, None, None, f"📦 Size: {total / 1_000_000:.0f} MB")
-            loop.call_soon_threadsafe(progress_cb, percent, speed, eta, None)
-        # Deliberately no action on "finished": video+audio are often
-        # downloaded as two separate formats, so "finished" fires once
-        # per format, not once overall. Pushing a new line here created a
-        # confusing extra "Finishing up..." bullet that then got
-        # immediately overwritten by the next format's fresh 0% tick,
-        # while the previous format's real 100% line stayed stranded in
-        # history - two "Downloading video" lines for what looked like
-        # one step. postprocessor_hooks below announces the real,
-        # meaningful transitions (merging, embedding, etc.) instead.
+        status = d.get("status")
+        if status not in ("downloading", "finished"):
+            return
+        info = d.get("info_dict") or {}
+        label = _stream_label(info, settings)
+
+        if status == "finished":
+            # Fires once PER STREAM (video, then audio). Marks that
+            # stream's line complete; the next stream's first tick starts
+            # a new line (job_manager notices the label change), so the
+            # finished line stays behind as "Video - 100%".
+            loop.call_soon_threadsafe(progress_cb, 100.0, None, None, None, label)
+            return
+
+        total = d.get("total_bytes") or d.get("total_bytes_estimate")
+        downloaded = d.get("downloaded_bytes", 0)
+        percent = (downloaded / total * 100) if total else 0.0
+        speed = _fmt_speed(d.get("speed"))
+        eta = d.get("_eta_str", "").strip() or None
+
+        key = str(info.get("format_id") or d.get("filename") or label)
+        if total and key not in stream_sizes:
+            stream_sizes[key] = total
+            # overall size = every stream seen so far (video, then + audio)
+            loop.call_soon_threadsafe(progress_cb, None, None, None, None, None, sum(stream_sizes.values()))
+        loop.call_soon_threadsafe(progress_cb, percent, speed, eta, None, label)
 
     def pp_hook(d: dict) -> None:
         _check_cancelled()

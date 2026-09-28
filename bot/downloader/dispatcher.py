@@ -62,8 +62,8 @@ async def download(url: str, workspace: Path, settings: dict, user_id: int,
         try:
             log.info("Trying %s for %s", tool_name, url)
 
-            def cb(percent, speed, eta, stage=None, _tool=tool_name):
-                progress_cb(_tool, percent, speed, eta, stage)
+            def cb(percent, speed, eta, stage=None, label=None, size=None, _tool=tool_name):
+                progress_cb(_tool, percent, speed, eta, stage, label, size)
 
             files = await handler(url, workspace, settings, user_id, cb, cancel_event=cancel_event)
             if files:

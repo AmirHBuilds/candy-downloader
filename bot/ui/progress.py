@@ -1,7 +1,7 @@
 """
 Progress bar rendering. Five styles, chosen per user in /settings:
 
-  candy   🍬🍬🍬🍬⚪⚪⚪⚪⚪⚪     10 slots, each candy = 10%  (default)
+  candy   🍬🍬🍬🍬◾️◾️◾️◾️◾️◾️     10 slots, each candy = 10%  (default)
   jar     🫙🍬🍬🍬🍬······        a candy jar filling up
   pacman  ・・・・😋🍬🍬🍬🍬🍬     eats its way through the candies
   slider  ····🍬·····            one candy sliding along a track
@@ -11,6 +11,7 @@ Progress bar rendering. Five styles, chosen per user in /settings:
 """
 
 SLOTS = 10
+EMPTY_SLOT = "◾️"   # candy bar's unfilled slot (black square + emoji variation selector)
 _MOON_PHASES = ["🌑", "🌒", "🌓", "🌔", "🌕"]
 
 
@@ -20,7 +21,7 @@ def _clamp(percent: float) -> float:
 
 def _candy(percent: float) -> str:
     filled = int(_clamp(percent) // (100 / SLOTS))
-    return "🍬" * filled + "⚪" * (SLOTS - filled)
+    return "🍬" * filled + EMPTY_SLOT * (SLOTS - filled)
 
 
 def _jar(percent: float) -> str:
@@ -65,10 +66,22 @@ def resolve_style(setting: str | None, adhd: bool) -> str:
     return "moon" if adhd else "candy"
 
 
-def render_progress(style: str, percent: float, speed: str | None = None) -> str:
-    """'42% • 🍬🍬🍬🍬⚪⚪⚪⚪⚪⚪ • 2.1MB/s' - speed omitted when unknown."""
-    bar = BAR_STYLES.get(style, BAR_STYLES["candy"])[1](percent)
-    parts = [f"{_clamp(percent):.0f}%", bar]
+def render_progress(style: str, percent: float, speed: str | None = None,
+                    label: str | None = None) -> str:
+    """'Video - 42% • 🍬🍬🍬🍬◾️◾️◾️◾️◾️◾️ • 2.1MB/s'.
+
+    label: which stream this is ("Video" / "Audio") - yt-dlp downloads them
+    one after the other, each running 0-100%, so without a title the bar
+    looks like it inexplicably restarted.
+
+    Once a stream is complete the bar (and speed) are dropped and only the
+    title and 100% remain: 'Video - 100%'."""
+    pct = _clamp(percent)
+    prefix = f"{label} - " if label else ""
+    if round(pct) >= 100:
+        return f"{prefix}100%"
+    bar = BAR_STYLES.get(style, BAR_STYLES["candy"])[1](pct)
+    parts = [f"{pct:.0f}%", bar]
     if speed:
         parts.append(speed)
-    return " • ".join(parts)
+    return prefix + " • ".join(parts)

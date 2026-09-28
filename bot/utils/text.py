@@ -60,3 +60,24 @@ def friendly_domain(url: str) -> str:
         return (host[4:] if host.startswith("www.") else host) or "this link"
     except Exception:  # noqa: BLE001
         return "this link"
+
+
+_SITE_ALIASES = {"youtu": "youtube", "x": "X", "fb": "facebook"}
+_SECOND_LEVEL = {"co", "com", "org", "net", "gov", "ac"}
+
+
+def site_label(url: str) -> str:
+    """'https://www.youtube.com/watch?v=..' -> 'Youtube'; 'youtu.be' -> 'Youtube';
+    'music.youtube.com' -> 'Youtube'; 'bbc.co.uk' -> 'Bbc'."""
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        host = ""
+    labels = [p for p in host.split(".") if p]
+    if len(labels) < 2:
+        return host.title() or "Link"
+    name = labels[-2]
+    if len(labels) >= 3 and len(labels[-1]) == 2 and labels[-2] in _SECOND_LEVEL:
+        name = labels[-3]
+    name = _SITE_ALIASES.get(name, name)
+    return name if name.isupper() else name.title()

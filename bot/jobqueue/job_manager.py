@@ -38,7 +38,7 @@ from ui import messages
 from ui.progress import render_progress, resolve_style
 from ui.quick_menu import queued_menu, send_as_file_menu, sent_menu, retry_menu, cancelled_menu
 from utils.cleanup import job_workspace, new_cache_path
-from utils.text import esc, sanitize_step as _sanitize_step, friendly_domain as _friendly_domain
+from utils.text import esc, sanitize_step as _sanitize_step, site_label
 
 log = logging.getLogger("candy.jobs")
 
@@ -46,7 +46,7 @@ MIN_EDIT_INTERVAL_SEC = 1.5
 MIN_PERCENT_DELTA = 3.0
 HEARTBEAT_INTERVAL_SEC = 2.5
 RECENT_FILE_TTL_SECONDS = 5 * 60
-MAX_STEP_LINES = 3
+MAX_STEP_LINES = 4   # room for: tool line + Video line + Audio line + a postprocessing stage
 
 # Extensions that are never the actual media - sidecar/thumbnail files
 # that can end up in the workspace alongside the real output. Everything
@@ -79,6 +79,10 @@ class Job:
     is_photo: bool = False
     force_document: bool = False
     steps: list[str] = field(default_factory=list)
+    # Permanent header facts (type / size / site) shown ABOVE the scrolling
+    # steps and updated in place as more becomes known - unlike steps they
+    # never scroll away. Keys: type, size (bytes), site.
+    info: dict = field(default_factory=dict)
     header: str = "Working"
     task: Optional[asyncio.Task] = field(default=None)
     cancelled: bool = False
@@ -158,6 +162,9 @@ class JobManager:
         if job.settings.get("adhd_mode"):
             return self._render_adhd(job)
         lines = [f"{OWNER_EMOJI} <b>{job.header}</b>"]
+        info_line = self._info_line(job)
+        if info_line:
+            lines.append(info_line)
         if job.steps:
             recent = job.steps[-MAX_STEP_LINES:]
             rendered = []
@@ -167,6 +174,27 @@ class JobManager:
                 rendered.append(f"• {text}")
             lines.append("\n".join(rendered))
         return "\n\n".join(lines)
+
+    # One place to change the icons on the info line.
+    _TYPE_ICONS = {"Audio": "🎵", "Video": "🎬", "File": "📄"}
+
+    def _info_line(self, job: Job) -> str:
+        """'• 🎵 Audio | 📦 230 MB | 🔗 Youtube' - parts appear as they become known."""
+        parts = []
+        kind = job.info.get("type")
+        if kind:
+            parts.append(f"{self._TYPE_ICONS.get(kind, '')} {kind}".strip())
+        size = job.info.get("size")
+        if size:
+            mb = size / 1_000_000
+            parts.append(f"📦 {mb / 1000:.1f} GB" if mb >= 1000 else f"📦 {mb:.0f} MB")
+        if job.info.get("site"):
+            parts.append(f"🔗 {esc(job.info['site'])}")
+        return ("• " + " | ".join(parts)) if parts else ""
+
+    async def _refresh(self, job: Job) -> None:
+        """Re-render without touching the steps - used when only the info line changed."""
+        await self._safe_edit(job, self._render(job), markup=queued_menu(job.rid, job.url))
 
     _ADHD_HEADERS = {
         "Queued": "🍬 On it...",
@@ -317,25 +345,50 @@ class JobManager:
         if adhd:
             await self._emit(job, "Fetching…", markup=queued_menu(job.rid, job.url))
         else:
-            type_label = "🎵 Audio" if job.settings.get("mode") == "audio" else "🎬 Video"
-            await self._emit(job, type_label, markup=queued_menu(job.rid, job.url))
-            provider = _friendly_domain(job.url)
-            await self._emit(job, f"Link: {provider}", markup=queued_menu(job.rid, job.url))
+            job.info = {
+                "type": "Audio" if job.settings.get("mode") == "audio" else "Video",
+                "site": site_label(job.url),
+            }
+            await self._emit(job, "Starting…", markup=queued_menu(job.rid, job.url))
 
         last_edit_time = 0.0
         last_percent = -100.0
 
-        def progress_cb(tool_name: str, percent: float | None, speed: str | None, eta: str | None,
-                        stage: str | None = None) -> None:
-            nonlocal last_edit_time, last_percent
-            push = stage is not None and not adhd
+        current_label: str | None = None
 
-            if not push:
-                now = time.monotonic()
-                if (now - last_edit_time) < MIN_EDIT_INTERVAL_SEC and abs((percent or 0) - last_percent) < MIN_PERCENT_DELTA:
+        def progress_cb(tool_name: str, percent: float | None, speed: str | None, eta: str | None,
+                        stage: str | None = None, label: str | None = None,
+                        size: int | None = None) -> None:
+            nonlocal last_edit_time, last_percent, current_label
+
+            # Anything that isn't a video/audio stream download (gallery-dl,
+            # plain file links) shouldn't be announced as "Video".
+            if tool_name in ("gallerydl", "generic") and job.info and job.info.get("type") != "File":
+                job.info["type"] = "File"
+
+            if size is not None:
+                job.info["size"] = size
+                if percent is None and stage is None and label is None:
+                    if not adhd:
+                        asyncio.create_task(self._refresh(job))
                     return
-                last_edit_time = now
-                last_percent = percent or 0
+
+            # yt-dlp downloads video and audio as two streams, each 0-100%.
+            # A new label = a new stream = its own line, so the finished
+            # "Video - 100%" line stays put while "Audio" progresses below it.
+            new_stream = label is not None and label != current_label
+            if label is not None:
+                current_label = label
+            done = percent is not None and round(percent) >= 100
+            push = (stage is not None or new_stream) and not adhd
+
+            now = time.monotonic()
+            if (not push and not done
+                    and (now - last_edit_time) < MIN_EDIT_INTERVAL_SEC
+                    and abs((percent or 0) - last_percent) < MIN_PERCENT_DELTA):
+                return
+            last_edit_time = now
+            last_percent = percent or 0
 
             if percent is None:
                 if adhd:
@@ -356,9 +409,15 @@ class JobManager:
                         line = stage
                     else:
                         line = "Working..."
+            elif stage and done:
+                # Postprocessing stages ("Merging video & audio") report
+                # 100% - the stage name is the message, not a bar.
+                line = "Finishing up…" if adhd else stage
             else:
-                # "42% • 🍬🍬🍬🍬⚪⚪⚪⚪⚪⚪ • 2.1MB/s" - ADHD Mode leaves the speed off.
-                line = render_progress(bar_style, percent, None if adhd else speed)
+                # "Video - 42% • 🍬🍬🍬🍬◾️◾️◾️◾️◾️◾️ • 2.1MB/s"; at 100% just "Video - 100%".
+                # ADHD Mode: no title and no speed.
+                line = render_progress(bar_style, percent, None if adhd else speed,
+                                       None if adhd else label)
                 if stage and not adhd:
                     line = f"{stage} · {line}"
 

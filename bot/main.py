@@ -136,6 +136,19 @@ async def gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     return True
 
 
+def _with_current_look(user_id: int, saved: dict) -> dict:
+    """Retry / Send-as-file re-run a download with the settings it originally
+    used. Only the *look* of the progress display should follow the user's
+    current preferences though - otherwise picking a new bar style (or
+    toggling ADHD Mode) and then tapping Try again would still show the old
+    one. Quality/format/etc. deliberately stay as they were."""
+    current = get_settings(user_id)
+    merged = dict(saved)
+    merged["bar_style"] = current.get("bar_style", "auto")
+    merged["adhd_mode"] = current.get("adhd_mode", False)
+    return merged
+
+
 async def gate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """gate(), but for a CallbackQuery - old dl|/nav|/s| buttons from
     before someone was removed, or from before Private mode was turned
@@ -805,7 +818,7 @@ async def link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
         await set_text(messages.with_link(messages.QUEUED, url), markup=queued_menu(rid, url))
         await job_manager.enqueue(
-            rid, user_id, query.message.chat_id, url, dict(saved_settings), query.message.message_id,
+            rid, user_id, query.message.chat_id, url, _with_current_look(user_id, saved_settings), query.message.message_id,
             is_photo=is_photo,
         )
         return
@@ -836,7 +849,7 @@ async def link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             query.message.chat_id, messages.with_link("Re-fetching as a file…", url), parse_mode=ParseMode.HTML,
         )
         await job_manager.enqueue(
-            rid, user_id, status_msg.chat_id, url, dict(saved_settings), status_msg.message_id,
+            rid, user_id, status_msg.chat_id, url, _with_current_look(user_id, saved_settings), status_msg.message_id,
             is_photo=False, force_document=True,
         )
         return
