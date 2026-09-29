@@ -5,7 +5,7 @@ import time
 import uuid
 
 import httpx
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application, ApplicationBuilder, CommandHandler, MessageHandler,
@@ -25,7 +25,9 @@ from ui.settings_menu import (
     main_menu, advanced_menu, confirm_reset_menu, back_to_main, ADVANCED_TEXT_FIELDS,
     bars_menu, bars_title,
 )
-from ui.history_menu import history_text, history_menu, confirm_clear_menu, PAGE_SIZE
+from ui.history_menu import (
+    history_text, history_menu, confirm_clear_menu, PAGE_SIZE, ORIGIN_HOME, ORIGIN_SETTINGS,
+)
 from ui.start_menu import start_menu
 from downloader.probe import probe, ProbeResult
 from downloader import gallerydl_probe
@@ -211,6 +213,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/adhd_off — turn that back off",
         "/settings — your saved defaults (cookies help is in there too)",
         "/queue — what's running",
+        "/history — what you've downloaded",
         "/cancel — stop your current download",
     ]
     if is_owner_or_admin(update.effective_user.id):
@@ -561,25 +564,41 @@ async def misc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         text = job_manager.active_summary(update.effective_user.id)
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("← Back", callback_data="nav|home")]])
         await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
-    elif action == "history":
-        text, markup = _render_history_page(update.effective_user.id, 1)
-        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+    elif action in ("history", "history_home"):
+        # Same screen, but "← Back" must return to wherever it was opened from.
+        origin = ORIGIN_HOME if action == "history_home" else ORIGIN_SETTINGS
+        text, markup = _render_history_page(update.effective_user.id, 1, origin)
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup,
+                                       link_preview_options=_NO_PREVIEW)
 
 
-def _render_history_page(user_id: int, page: int) -> tuple[str, InlineKeyboardMarkup]:
+# Every history entry is a link; without this Telegram would unfurl a big
+# preview card for the first one on each page.
+_NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
+
+
+def _render_history_page(user_id: int, page: int, origin: str = ORIGIN_HOME) -> tuple[str, InlineKeyboardMarkup]:
     total = ac.count_user_downloads(user_id)
     total_pages = max(1, -(-total // PAGE_SIZE))   # ceiling division
     page = max(1, min(page, total_pages))
     rows = ac.list_user_downloads(user_id, (page - 1) * PAGE_SIZE, PAGE_SIZE)
-    return history_text(rows, page, total_pages, total), history_menu(page, total_pages)
+    return history_text(rows, page, total_pages, total), history_menu(page, total_pages, origin)
+
+
+def _hist_origin(parts: list[str], index: int) -> str:
+    """Origin flag from a hist| callback; buttons on messages sent before
+    this existed have none, so fall back to the start screen."""
+    value = parts[index] if len(parts) > index else ""
+    return value if value in (ORIGIN_HOME, ORIGIN_SETTINGS) else ORIGIN_HOME
 
 
 async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await gate(update, context):
         return
     await _delete_quietly(update.message)
-    text, markup = _render_history_page(update.effective_user.id, 1)
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+    text, markup = _render_history_page(update.effective_user.id, 1, ORIGIN_HOME)
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup,
+                                     link_preview_options=_NO_PREVIEW)
 
 
 async def history_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -592,29 +611,42 @@ async def history_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     action = parts[1] if len(parts) > 1 else ""
 
     if action == "close":
-        s = get_settings(user_id)
-        await query.edit_message_text(settings_title(), parse_mode=ParseMode.HTML, reply_markup=main_menu(s))
+        if _hist_origin(parts, 2) == ORIGIN_SETTINGS:
+            s = get_settings(user_id)
+            await query.edit_message_text(settings_title(), parse_mode=ParseMode.HTML, reply_markup=main_menu(s))
+        else:
+            await query.edit_message_text(messages.WELCOME, parse_mode=ParseMode.HTML, reply_markup=start_menu())
         return
 
     if action == "page":
         page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
-        text, markup = _render_history_page(user_id, page)
-        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        text, markup = _render_history_page(user_id, page, _hist_origin(parts, 3))
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup,
+                                       link_preview_options=_NO_PREVIEW)
         return
 
     if action == "clear":
         page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
-        await query.edit_message_reply_markup(reply_markup=confirm_clear_menu(page))
+        await query.edit_message_reply_markup(reply_markup=confirm_clear_menu(page, _hist_origin(parts, 3)))
         return
 
     if action == "clear_yes":
         deleted = ac.clear_user_downloads(user_id)
         note = f"🗑 Cleared {deleted} entr{'y' if deleted == 1 else 'ies'}." if deleted else "Nothing to clear."
-        text, markup = _render_history_page(user_id, 1)
-        await query.edit_message_text(f"{note}\n\n{text}", parse_mode=ParseMode.HTML, reply_markup=markup)
+        text, markup = _render_history_page(user_id, 1, _hist_origin(parts, 2))
+        await query.edit_message_text(f"{note}\n\n{text}", parse_mode=ParseMode.HTML, reply_markup=markup,
+                                       link_preview_options=_NO_PREVIEW)
 
 
 # ---------- link handling ----------
+
+def _preview_title(rid: str) -> str:
+    """Title from the quality-picker preview, if we probed one. It only seeds
+    /history for jobs that never deliver a file (failed / cancelled); a
+    successful job's file name replaces it. ADHD Mode never probes -> ""."""
+    probe_result = pending_probes.get(rid)
+    return probe_result.title if probe_result and probe_result.title else ""
+
 
 async def handle_adhd_download(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, rid: str,
                                 user_id: int) -> None:
@@ -871,7 +903,7 @@ async def link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await set_text(messages.with_link(messages.QUEUED, url), markup=queued_menu(rid, url))
         await job_manager.enqueue(
             rid, user_id, query.message.chat_id, url, _with_current_look(user_id, saved_settings), query.message.message_id,
-            is_photo=is_photo,
+            is_photo=is_photo, title=_preview_title(rid),
         )
         return
 
@@ -902,7 +934,7 @@ async def link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         await job_manager.enqueue(
             rid, user_id, status_msg.chat_id, url, _with_current_look(user_id, saved_settings), status_msg.message_id,
-            is_photo=False, force_document=True,
+            is_photo=False, force_document=True, title=_preview_title(rid),
         )
         return
 
@@ -939,6 +971,7 @@ async def link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await set_text(messages.with_link(messages.QUEUED, url), markup=queued_menu(rid, url))
         await job_manager.enqueue(
             rid, user_id, query.message.chat_id, url, job_settings, query.message.message_id, is_photo=is_photo,
+            title=_preview_title(rid),
         )
 
 

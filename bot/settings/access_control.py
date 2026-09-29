@@ -48,11 +48,13 @@ def _connect() -> sqlite3.Connection:
             status TEXT NOT NULL,
             at TEXT NOT NULL,
             mode TEXT NOT NULL DEFAULT '',
-            quality TEXT NOT NULL DEFAULT ''
+            quality TEXT NOT NULL DEFAULT '',
+            title TEXT NOT NULL DEFAULT ''
         )"""
     )
     _add_column_if_missing(conn, "downloads_log", "mode", "TEXT NOT NULL DEFAULT ''")
     _add_column_if_missing(conn, "downloads_log", "quality", "TEXT NOT NULL DEFAULT ''")
+    _add_column_if_missing(conn, "downloads_log", "title", "TEXT NOT NULL DEFAULT ''")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_downloads_log_user ON downloads_log(user_id, id DESC)")
     conn.commit()
     return conn
@@ -164,14 +166,16 @@ def list_known_users(limit: int = 50) -> list[tuple[int, str]]:
         conn.close()
 
 
-def log_download(user_id: int, url: str, status: str, mode: str = "", quality: str = "") -> None:
+def log_download(user_id: int, url: str, status: str, mode: str = "", quality: str = "",
+                 title: str = "") -> None:
     """status: 'success', 'failed', or 'cancelled'. Powers both the owner's
     activity feed and each person's own /history."""
     conn = _connect()
     try:
         conn.execute(
-            "INSERT INTO downloads_log (user_id, url, status, at, mode, quality) VALUES (?, ?, ?, ?, ?, ?)",
-            (user_id, url[:300], status, datetime.now(timezone.utc).isoformat(), mode[:20], quality[:20]),
+            "INSERT INTO downloads_log (user_id, url, status, at, mode, quality, title) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (user_id, url[:300], status, datetime.now(timezone.utc).isoformat(), mode[:20], quality[:20],
+             (title or "")[:120]),
         )
         conn.commit()
     finally:
@@ -189,15 +193,16 @@ def count_user_downloads(user_id: int) -> int:
 
 
 def list_user_downloads(user_id: int, offset: int, limit: int) -> list[dict]:
-    """Newest first. Each row: {url, status, at, mode, quality}."""
+    """Newest first. Each row: {url, status, at, mode, quality, title}."""
     conn = _connect()
     try:
         rows = conn.execute(
-            """SELECT url, status, at, mode, quality FROM downloads_log
+            """SELECT url, status, at, mode, quality, title FROM downloads_log
                WHERE user_id = ? ORDER BY id DESC LIMIT ? OFFSET ?""",
             (user_id, limit, offset),
         ).fetchall()
-        return [{"url": r[0], "status": r[1], "at": r[2], "mode": r[3], "quality": r[4]} for r in rows]
+        return [{"url": r[0], "status": r[1], "at": r[2], "mode": r[3], "quality": r[4], "title": r[5]}
+                for r in rows]
     finally:
         conn.close()
 

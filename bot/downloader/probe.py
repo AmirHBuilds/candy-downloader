@@ -25,6 +25,10 @@ class ProbeResult:
     heights: list[int] = field(default_factory=list)   # available video heights, descending
     has_audio: bool = True                              # any audio-bearing format at all
     is_playlist: bool = False
+    # Length in seconds; None for playlists, live streams and anything the
+    # site doesn't report. Time-range sections are only offered when this is
+    # known (it's also what timestamps are validated against).
+    duration: int | None = None
     error: str = ""                                     # populated when ok=False, for a better user message
 
 
@@ -84,10 +88,17 @@ async def probe(url: str, user_id: int | None = None) -> ProbeResult:
     has_video = bool(heights) or (info.get("vcodec") not in (None, "none"))
     has_audio = any(f.get("acodec") not in (None, "none") for f in formats) or not formats
 
+    # A live stream (or a not-yet-started premiere) has no fixed length, so
+    # a time range on it is meaningless even if the site reports something.
+    is_live = bool(info.get("is_live")) or info.get("live_status") in ("is_live", "is_upcoming", "post_live")
+    raw_duration = info.get("duration")
+    duration = int(raw_duration) if raw_duration and not is_live else None
+
     return ProbeResult(
         ok=True,
         title=(info.get("title") or "")[:150],
         thumbnail=info.get("thumbnail") or "",
         heights=heights if has_video else [],
         has_audio=has_audio,
+        duration=duration,
     )

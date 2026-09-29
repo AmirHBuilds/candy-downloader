@@ -78,6 +78,10 @@ class Job:
     status_message_id: int
     is_photo: bool = False
     force_document: bool = False
+    # For /history. Seeded from the preview's title when we had one (so failed
+    # and cancelled jobs still get a name); replaced by the delivered file's
+    # name on success, which works for every tool, ADHD Mode included.
+    title: str = ""
     steps: list[str] = field(default_factory=list)
     # Permanent header facts (type / size / site) shown ABOVE the scrolling
     # steps and updated in place as more becomes known - unlike steps they
@@ -105,7 +109,7 @@ class JobManager:
 
     async def enqueue(self, rid: str, user_id: int, chat_id: int, url: str, settings: dict,
                        status_message_id: int, is_photo: bool = False,
-                       force_document: bool = False) -> Job:
+                       force_document: bool = False, title: str = "") -> Job:
         job = Job(
             rid=rid,
             user_id=user_id,
@@ -115,6 +119,7 @@ class JobManager:
             status_message_id=status_message_id,
             is_photo=is_photo,
             force_document=force_document,
+            title=title,
             header="Queued",
         )
         self._jobs_by_rid[rid] = job
@@ -183,6 +188,10 @@ class JobManager:
         if settings.get("mode") == "audio":
             return settings.get("audio_format", "audio")
         return settings.get("quality", "best")
+
+    def _log_history(self, job: Job, status: str) -> None:
+        ac.log_download(job.user_id, job.url, status, job.settings.get("mode", ""),
+                        self._history_quality(job.settings), job.title)
 
     # One place to change the icons on the info line.
     _TYPE_ICONS = {"Audio": "🎵", "Video": "🎬", "File": "📄"}
@@ -311,7 +320,7 @@ class JobManager:
             job = await self._queue.get()
 
             if job.cancelled:
-                ac.log_download(job.user_id, job.url, "cancelled", job.settings.get("mode", ""), self._history_quality(job.settings))
+                self._log_history(job, "cancelled")
                 job.header = "Cancelled"
                 await self._emit(job, "Cancelled before it started", markup=cancelled_menu(job.rid, job.url))
                 self._jobs_by_rid.pop(job.rid, None)
@@ -321,13 +330,13 @@ class JobManager:
             job.task = asyncio.current_task()
             try:
                 await self._run_job(job)
-                ac.log_download(job.user_id, job.url, "success", job.settings.get("mode", ""), self._history_quality(job.settings))
+                self._log_history(job, "success")
             except (asyncio.CancelledError, JobCancelled):
-                ac.log_download(job.user_id, job.url, "cancelled", job.settings.get("mode", ""), self._history_quality(job.settings))
+                self._log_history(job, "cancelled")
                 job.header = "Cancelled"
                 await self._emit(job, "Cancelled", markup=cancelled_menu(job.rid, job.url))
             except NoToolSucceeded as exc:
-                ac.log_download(job.user_id, job.url, "failed", job.settings.get("mode", ""), self._history_quality(job.settings))
+                self._log_history(job, "failed")
                 log.exception("Job %s failed", job.rid)
                 job.header = "Failed"
                 if all(any(m in v.lower() for m in _UNSUPPORTED_MARKERS) for v in exc.attempts.values()):
@@ -338,7 +347,7 @@ class JobManager:
                     await self._emit(job, messages.generic_error(cleaned), markup=retry_menu(job.rid, job.url),
                                       sanitize=False)
             except Exception as exc:  # noqa: BLE001
-                ac.log_download(job.user_id, job.url, "failed", job.settings.get("mode", ""), self._history_quality(job.settings))
+                self._log_history(job, "failed")
                 log.exception("Job %s failed", job.rid)
                 job.header = "Failed"
                 cleaned = _sanitize_step(str(exc), job.url)
@@ -435,6 +444,13 @@ class JobManager:
         with job_workspace() as workspace:
             files = await dispatch_download(job.url, workspace, job.settings, job.user_id, progress_cb,
                                              cancel_event=job.cancel_event)
+
+            # Name for /history: the first real file's name (a gallery/playlist
+            # just gets its first item). Keep the preview title if there's none.
+            named = next((f for f in files if f.suffix.lower() not in _NON_MEDIA_EXTS), None) \
+                or (files[0] if files else None)
+            if named is not None and named.stem:
+                job.title = named.stem
 
             if job.settings.get("mode") in ("video", "audio"):
                 for f in files:

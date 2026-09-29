@@ -1,5 +1,10 @@
 import asyncio
 import logging
+import os
+import re
+import shutil
+import signal
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -8,6 +13,7 @@ import yt_dlp
 from config import DATA_DIR, BGUTIL_POT_URL
 from downloader.cookies import apply_cookies, cookie_file_for
 from downloader.errors import JobCancelled
+from downloader.sections import SectionError, filename_tag, format_section, validate_sections
 
 log = logging.getLogger("candy.ytdlp")
 
@@ -216,6 +222,9 @@ async def download(url: str, workspace: Path, settings: dict, user_id: int,
     (which yt-dlp calls from that same thread) and raising
     DownloadCancelled is yt-dlp's own documented way to abort a download
     that's actually in progress."""
+    if settings.get("sections"):
+        return await _download_sections(url, workspace, settings, user_id, progress_cb, cancel_event)
+
     loop = asyncio.get_running_loop()
     stream_sizes: dict[str, int] = {}   # per-stream totals seen so far -> running overall size
 
@@ -324,3 +333,284 @@ async def download(url: str, workspace: Path, settings: dict, user_id: int,
     media = [p for p in results if p.suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp", ".part", ".ytdl"}]
     return media or results
 
+
+# ---------------------------------------------------------------------------
+# Time-range clips ("sections")
+#
+# Measured on a real 1h43m YouTube video (spike, 2026-09): a 2-minute clip
+# transferred ~18 MB instead of ~800 MB and came out exactly 120.0s, so yt-dlp's
+# download_ranges genuinely fetches only the range. What the spike ALSO showed
+# shapes this code:
+#   - Several ranges in ONE yt-dlp call silently yield a single file (the
+#     second range is lost) -> we run yt-dlp once PER section.
+#   - yt-dlp fires exactly one progress event, "finished", at the very end
+#     (ffmpeg does the transfer, not yt-dlp) -> no live percent bar is
+#     possible; we report "Clip 1 of 2 - 1:05" instead.
+#   - The hooks therefore never run mid-download, so the usual cancel-by-
+#     raising-in-a-hook can't interrupt a clip -> we kill the job's ffmpeg.
+# ---------------------------------------------------------------------------
+
+_NON_MEDIA_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".part", ".ytdl"}
+_ELAPSED_TICK_SECONDS = 4
+
+
+def _raise_if_cancelled(cancel_event: asyncio.Event | None) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise JobCancelled("Cancelled by user")
+
+
+def _kill_ffmpeg_under(workspace: Path) -> int:
+    """SIGKILL every ffmpeg whose command line mentions this job's workspace.
+
+    That is how a clip download is cancelled: the transfer runs inside an
+    ffmpeg child of yt-dlp that no hook can reach. The workspace path is
+    unique per job (see utils.cleanup.job_workspace), so other jobs' ffmpegs
+    are never touched. Reads /proc, so it is a harmless no-op off Linux."""
+    needle = str(workspace).rstrip("/") + "/"
+    killed = 0
+    for cmdline in Path("/proc").glob("[0-9]*/cmdline"):
+        try:
+            argv = cmdline.read_bytes().split(b"\0")
+            if not argv or b"ffmpeg" not in os.path.basename(argv[0]):
+                continue
+            if needle.encode() not in b" ".join(argv):
+                continue
+            os.kill(int(cmdline.parent.name), signal.SIGKILL)
+            killed += 1
+        except (OSError, ValueError):
+            continue   # process vanished, or not ours to kill
+    return killed
+
+
+def _tidy_clip_name(path: Path) -> Path:
+    """Titles are cut by yt-dlp's %(title).60B, which can end on a space and
+    leave 'Some title  [01-30-00-01-32-00].mp4'. Collapse that."""
+    cleaned = re.sub(r"\s+", " ", path.stem).strip()
+    if cleaned == path.stem:
+        return path
+    target = path.with_name(cleaned + path.suffix)
+    if target.exists():
+        return path
+    try:
+        path.rename(target)
+        return target
+    except OSError:
+        return path
+
+
+def _unique_destination(dest_dir: Path, name: str) -> Path:
+    target = dest_dir / name
+    counter = 2
+    while target.exists():
+        target = dest_dir / f"{Path(name).stem} ({counter}){Path(name).suffix}"
+        counter += 1
+    return target
+
+
+def _fmt_elapsed(seconds: float) -> str:
+    seconds = int(seconds)
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+async def _watch_clip(workspace: Path, cancel_event: asyncio.Event | None,
+                      progress_cb: ProgressCB, text: str, started: float) -> None:
+    """Runs alongside a clip download: (1) enforces cancellation by killing
+    ffmpeg, (2) keeps the status line alive with elapsed time, since yt-dlp
+    reports nothing while ffmpeg works and the message would look frozen.
+
+    The elapsed text travels in progress_cb's `speed` slot with everything
+    else None - job_manager renders that as a plain overwriting line."""
+    ticks = 0
+    while True:
+        await asyncio.sleep(1)
+        if cancel_event is not None and cancel_event.is_set():
+            # Repeatedly: yt-dlp may start another ffmpeg (thumbnail, remux)
+            # before it notices the first one died.
+            _kill_ffmpeg_under(workspace)
+            continue
+        ticks += 1
+        if ticks % _ELAPSED_TICK_SECONDS == 0:
+            progress_cb(None, f"{text} · {_fmt_elapsed(time.monotonic() - started)}", None)
+
+
+async def _run_ffmpeg(args: list[str], cancel_event: asyncio.Event | None) -> tuple[int, str]:
+    proc = await asyncio.create_subprocess_exec(
+        *args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+    )
+    waiter = asyncio.create_task(proc.communicate())
+    started = time.monotonic()
+    while not waiter.done():
+        await asyncio.wait({waiter}, timeout=0.5)
+        cancelled = cancel_event is not None and cancel_event.is_set()
+        if cancelled or time.monotonic() - started > DOWNLOAD_TIMEOUT_SECONDS:
+            proc.kill()
+            await waiter
+            if cancelled:
+                raise JobCancelled("Cancelled by user")
+            raise RuntimeError("Merging the clips took too long and was stopped.")
+    _, err = waiter.result()
+    return proc.returncode or 0, err.decode("utf-8", "replace")[-300:]
+
+
+async def _media_seconds(path: Path) -> float | None:
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await proc.communicate()
+        return float(out.decode().strip())
+    except (OSError, ValueError):
+        return None
+
+
+async def _merge_clips(clips: list[Path], sections: list[tuple[float, float]], workspace: Path,
+                       cancel_event: asyncio.Event | None) -> Path | None:
+    """Join clips into one file, in order. Returns None if it can't (callers
+    then send the clips separately - better than failing after all the work).
+
+    First tries a lossless concat (fast, no quality loss). The clips all come
+    from one source with one format selector, so that normally works, but
+    concat-copy can produce timestamp glitches, so the result's length is
+    checked and only a wrong length triggers the slower re-encode."""
+    if len({c.suffix.lower() for c in clips}) != 1:
+        return None
+    suffix = clips[0].suffix
+    base = re.sub(r"\s*\[[^\]]*\]$", "", clips[0].stem).strip() or "clips"
+    out = _unique_destination(workspace, f"{base} [{len(clips)} clips]{suffix}")
+    listing = workspace / "concat_list.txt"
+    listing.write_text("".join("file '{}'\n".format(str(c).replace("'", "'\\''")) for c in clips), encoding="utf-8")
+    expected = sum(end - start for start, end in sections)
+
+    try:
+        for reencode in (False, True):
+            _raise_if_cancelled(cancel_event)
+            args = ["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", str(listing)]
+            args += [] if reencode else ["-c", "copy"]
+            args.append(str(out))
+            code, err = await _run_ffmpeg(args, cancel_event)
+            if code == 0 and out.exists() and out.stat().st_size > 0:
+                got = await _media_seconds(out)
+                if got is not None and abs(got - expected) <= max(3.0, expected * 0.02):
+                    return out
+                log.info("Concat (reencode=%s) length %s != expected %s", reencode, got, expected)
+            else:
+                log.info("Concat (reencode=%s) failed: %s", reencode, err.strip())
+            out.unlink(missing_ok=True)
+        return None
+    finally:
+        listing.unlink(missing_ok=True)
+
+
+async def _download_sections(url: str, workspace: Path, settings: dict, user_id: int,
+                             progress_cb: ProgressCB, cancel_event: asyncio.Event | None) -> list[Path]:
+    """Download only the requested time ranges of one video or audio track.
+
+    settings["sections"]: [(start_s, end_s), ...], already concrete (see
+    downloader.sections). settings["sections_merge"]: join into one file.
+    Any failed clip fails the whole job with a message naming the clip - a
+    silent partial result would be worse than a clear error and a retry."""
+    from yt_dlp.utils import download_range_func   # local: keeps module import cheap for tests
+
+    loop = asyncio.get_running_loop()
+    try:
+        sections = validate_sections(settings["sections"])
+    except SectionError as exc:
+        raise RuntimeError(str(exc)) from exc
+    total = len(sections)
+    merge = bool(settings.get("sections_merge")) and total > 1
+
+    def _check_cancelled_hook(_d: dict) -> None:
+        # Only fires around the download (never mid-transfer, see above), but
+        # it is free and stops the postprocessing phase promptly.
+        if cancel_event is not None and cancel_event.is_set():
+            raise yt_dlp.utils.DownloadCancelled("Cancelled by user")
+
+    clips: list[Path] = []
+    for index, (start, end) in enumerate(sections, 1):
+        _raise_if_cancelled(cancel_event)
+        text = f"Clip {index} of {total} · {format_section(start, end)}" if total > 1 \
+            else f"Clip · {format_section(start, end)}"
+        progress_cb(None, None, None, text)          # stage -> a new status line
+
+        clip_dir = workspace / f"clip{index:02d}"
+        clip_dir.mkdir(exist_ok=True)
+        clip_settings = dict(settings)
+        clip_settings["filename_template"] = f"%(title).60B [{filename_tag(start, end)}].%(ext)s"
+        base_opts = _build_opts(url, clip_dir, clip_settings, user_id, _check_cancelled_hook, _check_cancelled_hook)
+        # Cut exactly where asked (re-encodes just this small piece) instead
+        # of snapping to the nearest keyframe, which can be seconds off.
+        base_opts["download_ranges"] = download_range_func(None, [(start, end)])
+        base_opts["force_keyframes_at_cuts"] = True
+        using_cookies = "cookiefile" in base_opts
+
+        def run(opts: dict) -> None:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([url])
+
+        async def attempt(opts: dict, _dir: Path = clip_dir, _text: str = text) -> None:
+            watcher = asyncio.create_task(_watch_clip(workspace, cancel_event, progress_cb, _text, time.monotonic()))
+            try:
+                await asyncio.wait_for(loop.run_in_executor(None, run, opts), timeout=DOWNLOAD_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                _kill_ffmpeg_under(workspace)
+                raise RuntimeError(f"Timed out after {DOWNLOAD_TIMEOUT_SECONDS // 60} minutes.")
+            except yt_dlp.utils.DownloadCancelled as exc:
+                raise JobCancelled(str(exc)) from exc
+            except Exception:
+                # Killing ffmpeg makes yt-dlp fail with a generic error;
+                # if that's why we're here, it's a cancel, not a failure.
+                _raise_if_cancelled(cancel_event)
+                raise
+            finally:
+                watcher.cancel()
+
+        try:
+            await attempt(base_opts)
+        except JobCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            if using_cookies or not _looks_like_bot_check(exc):
+                raise RuntimeError(f"Clip {index} failed: {str(exc).strip().splitlines()[0][:160]}") from exc
+            last_error: Exception | None = exc
+            for client in CLIENT_FALLBACKS:
+                _raise_if_cancelled(cancel_event)
+                for leftover in clip_dir.iterdir():
+                    leftover.unlink(missing_ok=True)
+                retry_opts = dict(base_opts)
+                retry_opts["extractor_args"] = {
+                    **base_opts.get("extractor_args", {}),
+                    "youtube": {"player_client": [client]},
+                }
+                try:
+                    log.info("Retrying clip %s of %s with player_client=%s after bot-check", index, url, client)
+                    await attempt(retry_opts)
+                    last_error = None
+                    break
+                except JobCancelled:
+                    raise
+                except Exception as retry_exc:  # noqa: BLE001
+                    last_error = retry_exc
+            if last_error is not None:
+                raise RuntimeError(f"Clip {index} failed: {str(last_error).strip().splitlines()[0][:160]}") from last_error
+
+        produced = [f for f in sorted(clip_dir.glob("*")) if f.suffix.lower() not in _NON_MEDIA_SUFFIXES]
+        if settings.get("mode") == "audio" and settings.get("audio_format") == "opus":
+            produced = [_rename_opus_ogg(f) for f in produced]
+        produced = [f for f in produced if f.exists() and f.stat().st_size > 0]
+        if not produced:
+            raise RuntimeError(f"Clip {index} came out empty.")
+        # Flatten into the workspace root, where job_manager expects results.
+        for f in produced:
+            clips.append(_tidy_clip_name(Path(shutil.move(str(f), str(_unique_destination(workspace, f.name))))))
+        shutil.rmtree(clip_dir, ignore_errors=True)
+
+    if merge:
+        progress_cb(None, None, None, "Merging clips")
+        merged = await _merge_clips(clips, sections, workspace, cancel_event)
+        if merged is not None:
+            for c in clips:
+                c.unlink(missing_ok=True)
+            return [merged]
+        progress_cb(None, None, None, "Couldn't merge - sending the clips separately")
+    return clips

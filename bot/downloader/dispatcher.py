@@ -55,6 +55,14 @@ async def download(url: str, workspace: Path, settings: dict, user_id: int,
     order = tool_order_for(url)
     attempts: dict[str, str] = {}
 
+    if settings.get("sections"):
+        # Only yt-dlp can cut a time range. Falling through to gallery-dl or
+        # aria2c would quietly download the WHOLE file - exactly what the
+        # person asked not to do - so a clip request never uses them.
+        if "ytdlp" not in order:
+            raise NoToolSucceeded({order[0]: "time ranges aren't supported for this link"}, primary_tool=order[0])
+        order = ["ytdlp"]
+
     for tool_name in order:
         handler = HANDLERS[tool_name]
         label = FRIENDLY_TOOL.get(tool_name, tool_name)
