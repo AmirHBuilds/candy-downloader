@@ -7,6 +7,7 @@ import uuid
 import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import (
     Application, ApplicationBuilder, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters,
@@ -18,9 +19,10 @@ from settings import access_control as ac
 from settings.user_settings import get_settings, update_setting, reset_settings
 from ui import messages, admin_menu
 from ui.quick_menu import (
-    video_menu, extended_video_menu, simple_menu, fallback_menu, spotify_menu,
-    audio_only_menu, queued_menu, redo_menu,
+    extended_video_menu, simple_menu, fallback_menu, spotify_menu,
+    queued_menu, redo_menu, quality_menu,
 )
+from ui.section_menu import editor_text, editor_menu, prompt_text, prompt_menu
 from ui.settings_menu import (
     main_menu, advanced_menu, confirm_reset_menu, back_to_main, ADVANCED_TEXT_FIELDS,
     bars_menu, bars_title,
@@ -30,6 +32,9 @@ from ui.history_menu import (
 )
 from ui.start_menu import start_menu
 from downloader.probe import probe, ProbeResult
+from downloader.sections import (
+    SectionDraft, SectionError, parse_timestamp, format_timestamp, validate_sections,
+)
 from downloader import gallerydl_probe
 from downloader.cookies import inspect_cookie_file
 from downloader.site_map import tool_order_for
@@ -56,6 +61,13 @@ pending_probes: dict[str, ProbeResult] = {}             # rid -> probe result, f
 pending_admin_input: dict[int, str] = {}                # user_id -> which admin panel field they're typing
 pending_setting_input: dict[int, str] = {}              # user_id -> which advanced-settings field they're typing
 last_download: dict[str, tuple[int, str, dict]] = {}    # rid -> (user_id, url, settings)
+pending_sections: dict[str, SectionDraft] = {}          # rid -> the clip-sections editor's state
+# user_id -> where a typed timestamp should go: {rid, field, chat_id, message_id, is_photo, at}.
+# Keyed by user (a person can only type one thing at a time) and time-limited,
+# unlike pending_admin_input, so a forgotten prompt can't swallow a message
+# minutes later.
+pending_section_input: dict[int, dict] = {}
+SECTION_INPUT_TTL_SECONDS = 10 * 60
 
 # None of the rid-keyed dicts above ever had anything removing an entry
 # once its message was long gone (deleted, or from a chat the person left)
@@ -88,8 +100,12 @@ async def _sweep_stale_link_state_loop() -> None:
             pending_links.pop(rid, None)
             pending_probes.pop(rid, None)
             last_download.pop(rid, None)
+            pending_sections.pop(rid, None)
             cancelled_pre_job_rids.discard(rid)
             _rid_last_touch.pop(rid, None)
+        now = time.time()
+        for uid in [u for u, st in pending_section_input.items() if now - st["at"] > SECTION_INPUT_TTL_SECONDS]:
+            pending_section_input.pop(uid, None)
         if stale:
             log.info("Pruned %d stale link state entries", len(stale))
 
@@ -380,6 +396,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if data.startswith("nav|"):
         screen = data.split("|", 1)[1]
         pending_setting_input.pop(user_id, None)
+        pending_section_input.pop(user_id, None)
 
         if screen == "cookies":
             await query.edit_message_text(COOKIES_HELP, parse_mode=ParseMode.HTML, reply_markup=back_to_main())
@@ -638,6 +655,169 @@ async def history_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                                        link_preview_options=_NO_PREVIEW)
 
 
+# ---------- clip sections editor ----------
+
+async def _show_screen(bot, chat_id: int, message_id: int, is_photo: bool, text: str, markup) -> None:
+    """Replace the quality-picker message's text and buttons. That message is a
+    photo with a caption when the link had a thumbnail, plain text otherwise.
+    Telegram rejects an edit that changes nothing ("message is not modified" -
+    e.g. tapping the already-selected format); that's harmless, so swallow it."""
+    try:
+        if is_photo:
+            await bot.edit_message_caption(chat_id=chat_id, message_id=message_id, caption=text,
+                                            parse_mode=ParseMode.HTML, reply_markup=markup)
+        else:
+            await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id,
+                                         parse_mode=ParseMode.HTML, reply_markup=markup)
+    except BadRequest as exc:
+        if "not modified" not in str(exc).lower():
+            raise
+
+
+def _section_context(rid: str, user_id: int):
+    """(url, probe, draft) for this link's sections editor, or None if the link
+    expired (restart / the 2-hour sweep) or isn't this person's. The draft is
+    created on first use."""
+    entry = pending_links.get(rid)
+    probe_result = pending_probes.get(rid)
+    if not entry or entry[0] != user_id or not probe_result or not probe_result.duration:
+        return None
+    _touch_rid(rid)
+    draft = pending_sections.get(rid)
+    if draft is None:
+        draft = pending_sections[rid] = SectionDraft(fmt="video" if probe_result.heights else "mp3")
+    return entry[1], probe_result, draft
+
+
+async def sections_callback(context: ContextTypes.DEFAULT_TYPE, query, user_id: int, parts: list[str],
+                            rid: str, is_photo: bool) -> None:
+    """Every dl|sec|... button. Errors are shown as a warning line inside the
+    editor rather than a popup: the query was already answered once, and
+    Telegram only honours the first answer."""
+    sub = parts[2] if len(parts) > 3 else ""
+    chat_id, message_id = query.message.chat_id, query.message.message_id
+    pending_section_input.pop(user_id, None)   # any button abandons a half-typed time (start/end re-arm it)
+
+    async def show(text: str, markup) -> None:
+        await _show_screen(context.bot, chat_id, message_id, is_photo, text, markup)
+
+    ctx = _section_context(rid, user_id)
+    if ctx is None:
+        await show("This link expired — send it again.", None)
+        return
+    url, probe_result, draft = ctx
+    duration = probe_result.duration
+    has_video = bool(probe_result.heights)
+
+    async def editor(notice: str = "") -> None:
+        await show(editor_text(draft, duration, probe_result.title, notice), editor_menu(draft, rid, has_video))
+
+    if sub in ("open", "edit"):
+        await editor()
+
+    elif sub in ("start", "end"):
+        pending_setting_input.pop(user_id, None)   # one free-text capture at a time
+        pending_section_input[user_id] = {
+            "rid": rid, "field": sub, "chat_id": chat_id, "message_id": message_id,
+            "is_photo": is_photo, "at": time.time(),
+        }
+        await show(prompt_text(sub, duration), prompt_menu(sub, rid))
+
+    elif sub == "clear" and len(parts) > 4 and parts[3] in ("start", "end"):
+        setattr(draft, parts[3], None)
+        await editor()
+
+    elif sub == "save":
+        try:
+            draft.save(duration)
+        except SectionError as exc:
+            await editor(str(exc))
+        else:
+            await editor()
+
+    elif sub == "del" and len(parts) > 4 and parts[3].isdigit():
+        draft.remove(int(parts[3]) - 1)
+        await editor()
+
+    elif sub == "merge" and len(parts) > 4:
+        draft.merge = parts[3] == "on"
+        await editor()
+
+    elif sub == "fmt" and len(parts) > 4 and parts[3] in ("video", "mp3", "opus"):
+        if parts[3] != "video" or has_video:
+            draft.fmt = parts[3]
+        await editor()
+
+    elif sub == "back":
+        title = esc(probe_result.title) if probe_result.title else messages.PICK_OPTION
+        await show(title, quality_menu(probe_result, rid))
+
+    elif sub == "go":
+        if draft.has_unsaved():
+            await editor("You have an unsaved section. Tap “Save section” first, or set Start/End to empty.")
+            return
+        try:
+            sections = validate_sections(draft.sections, duration)
+        except SectionError as exc:
+            await editor(str(exc))
+            return
+
+        preview_title = _preview_title(rid)   # read BEFORE the probe state is dropped below
+        pending_links.pop(rid, None)
+        pending_probes.pop(rid, None)
+        pending_sections.pop(rid, None)
+
+        job_settings = dict(get_settings(user_id))
+        if draft.fmt == "video":
+            job_settings["mode"] = "video"
+            job_settings["quality"] = "best"
+        else:
+            job_settings["mode"] = "audio"
+            job_settings["audio_format"] = draft.fmt
+        job_settings["sections"] = sections
+        job_settings["sections_merge"] = bool(draft.merge and len(sections) > 1)
+
+        last_download[rid] = (user_id, url, job_settings)   # Try again / Send as file reuse the sections
+        _touch_rid(rid)
+        await show(messages.QUEUED, queued_menu(rid, url))
+        await job_manager.enqueue(rid, user_id, chat_id, url, job_settings, message_id,
+                                  is_photo=is_photo, title=preview_title)
+
+
+async def handle_section_text_input(update: Update, user_id: int, text: str) -> None:
+    """The person typed a timestamp after tapping Start / End."""
+    state = pending_section_input[user_id]
+    rid, field = state["rid"], state["field"]
+    await _delete_quietly(update.message)   # keep the chat tidy: the editor message is the UI
+
+    async def show(text_: str, markup) -> None:
+        await _show_screen(update.get_bot(), state["chat_id"], state["message_id"], state["is_photo"],
+                           text_, markup)
+
+    ctx = _section_context(rid, user_id)
+    if ctx is None:
+        pending_section_input.pop(user_id, None)
+        await show("This link expired — send it again.", None)
+        return
+    _, probe_result, draft = ctx
+    duration = probe_result.duration
+
+    try:
+        seconds = parse_timestamp(text)
+        if seconds > duration:
+            raise SectionError(f"{format_timestamp(seconds)} is past the end of the video "
+                               f"(it's {format_timestamp(duration)} long).")
+    except SectionError as exc:
+        # Keep waiting on the same prompt, with the reason - a typo shouldn't
+        # send the person back to the start.
+        await show(prompt_text(field, duration, str(exc)), prompt_menu(field, rid))
+        return
+
+    pending_section_input.pop(user_id, None)
+    setattr(draft, field, seconds)
+    await show(editor_text(draft, duration, probe_result.title), editor_menu(draft, rid, bool(probe_result.heights)))
+
+
 # ---------- link handling ----------
 
 def _preview_title(rid: str) -> str:
@@ -718,6 +898,14 @@ async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await handle_setting_text_input(update, user_id, raw_text)
         return
 
+    section_state = pending_section_input.get(user_id)
+    if section_state:
+        if time.time() - section_state["at"] > SECTION_INPUT_TTL_SECONDS or URL_RE.search(raw_text):
+            pending_section_input.pop(user_id, None)   # stale, or they pasted a new link: move on
+        else:
+            await handle_section_text_input(update, user_id, raw_text)
+            return
+
     match = URL_RE.search(raw_text)
     if not match:
         return
@@ -758,14 +946,8 @@ async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         pending_probes[rid] = probe_result
         _touch_rid(rid)
         caption = messages.with_link(esc(probe_result.title) if probe_result.title else messages.PICK_OPTION, url)
-        if probe_result.heights:
-            markup = video_menu(probe_result, rid)
-        elif probe_result.has_audio:
-            # Audio-only source (SoundCloud, etc.) - no video to pick a
-            # quality for, so don't offer a "video" button at all.
-            markup = audio_only_menu(rid)
-        else:
-            markup = simple_menu(rid)
+        # Audio-only sources (SoundCloud, etc.) get audio formats only - see quality_menu.
+        markup = quality_menu(probe_result, rid)
         if probe_result.thumbnail:
             try:
                 await context.bot.send_photo(
@@ -843,6 +1025,11 @@ async def link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         else:
             await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
 
+    if action == "sec":
+        await sections_callback(context, query, user_id, parts, rid, is_photo)
+        return
+    pending_section_input.pop(user_id, None)   # any other button abandons a half-typed time
+
     if action == "dismiss":
         await _delete_quietly(query.message)
         return
@@ -866,7 +1053,7 @@ async def link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             return
         url = entry[1]
         probe_result = pending_probes.get(rid)
-        markup = video_menu(probe_result, rid) if probe_result else fallback_menu(rid)
+        markup = quality_menu(probe_result, rid) if probe_result else fallback_menu(rid)
         title = esc(probe_result.title) if probe_result and probe_result.title else messages.PICK_OPTION
         await set_text(messages.with_link(title, url), markup=markup)
         return
@@ -879,7 +1066,7 @@ async def link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     if action == "backq":
         probe_result = pending_probes.get(rid)
-        markup = video_menu(probe_result, rid) if probe_result else fallback_menu(rid)
+        markup = quality_menu(probe_result, rid) if probe_result else fallback_menu(rid)
         await query.edit_message_reply_markup(reply_markup=markup)
         return
 
@@ -939,6 +1126,7 @@ async def link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     if action in ("video", "audio", "simple") and len(parts) == 4:
+        preview_title = _preview_title(rid)   # must be read BEFORE the probe state is dropped
         entry = pending_links.pop(rid, None)
         pending_probes.pop(rid, None)
         if not entry or entry[0] != user_id:
@@ -971,7 +1159,7 @@ async def link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await set_text(messages.with_link(messages.QUEUED, url), markup=queued_menu(rid, url))
         await job_manager.enqueue(
             rid, user_id, query.message.chat_id, url, job_settings, query.message.message_id, is_photo=is_photo,
-            title=_preview_title(rid),
+            title=preview_title,
         )
 
 

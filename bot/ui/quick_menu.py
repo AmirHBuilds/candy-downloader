@@ -21,6 +21,25 @@ def cancel_row(rid: str) -> list[InlineKeyboardButton]:
     return [InlineKeyboardButton("✕ Cancel", callback_data=f"dl|cancel|{rid}")]
 
 
+def _clip_row(probe: ProbeResult | None, rid: str) -> list[list[InlineKeyboardButton]]:
+    """The "download only part of it" entry point. Offered only when the
+    probe knows the length (never for playlists / live streams) - the editor
+    validates timestamps against it."""
+    if probe is None or not probe.duration:
+        return []
+    return [[InlineKeyboardButton("✂ Add section", callback_data=f"dl|sec|open|{rid}")]]
+
+
+def quality_menu(probe: ProbeResult, rid: str) -> InlineKeyboardMarkup:
+    """The right first screen for a probed link: video picker, or - for an
+    audio-only source - just the audio formats, or a single Download button."""
+    if probe.heights:
+        return video_menu(probe, rid)
+    if probe.has_audio:
+        return audio_only_menu(rid, probe)
+    return simple_menu(rid)
+
+
 def video_menu(probe: ProbeResult, rid: str) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton("★ Best available", callback_data=f"dl|video|best|{rid}")]]
 
@@ -58,15 +77,17 @@ def extended_video_menu(probe: ProbeResult, rid: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton(f"{h}p", callback_data=f"dl|video|{h}p|{rid}") for h in picks[i:i + 3]
         ])
     rows.append([InlineKeyboardButton("↓ Smallest size", callback_data=f"dl|video|worst|{rid}")])
+    rows.extend(_clip_row(probe, rid))
     rows.append([InlineKeyboardButton("← Back", callback_data=f"dl|backq|{rid}")])
     rows.append(cancel_row(rid))
     return InlineKeyboardMarkup(rows)
 
 
-def audio_only_menu(rid: str) -> InlineKeyboardMarkup:
+def audio_only_menu(rid: str, probe: ProbeResult | None = None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("♪ MP3", callback_data=f"dl|audio|mp3|{rid}"),
          InlineKeyboardButton("♪ Opus", callback_data=f"dl|audio|opus|{rid}")],
+        *_clip_row(probe, rid),
         cancel_row(rid),
     ])
 
@@ -108,9 +129,9 @@ def link_row(url: str) -> list[InlineKeyboardButton]:
     return [InlineKeyboardButton("🔗 Video link", copy_text=CopyTextButton(text=url))]
 
 
-def send_as_file_menu(rid: str, url: str) -> InlineKeyboardMarkup:
+def send_as_file_menu(rid: str, url: str, label: str = "▤ Send as file instead") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("▤ Send as file instead", callback_data=f"dl|asfile|{rid}")],
+        [InlineKeyboardButton(label, callback_data=f"dl|asfile|{rid}")],
         link_row(url),
     ])
 

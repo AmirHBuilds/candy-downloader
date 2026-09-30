@@ -1,0 +1,2 @@
+class ParseMode:
+    HTML = "HTML"

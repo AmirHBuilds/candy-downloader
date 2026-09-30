@@ -15,6 +15,7 @@ end user. It is PLAIN TEXT and can echo what the person typed, so callers
 that put it in a parse_mode=HTML message must escape it (utils.text.esc).
 """
 import re
+from dataclasses import dataclass, field
 
 MAX_SECTIONS = 10
 MIN_SECTION_SECONDS = 1
@@ -151,3 +152,35 @@ def validate_sections(sections, duration: float | None = None) -> list[tuple[flo
     if len(result) > MAX_SECTIONS:
         raise SectionError(f"You can add up to {MAX_SECTIONS} sections per download.")
     return result
+
+
+@dataclass
+class SectionDraft:
+    """Everything the person has entered in the sections editor for ONE link
+    (keyed by rid in main.py). start/end are the half-typed NEXT section;
+    `sections` are the saved ones; `fmt` is what to produce:
+    "video" | "mp3" | "opus"."""
+    fmt: str = "video"
+    merge: bool = False
+    start: float | None = None
+    end: float | None = None
+    sections: list[tuple[float, float]] = field(default_factory=list)
+
+    def has_unsaved(self) -> bool:
+        return self.start is not None or self.end is not None
+
+    def save(self, duration: float | None) -> tuple[float, float]:
+        """Validate the draft and append it. On error nothing changes, so the
+        person can fix just the field that was wrong."""
+        check_can_add(len(self.sections))
+        section = make_section(self.start, self.end, duration)
+        if section in self.sections:
+            raise SectionError("That section is already in the list.")
+        self.sections.append(section)
+        self.start = self.end = None
+        return section
+
+    def remove(self, index: int) -> None:
+        """index is 0-based; out-of-range is ignored (a stale button)."""
+        if 0 <= index < len(self.sections):
+            del self.sections[index]

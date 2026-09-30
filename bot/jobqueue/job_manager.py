@@ -20,6 +20,7 @@ lines behind.
 """
 import asyncio
 import logging
+import re
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -100,7 +101,9 @@ class JobManager:
         self._max_concurrent = max_concurrent
         self._workers: list[asyncio.Task] = []
         self._jobs_by_rid: dict[str, Job] = {}
-        self._recent_files: dict[str, dict] = {}
+        # rid -> every file of that job, in delivery order (a playlist or a
+        # multi-clip job has several; "Send as file instead" re-sends all of them)
+        self._recent_files: dict[str, list[dict]] = {}
 
     def start(self) -> None:
         for i in range(self._max_concurrent):
@@ -185,9 +188,10 @@ class JobManager:
         """What /history shows in the quality column: the audio format for
         an audio job (there's no "quality" concept there, just a codec), or
         the picked video quality otherwise."""
-        if settings.get("mode") == "audio":
-            return settings.get("audio_format", "audio")
-        return settings.get("quality", "best")
+        base = settings.get("audio_format", "audio") if settings.get("mode") == "audio" \
+            else settings.get("quality", "best")
+        sections = settings.get("sections")
+        return f"{base} ✂{len(sections)}" if sections else base
 
     def _log_history(self, job: Job, status: str) -> None:
         ac.log_download(job.user_id, job.url, status, job.settings.get("mode", ""),
@@ -202,6 +206,11 @@ class JobManager:
         kind = job.info.get("type")
         if kind:
             parts.append(f"{self._TYPE_ICONS.get(kind, '')} {kind}".strip())
+        sections = job.settings.get("sections")
+        if sections:
+            n = len(sections)
+            merged = " merged" if job.settings.get("sections_merge") and n > 1 else ""
+            parts.append(f"✂ {n} clip{'s' if n != 1 else ''}{merged}")
         size = job.info.get("size")
         if size:
             mb = size / 1_000_000
@@ -243,11 +252,15 @@ class JobManager:
             job.steps[-1] = text
         await self._safe_edit(job, self._render(job), markup=markup)
 
-    async def _cache_video_file(self, rid: str, url: str, src: Path) -> None:
-        old = self._recent_files.pop(rid, None)
-        if old:
-            old["path"].unlink(missing_ok=True)
+    def _drop_cached(self, rid: str) -> None:
+        """Forget (and delete) everything cached for this job."""
+        for entry in self._recent_files.pop(rid, []):
+            entry["path"].unlink(missing_ok=True)
 
+    async def _cache_video_file(self, rid: str, url: str, src: Path) -> None:
+        """Add one delivered file to this job's cache. Callers clear the job's
+        old entries first (_drop_cached) - a per-call reset here would keep
+        only the last file of a playlist / multi-clip job."""
         cached_path = new_cache_path(src.suffix)
         loop = asyncio.get_running_loop()
         try:
@@ -256,47 +269,60 @@ class JobManager:
             log.warning("Could not cache %s -> %s for reuse: %s", src, cached_path, exc)
             return
 
-        self._recent_files[rid] = {"path": cached_path, "url": url, "title": src.stem[:100]}
+        self._recent_files.setdefault(rid, []).append(
+            {"path": cached_path, "url": url, "title": src.stem[:100], "name": src.name})
         log.info("Cached %s for rid %s (url=%s)", cached_path, rid, url)
         asyncio.create_task(self._expire_cached_file(rid, cached_path))
 
     async def _expire_cached_file(self, rid: str, path: Path) -> None:
         await asyncio.sleep(RECENT_FILE_TTL_SECONDS)
-        entry = self._recent_files.get(rid)
-        if entry and entry["path"] == path:
+        entries = self._recent_files.get(rid, [])
+        remaining = [e for e in entries if e["path"] != path]
+        if remaining:
+            self._recent_files[rid] = remaining
+        else:
             self._recent_files.pop(rid, None)
         path.unlink(missing_ok=True)
 
     def has_cached_video(self, rid: str, url: str) -> bool:
-        entry = self._recent_files.get(rid)
-        hit = bool(entry and entry["url"] == url and entry["path"].exists())
-        if not entry:
+        entries = self._recent_files.get(rid)
+        hit = bool(entries) and all(e["url"] == url and e["path"].exists() for e in entries)
+        if not entries:
             log.info("No cache entry at all for rid %s (wanted url=%r)", rid, url)
         elif not hit:
-            log.info("Cache miss for rid %s: have url=%r, wanted url=%r, exists=%s",
-                      rid, entry.get("url"), url, entry["path"].exists())
+            log.info("Cache miss for rid %s: wanted url=%r, have %s", rid, url,
+                      [(e.get("url"), e["path"].exists()) for e in entries])
         return hit
 
     async def send_cached_as_document(self, rid: str, chat_id: int, url: str,
                                        status_message_id: int) -> bool:
-        entry = self._recent_files.get(rid)
-        if not entry or entry["url"] != url or not entry["path"].exists():
+        """Re-send every cached file of this job as a plain document. Returns
+        False (so the caller re-downloads) only if NOTHING could be sent; once
+        at least one file went out, a failure stops here rather than falling
+        back to a re-download that would deliver the earlier ones twice."""
+        if not self.has_cached_video(rid, url):
             return False
 
-        path = entry["path"]
-        title = entry.get("title") or path.stem
-        caption = messages.all_done_caption(title) + "\n\nSent as a file — not re-compressed by Telegram."
-        try:
-            with open(path, "rb") as fh:
-                input_file = InputFile(fh, filename=f"{title}{path.suffix}")
-                await self.bot.send_document(chat_id, input_file, caption=caption, parse_mode=ParseMode.HTML,
-                                              reply_markup=sent_menu(url),
-                                              read_timeout=180, write_timeout=180, connect_timeout=60)
-        except (OSError, TelegramError) as exc:
-            log.warning("Cached send failed for rid %s, falling back to re-download: %s", rid, exc)
-            return False
-
-        log.info("Sent cached document for rid %s (%s)", rid, path)
+        entries = list(self._recent_files[rid])
+        sent_any = False
+        for index, entry in enumerate(entries):
+            path = entry["path"]
+            title = entry.get("title") or path.stem
+            caption = messages.all_done_caption(title) + "\n\nSent as a file — not re-compressed by Telegram."
+            is_last = index == len(entries) - 1
+            try:
+                with open(path, "rb") as fh:
+                    input_file = InputFile(fh, filename=entry.get("name") or f"{title}{path.suffix}")
+                    await self.bot.send_document(chat_id, input_file, caption=caption, parse_mode=ParseMode.HTML,
+                                                  reply_markup=sent_menu(url) if is_last else None,
+                                                  read_timeout=180, write_timeout=180, connect_timeout=60)
+            except (OSError, TelegramError) as exc:
+                log.warning("Cached send failed for rid %s (file %d of %d): %s", rid, index + 1, len(entries), exc)
+                if not sent_any:
+                    return False
+                break
+            sent_any = True
+            log.info("Sent cached document for rid %s (%s)", rid, path)
 
         try:
             await self.bot.delete_message(chat_id, status_message_id)
@@ -451,8 +477,12 @@ class JobManager:
                 or (files[0] if files else None)
             if named is not None and named.stem:
                 job.title = named.stem
+                if job.settings.get("sections"):
+                    # "Title [01-30-00–01-32-00]" -> "Title": the range isn't a title
+                    job.title = re.sub(r"\s*\[[^\]]*\]$", "", job.title) or job.title
 
             if job.settings.get("mode") in ("video", "audio"):
+                self._drop_cached(job.rid)
                 for f in files:
                     if f.suffix.lower() not in _NON_MEDIA_EXTS:
                         await self._cache_video_file(job.rid, job.url, f)
@@ -462,7 +492,12 @@ class JobManager:
             await self._send_files(job, files)
 
     async def _send_files(self, job: Job, files: list[Path]) -> None:
-        for f in files:
+        # With several videos/audios (multi-clip job, playlist) the "send as
+        # file" button goes on the LAST one only, labelled "all": it re-sends
+        # the whole batch, so repeating it under every clip would be misleading.
+        multi = len(files) > 1
+        for index, f in enumerate(files):
+            is_last = index == len(files) - 1
             suffix = f.suffix.lower()
             size_mb = f.stat().st_size / 1_000_000
             log.info("Sending rid=%s file=%s suffix=%s force_document=%s",
@@ -475,28 +510,37 @@ class JobManager:
                     input_file = InputFile(fh, filename=f.name)
                     await self.bot.send_document(
                         job.chat_id, input_file, caption=caption, parse_mode=ParseMode.HTML,
-                        reply_markup=sent_menu(job.url),
+                        reply_markup=sent_menu(job.url) if (is_last or not multi) else None,
                         read_timeout=180, write_timeout=180, connect_timeout=60,
                     )
                 continue
 
             caption = messages.all_done_caption(f.stem[:100])
+            if multi:
+                send_menu = send_as_file_menu(job.rid, job.url, "▤ Send all as files") if is_last else None
+                video_note = "\n\nWant the original files instead of these compressed previews?"
+                audio_note = "\n\nWant them sent as plain files instead?"
+            else:
+                send_menu = send_as_file_menu(job.rid, job.url)
+                video_note = "\n\nWant the original file instead of this compressed preview?"
+                audio_note = "\n\nWant it sent as a plain file instead?"
+            if multi and not is_last:
+                video_note = audio_note = ""
+
             if suffix in _STREAMABLE_VIDEO_EXTS:
                 await self._emit(job, f"Sending {size_mb:.1f} MB...", markup=None)
-                video_caption = caption + "\n\nWant the original file instead of this compressed preview?"
                 with open(f, "rb") as fh:
                     input_file = InputFile(fh, filename=f.name)
                     await self.bot.send_video(
-                        job.chat_id, input_file, caption=video_caption, parse_mode=ParseMode.HTML,
-                        supports_streaming=True, reply_markup=send_as_file_menu(job.rid, job.url),
+                        job.chat_id, input_file, caption=caption + video_note, parse_mode=ParseMode.HTML,
+                        supports_streaming=True, reply_markup=send_menu,
                         read_timeout=120, write_timeout=120, connect_timeout=60,
                     )
             elif suffix in {".mp3", ".m4a", ".opus", ".flac", ".wav"}:
-                audio_caption = caption + "\n\nWant it sent as a plain file instead?"
                 with open(f, "rb") as fh:
                     input_file = InputFile(fh, filename=f.name)
-                    await self.bot.send_audio(job.chat_id, input_file, caption=audio_caption,
-                                               parse_mode=ParseMode.HTML, reply_markup=send_as_file_menu(job.rid, job.url),
+                    await self.bot.send_audio(job.chat_id, input_file, caption=caption + audio_note,
+                                               parse_mode=ParseMode.HTML, reply_markup=send_menu,
                                                read_timeout=120, write_timeout=120, connect_timeout=60)
             elif suffix in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
                 with open(f, "rb") as fh:
