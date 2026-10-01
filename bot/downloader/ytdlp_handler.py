@@ -351,7 +351,9 @@ async def download(url: str, workspace: Path, settings: dict, user_id: int,
 # ---------------------------------------------------------------------------
 
 _NON_MEDIA_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".part", ".ytdl"}
-_ELAPSED_TICK_SECONDS = 4
+_WATCH_INTERVAL = 1.0          # seconds between looks at a running clip download
+_ELAPSED_EVERY_TICKS = 4       # elapsed-time line cadence while no real progress is available
+_NO_PROGRESS_WARN_TICKS = 25   # then log once why the bar never appeared
 
 
 def _raise_if_cancelled(cancel_event: asyncio.Event | None) -> None:
@@ -412,25 +414,126 @@ def _fmt_elapsed(seconds: float) -> str:
     return f"{seconds // 60}:{seconds % 60:02d}"
 
 
-async def _watch_clip(workspace: Path, cancel_event: asyncio.Event | None,
-                      progress_cb: ProgressCB, text: str, started: float) -> None:
-    """Runs alongside a clip download: (1) enforces cancellation by killing
-    ffmpeg, (2) keeps the status line alive with elapsed time, since yt-dlp
-    reports nothing while ffmpeg works and the message would look frozen.
+class _FfmpegProgress:
+    """Follows ffmpeg's own `-progress <file>` output for one clip.
 
+    yt-dlp reports nothing while ffmpeg transfers a range (spike: a single
+    "finished" event at the very end), but ffmpeg itself can log how far it
+    is: blocks of key=value lines, each closed by progress=continue|end, with
+    out_time_us = how much OUTPUT it has produced so far. For a clip that is
+    directly "seconds done of clip length".
+
+    yt-dlp runs one ffmpeg per format (video, then audio), each reopening the
+    same file from scratch, so output time going backwards (or continuing
+    after an "end") means the next stream has started."""
+
+    def __init__(self, path: Path, clip_seconds: float):
+        self.path = path
+        self.total_us = max(clip_seconds, 1.0) * 1_000_000
+        self.stream = 0
+        self._last_us = -1
+        self._ended = False
+
+    def poll(self) -> tuple[int, float] | None:
+        """(stream index, percent), or None while there's nothing usable yet."""
+        try:
+            with open(self.path, "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                fh.seek(max(0, fh.tell() - 4096))
+                text = fh.read().decode("utf-8", "ignore")
+        except OSError:
+            return None
+        # Only COMPLETE blocks count: we may read while ffmpeg is mid-write.
+        complete = list(re.finditer(r"^progress=\w*\n", text, re.M))
+        if not complete:
+            return None
+
+        values: dict[str, str] = {}
+        newest: dict[str, str] | None = None
+        status = ""
+        for line in text[:complete[-1].end()].splitlines():
+            key, _, value = line.partition("=")
+            if key.strip() == "progress":
+                newest, status, values = values, value.strip(), {}
+            else:
+                values[key.strip()] = value.strip()
+        if newest is None:
+            return None
+
+        raw = newest.get("out_time_us") or newest.get("out_time_ms")   # (_ms is really microseconds too)
+        try:
+            out_us = int(raw)
+        except (TypeError, ValueError):
+            out_us = None
+        ended = status == "end"
+        if out_us is None or out_us < 0:
+            if not ended:
+                return None                  # "N/A" before the first frame
+            out_us = int(self.total_us)
+
+        if out_us < self._last_us - 1_000_000 or (self._ended and not ended):
+            self.stream += 1
+        self._last_us, self._ended = out_us, ended
+        return self.stream, 100.0 if ended else min(99.0, out_us / self.total_us * 100)
+
+
+def _ffmpeg_flags_under(workspace: Path) -> list[str]:
+    """Cut/progress flags of this job's running ffmpegs (never the signed input
+    URLs) - logged when the progress bar doesn't show up, so the cause is visible."""
+    wanted = {"-ss", "-t", "-to", "-progress", "-c", "-c:v", "-c:a"}
+    needle = (str(workspace).rstrip("/") + "/").encode()
+    found = []
+    for cmdline in Path("/proc").glob("[0-9]*/cmdline"):
+        try:
+            argv = cmdline.read_bytes().split(b"\0")
+            if not argv or b"ffmpeg" not in os.path.basename(argv[0]) or needle not in b" ".join(argv):
+                continue
+        except OSError:
+            continue
+        args = [a.decode("utf-8", "replace") for a in argv]
+        found.append(" ".join(f"{a} {args[i + 1]}" for i, a in enumerate(args[:-1]) if a in wanted) or "(no flags)")
+    return found
+
+
+async def _watch_clip(workspace: Path, cancel_event: asyncio.Event | None, progress_cb: ProgressCB,
+                      text: str, started: float, progress: _FfmpegProgress | None = None,
+                      labels: tuple[str, ...] = ("Video", "Audio")) -> None:
+    """Runs alongside a clip download: (1) enforces cancellation by killing
+    ffmpeg, (2) reports progress - a real bar from ffmpeg's -progress output
+    when it is available, otherwise elapsed time (yt-dlp itself reports
+    nothing, so without this the message would look frozen).
+
+    Elapsed time also covers the quiet start (extraction, PO token) before
+    ffmpeg produces anything; it stops the moment real progress arrives.
     The elapsed text travels in progress_cb's `speed` slot with everything
     else None - job_manager renders that as a plain overwriting line."""
     ticks = 0
+    have_bar = False
+    warned = False
     while True:
-        await asyncio.sleep(1)
+        await asyncio.sleep(_WATCH_INTERVAL)
         if cancel_event is not None and cancel_event.is_set():
             # Repeatedly: yt-dlp may start another ffmpeg (thumbnail, remux)
             # before it notices the first one died.
             _kill_ffmpeg_under(workspace)
             continue
         ticks += 1
-        if ticks % _ELAPSED_TICK_SECONDS == 0:
+
+        reading = progress.poll() if progress is not None else None
+        if reading is not None:
+            if not have_bar:
+                have_bar = True
+                log.info("Clip progress is coming from ffmpeg -progress (%s)", text)
+            stream, percent = reading
+            progress_cb(percent, None, None, None, labels[min(stream, len(labels) - 1)])
+            continue
+
+        if not have_bar and ticks % _ELAPSED_EVERY_TICKS == 0:
             progress_cb(None, f"{text} · {_fmt_elapsed(time.monotonic() - started)}", None)
+        if not have_bar and not warned and ticks >= _NO_PROGRESS_WARN_TICKS:
+            warned = True
+            log.info("No ffmpeg progress data after %s ticks; showing elapsed time instead. "
+                     "Running ffmpeg flags: %s", ticks, _ffmpeg_flags_under(workspace) or "none running")
 
 
 async def _run_ffmpeg(args: list[str], cancel_event: asyncio.Event | None) -> tuple[int, str]:
@@ -519,6 +622,8 @@ async def _download_sections(url: str, workspace: Path, settings: dict, user_id:
         raise RuntimeError(str(exc)) from exc
     total = len(sections)
     merge = bool(settings.get("sections_merge")) and total > 1
+    # Stream order yt-dlp downloads in: video first, then audio (audio jobs: just audio).
+    labels = ("Audio",) if settings.get("mode") == "audio" else ("Video", "Audio")
 
     def _check_cancelled_hook(_d: dict) -> None:
         # Only fires around the download (never mid-transfer, see above), but
@@ -542,14 +647,26 @@ async def _download_sections(url: str, workspace: Path, settings: dict, user_id:
         # of snapping to the nearest keyframe, which can be seconds off.
         base_opts["download_ranges"] = download_range_func(None, [(start, end)])
         base_opts["force_keyframes_at_cuts"] = True
+        # Ask ffmpeg to log its own progress to a file (see _FfmpegProgress).
+        # "ffmpeg_i" = yt-dlp's per-input ffmpeg args; -progress is a global
+        # option, so it is valid in that position. If this key were ever not
+        # honoured the watcher just falls back to elapsed time (and logs why).
+        progress_file = workspace / f"ffmpeg_progress_{index}.txt"
+        ff_args = dict(base_opts.get("external_downloader_args") or {})
+        ff_args["ffmpeg_i"] = [*ff_args.get("ffmpeg_i", []), "-progress", str(progress_file)]
+        base_opts["external_downloader_args"] = ff_args
         using_cookies = "cookiefile" in base_opts
 
         def run(opts: dict) -> None:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.download([url])
 
-        async def attempt(opts: dict, _dir: Path = clip_dir, _text: str = text) -> None:
-            watcher = asyncio.create_task(_watch_clip(workspace, cancel_event, progress_cb, _text, time.monotonic()))
+        async def attempt(opts: dict, _text: str = text, _file: Path = progress_file,
+                          _length: float = end - start) -> None:
+            _file.unlink(missing_ok=True)       # a retry must not read the failed run's numbers
+            watcher = asyncio.create_task(_watch_clip(
+                workspace, cancel_event, progress_cb, _text, time.monotonic(),
+                _FfmpegProgress(_file, _length), labels))
             try:
                 await asyncio.wait_for(loop.run_in_executor(None, run, opts), timeout=DOWNLOAD_TIMEOUT_SECONDS)
             except asyncio.TimeoutError:
@@ -604,6 +721,7 @@ async def _download_sections(url: str, workspace: Path, settings: dict, user_id:
         for f in produced:
             clips.append(_tidy_clip_name(Path(shutil.move(str(f), str(_unique_destination(workspace, f.name))))))
         shutil.rmtree(clip_dir, ignore_errors=True)
+        progress_file.unlink(missing_ok=True)
 
     if merge:
         progress_cb(None, None, None, "Merging clips")

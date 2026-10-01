@@ -32,6 +32,7 @@ from telegram.constants import ParseMode
 from telegram.error import TelegramError
 
 from config import OWNER_EMOJI
+from ui.steplog import step_line
 from downloader.dispatcher import download as dispatch_download, NoToolSucceeded
 from downloader.errors import JobCancelled
 from settings import access_control as ac
@@ -47,7 +48,7 @@ MIN_EDIT_INTERVAL_SEC = 1.5
 MIN_PERCENT_DELTA = 3.0
 HEARTBEAT_INTERVAL_SEC = 2.5
 RECENT_FILE_TTL_SECONDS = 5 * 60
-MAX_STEP_LINES = 4   # room for: tool line + Video line + Audio line + a postprocessing stage
+MAX_STEP_LINES = 5   # room for: tool line + clip line + Video line + Audio line + a postprocessing stage
 
 # Extensions that are never the actual media - sidecar/thumbnail files
 # that can end up in the workspace alongside the real output. Everything
@@ -170,17 +171,18 @@ class JobManager:
         if job.settings.get("adhd_mode"):
             return self._render_adhd(job)
         lines = [f"{OWNER_EMOJI} <b>{job.header}</b>"]
+        log_lines, notices = [], []
+        for step in job.steps[-MAX_STEP_LINES:]:
+            # A step containing '<' is ready-made HTML (the failure message,
+            # with its <code> block); ordinary steps are escaped and never do.
+            # Telegram can't nest formatting inside <pre>, so those go below it.
+            (notices if "<" in step else log_lines).append(step)
+        if log_lines:
+            lines.append("<pre>" + "\n".join(step_line(s) for s in log_lines) + "</pre>")
+        lines.extend(notices)
         info_line = self._info_line(job)
         if info_line:
             lines.append(info_line)
-        if job.steps:
-            recent = job.steps[-MAX_STEP_LINES:]
-            rendered = []
-            for i, s in enumerate(recent):
-                is_current = i == len(recent) - 1
-                text = f"<b>{s}</b>" if (is_current and "<" not in s) else s
-                rendered.append(f"• {text}")
-            lines.append("\n".join(rendered))
         return "\n\n".join(lines)
 
     @staticmethod
@@ -191,7 +193,7 @@ class JobManager:
         base = settings.get("audio_format", "audio") if settings.get("mode") == "audio" \
             else settings.get("quality", "best")
         sections = settings.get("sections")
-        return f"{base} ✂{len(sections)}" if sections else base
+        return f"{base} ✄{len(sections)}" if sections else base
 
     def _log_history(self, job: Job, status: str) -> None:
         ac.log_download(job.user_id, job.url, status, job.settings.get("mode", ""),
@@ -210,7 +212,7 @@ class JobManager:
         if sections:
             n = len(sections)
             merged = " merged" if job.settings.get("sections_merge") and n > 1 else ""
-            parts.append(f"✂ {n} clip{'s' if n != 1 else ''}{merged}")
+            parts.append(f"✂️ {n} clip{'s' if n != 1 else ''}{merged}")   # emoji form, like 🎬 / 🔗 on this line
         size = job.info.get("size")
         if size:
             mb = size / 1_000_000
@@ -423,6 +425,11 @@ class JobManager:
             new_stream = label is not None and label != current_label
             if label is not None:
                 current_label = label
+            if stage is not None:
+                # A new stage line starts a fresh run of streams (next clip,
+                # a retry): its first bar must get its own line instead of
+                # overwriting the stage line just because the label repeats.
+                current_label = None
             done = percent is not None and round(percent) >= 100
             push = (stage is not None or new_stream) and not adhd
 

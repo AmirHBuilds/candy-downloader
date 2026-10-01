@@ -27,7 +27,7 @@ def _clip_row(probe: ProbeResult | None, rid: str) -> list[list[InlineKeyboardBu
     validates timestamps against it."""
     if probe is None or not probe.duration:
         return []
-    return [[InlineKeyboardButton("✂ Add section", callback_data=f"dl|sec|open|{rid}")]]
+    return [[InlineKeyboardButton("✄ Add section", callback_data=f"dl|sec|open|{rid}")]]
 
 
 def quality_menu(probe: ProbeResult, rid: str) -> InlineKeyboardMarkup:
@@ -79,7 +79,6 @@ def extended_video_menu(probe: ProbeResult, rid: str) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton("↓ Smallest size", callback_data=f"dl|video|worst|{rid}")])
     rows.extend(_clip_row(probe, rid))
     rows.append([InlineKeyboardButton("← Back", callback_data=f"dl|backq|{rid}")])
-    rows.append(cancel_row(rid))
     return InlineKeyboardMarkup(rows)
 
 

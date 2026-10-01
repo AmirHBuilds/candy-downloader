@@ -148,3 +148,130 @@ class DispatcherClipTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProgressBarTests(ClipTests.__bases__[0]):
+    """The bar for clip downloads: ffmpeg's own -progress output, with elapsed time as the fallback."""
+
+    def setUp(self):
+        self.workspace = Path(tempfile.mkdtemp(prefix="cliptest-"))
+        self.addCleanup(shutil.rmtree, self.workspace, ignore_errors=True)
+        self.calls: list[tuple] = []
+        self.settings = dict(DEFAULTS, mode="video", quality="best", sections=[(0.0, 4.0)])
+        for name, value in (("_WATCH_INTERVAL", 0.05), ("_ELAPSED_EVERY_TICKS", 2)):
+            self.addCleanup(setattr, ytdlp_handler, name, getattr(ytdlp_handler, name))
+            setattr(ytdlp_handler, name, value)
+
+    def cb(self, *args):
+        self.calls.append(args)
+
+    async def run_clip(self, script, progress):
+        yt_dlp.reset(script)
+        yt_dlp.PROGRESS["enabled"] = progress
+        return await ytdlp_handler.download("https://youtu.be/x", self.workspace, self.settings, 1, self.cb)
+
+    def bar_calls(self):
+        return [(c[0], c[4]) for c in self.calls if c[0] is not None]      # (percent, label)
+
+    async def test_asks_ffmpeg_for_a_progress_file(self):
+        await self.run_clip([], progress=False)
+        args = yt_dlp.CALLS[0]["external_downloader_args"]["ffmpeg_i"]
+        self.assertEqual(args[0], "-progress")
+        self.assertTrue(args[1].startswith(str(self.workspace) + "/"))     # inside the job's workspace
+        self.assertFalse(list(self.workspace.glob("ffmpeg_progress_*")))   # cleaned up afterwards
+
+    async def test_real_bar_for_video_then_audio_and_no_elapsed_text_once_it_runs(self):
+        await self.run_clip(["ok"], progress=True)
+        bars = self.bar_calls()
+        self.assertTrue(bars, "no progress was reported")
+        video = [p for p, label in bars if label == "Video"]
+        audio = [p for p, label in bars if label == "Audio"]
+        self.assertTrue(video and audio)
+        self.assertEqual(video[-1], 100.0)
+        self.assertEqual(audio[-1], 100.0)
+        self.assertTrue(all(0 <= p <= 100 for p, _ in bars))
+        self.assertEqual(video, sorted(video))                              # monotonic within a stream
+        first_bar = next(i for i, c in enumerate(self.calls) if c[0] is not None)
+        later_text = [c for c in self.calls[first_bar:] if c[0] is None and c[1] and "elapsed" not in str(c[1])
+                      and c[3] is None]
+        self.assertEqual(later_text, [], "elapsed-time lines kept overwriting the bar")
+        # Video finishes before Audio starts
+        labels_in_order = [label for _, label in bars]
+        self.assertEqual(labels_in_order, sorted(labels_in_order, key=lambda l: l != "Video"))
+
+    async def test_audio_jobs_label_their_one_stream_audio(self):
+        self.settings.update(mode="audio", audio_format="mp3")
+        yt_dlp.reset(["ok"])
+        yt_dlp.PROGRESS.update(enabled=True, streams=1)
+        await ytdlp_handler.download("https://youtu.be/x", self.workspace, self.settings, 1, self.cb)
+        self.assertEqual({label for _, label in self.bar_calls()}, {"Audio"})
+
+    async def test_falls_back_to_elapsed_time_when_ffmpeg_reports_nothing(self):
+        await self.run_clip(["slow"], progress=False)
+        self.assertEqual(self.bar_calls(), [])
+        elapsed = [c[1] for c in self.calls if c[0] is None and c[1] and " · " in str(c[1])]
+        self.assertTrue(elapsed and elapsed[0].startswith("Clip · 0:00 – 0:04 · "), elapsed)
+
+
+class FfmpegProgressParsing(unittest.TestCase):
+    def block(self, us, status):
+        value = "N/A" if us is None else str(us)
+        return f"frame=1\nout_time_us={value}\nout_time_ms={value}\nprogress={status}\n"
+
+    def make(self, text, seconds=10):
+        path = Path(tempfile.mkdtemp(prefix="ffprog-")) / "p.txt"
+        path.write_text(text)
+        self.addCleanup(shutil.rmtree, path.parent, ignore_errors=True)
+        return ytdlp_handler._FfmpegProgress(path, seconds), path
+
+    def test_no_file_no_data_and_not_yet_started(self):
+        tracker, path = self.make("")
+        self.assertIsNone(tracker.poll())
+        path.write_text(self.block(None, "continue"))                  # "N/A" before the first frame
+        self.assertIsNone(tracker.poll())
+        tracker.path = path.parent / "missing.txt"
+        self.assertIsNone(tracker.poll())
+
+    def test_percent_from_output_time_and_capped_below_100_until_ended(self):
+        tracker, path = self.make(self.block(2_500_000, "continue"))
+        self.assertEqual(tracker.poll(), (0, 25.0))
+        path.write_text(self.block(10_000_000, "continue"))
+        self.assertEqual(tracker.poll(), (0, 99.0))                     # ffmpeg says done only via progress=end
+        path.write_text(self.block(10_000_000, "end"))
+        self.assertEqual(tracker.poll(), (0, 100.0))
+
+    def test_partially_written_block_is_ignored(self):
+        tracker, path = self.make(self.block(1_000_000, "continue") + "frame=2\nout_time_us=3000000\nprogress=con")
+        self.assertEqual(tracker.poll(), (0, 10.0))                     # the unfinished block isn't used
+
+    def test_next_stream_detected_by_time_going_backwards_or_restart_after_end(self):
+        tracker, path = self.make(self.block(10_000_000, "end"))
+        self.assertEqual(tracker.poll(), (0, 100.0))
+        path.write_text(self.block(1_000_000, "continue"))              # file restarted: audio stream
+        self.assertEqual(tracker.poll(), (1, 10.0))
+        path.write_text(self.block(5_000_000, "continue"))
+        self.assertEqual(tracker.poll(), (1, 50.0))
+
+    def test_old_ms_key_and_end_without_a_time(self):
+        tracker, path = self.make("out_time_ms=5000000\nprogress=continue\n")
+        self.assertEqual(tracker.poll(), (0, 50.0))
+        tracker, path = self.make("out_time_us=N/A\nprogress=end\n")
+        self.assertEqual(tracker.poll(), (0, 100.0))
+
+    def test_only_the_tail_of_a_long_log_is_read(self):
+        many = "".join(self.block(i * 100_000, "continue") for i in range(1, 400))
+        tracker, path = self.make(many, seconds=100)
+        stream, percent = tracker.poll()
+        self.assertEqual(stream, 0)
+        self.assertAlmostEqual(percent, 39.9, places=1)
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "needs ffmpeg")
+    def test_parses_what_the_real_ffmpeg_writes(self):
+        workdir = Path(tempfile.mkdtemp(prefix="ffreal-"))
+        self.addCleanup(shutil.rmtree, workdir, ignore_errors=True)
+        progress = workdir / "p.txt"
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-progress", str(progress), "-f", "lavfi", "-i",
+                        "testsrc=d=3:s=160x120:r=25", "-f", "lavfi", "-i", "sine=d=3", "-shortest",
+                        "-pix_fmt", "yuv420p", str(workdir / "o.mp4")], check=True)
+        tracker = ytdlp_handler._FfmpegProgress(progress, 3)
+        self.assertEqual(tracker.poll(), (0, 100.0))

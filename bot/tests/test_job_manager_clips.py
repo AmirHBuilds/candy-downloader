@@ -2,6 +2,7 @@
 JobManager with several files: the cache keeps all of them, "send as file"
 re-sends all of them, and the buttons make sense on a multi-clip delivery.
 """
+import asyncio
 import contextlib
 import shutil
 import tempfile
@@ -174,15 +175,15 @@ class MultiFileTests(unittest.IsolatedAsyncioTestCase):
     def test_info_line_and_history_describe_clips(self):
         job = self.make_job(mode="video", quality="best", sections=[(0, 5), (9, 12)], sections_merge=True)
         job.info = {"type": "Video", "site": "Youtube"}
-        self.assertIn("✂ 2 clips merged", self.manager._info_line(job))
+        self.assertIn("✂️ 2 clips merged", self.manager._info_line(job))
         job.settings["sections_merge"] = False
-        self.assertIn("✂ 2 clips", self.manager._info_line(job))
+        self.assertIn("✂️ 2 clips", self.manager._info_line(job))
         self.assertNotIn("merged", self.manager._info_line(job))
         job.settings["sections"] = [(0, 5)]
-        self.assertIn("✂ 1 clip", self.manager._info_line(job))
-        self.assertEqual(self.manager._history_quality(job.settings), "best ✂1")
+        self.assertIn("✂️ 1 clip", self.manager._info_line(job))
+        self.assertEqual(self.manager._history_quality(job.settings), "best ✄1")
         audio = {"mode": "audio", "audio_format": "mp3", "sections": [(0, 5), (9, 12), (20, 30)]}
-        self.assertEqual(self.manager._history_quality(audio), "mp3 ✂3")
+        self.assertEqual(self.manager._history_quality(audio), "mp3 ✄3")
         self.assertEqual(self.manager._history_quality({"mode": "video", "quality": "720p"}), "720p")
 
     async def test_run_job_caches_all_clips_and_names_history_without_the_range(self):
@@ -210,6 +211,87 @@ class MultiFileTests(unittest.IsolatedAsyncioTestCase):
         # A second run of the same job (Try again) replaces the cache instead of piling up
         await self.manager._run_job(job)
         self.assertEqual(len(self.manager._recent_files[RID]), 2)
+
+
+class StatusMessageTests(unittest.IsolatedAsyncioTestCase):
+    """The live status message: a code block of symbol-prefixed steps, info line underneath."""
+
+    def setUp(self):
+        self.manager = jm.JobManager(FakeBot(), max_concurrent=1)
+
+    def job(self, steps, **settings):
+        job = jm.Job(rid=RID, user_id=1, chat_id=7, url=URL, settings=settings, status_message_id=55,
+                     is_photo=False, header="Downloading")
+        job.steps = list(steps)
+        job.info = {"type": "Video", "site": "Youtube"}
+        return job
+
+    def test_layout_header_then_code_block_then_info_line(self):
+        text = self.manager._render(self.job(["Starting…", "Trying yt-dlp...", "Clip · 1:20:10 – 1:20:20 · 0:04"],
+                                             sections=[(0, 10)]))
+        blocks = text.split("\n\n")
+        self.assertIn("Downloading", blocks[0])
+        self.assertEqual(blocks[1], "<pre>[★] Starting…\n[⌲] Trying yt-dlp...\n[ⴵ] Clip · 1:20:10 – 1:20:20 · 0:04</pre>")
+        self.assertEqual(blocks[2], "↳ 🎬 Video | ✂️ 1 clip | 🔗 Youtube")
+        self.assertEqual(len(blocks), 3)
+
+    def test_shows_the_last_five_steps(self):
+        steps = [f"Step {i}" for i in range(1, 9)]
+        text = self.manager._render(self.job(steps))
+        for gone in ("Step 1", "Step 2", "Step 3"):
+            self.assertNotIn(gone, text)
+        for kept in ("Step 4", "Step 8"):
+            self.assertIn(kept, text)
+        self.assertEqual(jm.MAX_STEP_LINES, 5)
+
+    def test_failure_message_html_sits_below_the_code_block_not_inside_it(self):
+        text = self.manager._render(self.job(["Trying yt-dlp...", "yt-dlp failed: boom",
+                                              "✕ Didn't work:\n<code>boom</code>"]))
+        pre = text[text.index("<pre>"):text.index("</pre>") + 6]
+        self.assertNotIn("<code>", pre)
+        self.assertIn("[⌲] Trying yt-dlp...", pre)
+        self.assertIn("[✕] yt-dlp failed: boom", pre)
+        self.assertLess(text.index("</pre>"), text.index("<code>boom</code>"))
+
+    def test_no_empty_block_before_anything_happened(self):
+        self.assertNotIn("<pre>", self.manager._render(self.job([])))
+
+    def test_adhd_mode_is_untouched(self):
+        text = self.manager._render(self.job(["Trying yt-dlp...", "Video - 40%"], adhd_mode=True))
+        self.assertNotIn("<pre>", text)
+        self.assertNotIn("[", text)
+
+    async def test_a_new_stage_lets_the_next_clips_bar_get_its_own_line(self):
+        """Regression guard. Audio clips reuse the label "Audio" for every clip, so clip 2's first
+        bar used to OVERWRITE the "Clip 2 of 2" stage line instead of following it."""
+        job = self.job([], mode="audio", sections=[(0, 5), (9, 12)])
+
+        async def settle():
+            for _ in range(5):
+                await asyncio.sleep(0)
+
+        async def fake_download(url, workspace, settings, user_id, progress_cb, cancel_event=None):
+            for clip in (1, 2):
+                progress_cb("ytdlp", None, None, None, f"Clip {clip} of 2 · 0:00 – 0:05", None, None)
+                await settle()
+                progress_cb("ytdlp", 40.0, None, None, None, "Audio", None)
+                await settle()
+                progress_cb("ytdlp", 100.0, None, None, None, "Audio", None)
+                await settle()
+            return []
+
+        original = (jm.dispatch_download, jm.job_workspace)
+        jm.dispatch_download = fake_download
+        jm.job_workspace = lambda: contextlib.nullcontext(Path(tempfile.mkdtemp()))
+        self.addCleanup(lambda: setattr(jm, "dispatch_download", original[0]))
+        self.addCleanup(lambda: setattr(jm, "job_workspace", original[1]))
+        try:
+            await self.manager._run_job(job)
+        except Exception:
+            pass          # no files come back; only the steps recorded on the way matter
+        mine = [s for s in job.steps if s.startswith(("Clip", "Audio"))]
+        self.assertEqual(mine, ["Clip 1 of 2 · 0:00 – 0:05", "Audio - 100%",
+                                "Clip 2 of 2 · 0:00 – 0:05", "Audio - 100%"])
 
 
 if __name__ == "__main__":

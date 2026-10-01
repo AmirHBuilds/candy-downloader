@@ -15,7 +15,6 @@ every other dl| button, and the longest one here is well under 64 bytes.
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from downloader.sections import SectionDraft, format_section, format_timestamp, section_length
-from ui.quick_menu import cancel_row
 from utils.text import esc
 
 _FMT_LABELS = {"video": "Video", "mp3": "MP3", "opus": "Opus"}
@@ -30,7 +29,7 @@ def _value(seconds: float | None) -> str:
 
 
 def editor_text(draft: SectionDraft, duration: int, title: str = "", notice: str = "") -> str:
-    lines = ["✂ <b>Clip sections</b>"]
+    lines = ["✄ <b>Clip sections</b>"]
     if title:
         shown = " ".join(title.split())
         lines.append(f"<i>{esc(shown[:60] + ('…' if len(shown) > 60 else ''))}</i>")
@@ -51,7 +50,6 @@ def editor_text(draft: SectionDraft, duration: int, title: str = "", notice: str
         "",
         "<b>New section</b>",
         f"Start: {_value(draft.start)}   End: {_value(draft.end)}",
-        "<i>Empty Start = from the beginning. Empty End = to the end.</i>",
     ]
     return "\n".join(lines)
 
@@ -81,7 +79,6 @@ def editor_menu(draft: SectionDraft, rid: str, has_video: bool) -> InlineKeyboar
     rows.append([_btn(f"↓ Download {count} clip{'s' if count != 1 else ''}" if count else "↓ Download",
                       f"dl|sec|go|{rid}")])
     rows.append([_btn("← Back", f"dl|sec|back|{rid}")])
-    rows.append(cancel_row(rid))
     return InlineKeyboardMarkup(rows)
 
 

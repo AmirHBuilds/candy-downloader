@@ -143,6 +143,33 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         audio_only = ProbeResult(ok=True, heights=[], has_audio=True, duration=100)
         self.assertIn(f"dl|sec|open|{RID}", [d for _, d in buttons(quick_menu.quality_menu(audio_only, RID))])
 
+    def test_more_options_and_the_editor_have_no_cancel_button_only_back(self):
+        probe = ProbeResult(ok=True, heights=[1080, 720], has_audio=True, duration=100)
+        more = [d for _, d in buttons(quick_menu.extended_video_menu(probe, RID))]
+        self.assertFalse([d for d in more if d.startswith("dl|cancel")])
+        self.assertIn(f"dl|backq|{RID}", more)
+
+        from ui.section_menu import editor_menu
+        editor = [d for _, d in buttons(editor_menu(SectionDraft(), RID, True))]
+        self.assertFalse([d for d in editor if d.startswith("dl|cancel")])
+        self.assertIn(f"dl|sec|back|{RID}", editor)
+        # ...while the first screen still has it, so the job can be cancelled from there
+        first = [d for _, d in buttons(quick_menu.video_menu(probe, RID))]
+        self.assertIn(f"dl|cancel|{RID}", first)
+
+    def test_add_section_uses_a_text_symbol_not_an_emoji(self):
+        probe = ProbeResult(ok=True, heights=[720], has_audio=True, duration=100)
+        label = next(t for t, d in buttons(quick_menu.extended_video_menu(probe, RID)) if "sec|open" in d)
+        self.assertEqual(label, "✄ Add section")
+        self.assertNotIn("✂", label)           # U+2702 is drawn as a coloured emoji by Telegram
+
+    async def test_editor_text_has_no_explanatory_hint_and_no_emoji_scissors(self):
+        edit = await self.tap(f"dl|sec|open|{RID}")
+        self.assertNotIn("Empty Start", edit["text"])
+        self.assertNotIn("from the beginning", edit["text"])
+        self.assertNotIn("✂", edit["text"])
+        self.assertTrue(edit["text"].startswith("✄"))
+
     def test_every_callback_fits_telegrams_64_byte_limit(self):
         draft = SectionDraft(sections=[(i * 100.0, i * 100.0 + 50) for i in range(10)])
         from ui.section_menu import editor_menu, prompt_menu
