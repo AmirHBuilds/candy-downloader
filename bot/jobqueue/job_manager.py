@@ -93,6 +93,14 @@ class Job:
     task: Optional[asyncio.Task] = field(default=None)
     cancelled: bool = False
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
+    # Set once the job has reached its final state (done / failed / cancelled).
+    # Progress that is still in flight after that is dropped, so a stale
+    # "One moment…" can't overwrite the final message.
+    terminal: bool = False
+    # Status-message edit pump (see _safe_edit): the newest text waiting to be
+    # sent, and whether a sender is already running.
+    pending_edit: Optional[tuple] = field(default=None, repr=False)
+    editing: bool = field(default=False, repr=False)
 
 
 class JobManager:
@@ -221,8 +229,17 @@ class JobManager:
             parts.append(f"🔗 {esc(job.info['site'])}")
         return ("↳ " + " | ".join(parts)) if parts else ""
 
+    async def _emit_progress(self, job: Job, text: str, push: bool, markup: InlineKeyboardMarkup | None) -> None:
+        """A progress update. Checked when it RUNS, not when it was scheduled:
+        these are fire-and-forget tasks, and one can start after the job has
+        already finished."""
+        if not job.terminal:
+            await self._emit(job, text, push=push, markup=markup)
+
     async def _refresh(self, job: Job) -> None:
         """Re-render without touching the steps - used when only the info line changed."""
+        if job.terminal:
+            return
         await self._safe_edit(job, self._render(job), markup=queued_menu(job.rid, job.url))
 
     _ADHD_HEADERS = {
@@ -360,10 +377,12 @@ class JobManager:
                 await self._run_job(job)
                 self._log_history(job, "success")
             except (asyncio.CancelledError, JobCancelled):
+                job.terminal = True
                 self._log_history(job, "cancelled")
                 job.header = "Cancelled"
                 await self._emit(job, "Cancelled", markup=cancelled_menu(job.rid, job.url))
             except NoToolSucceeded as exc:
+                job.terminal = True
                 self._log_history(job, "failed")
                 log.exception("Job %s failed", job.rid)
                 job.header = "Failed"
@@ -375,12 +394,14 @@ class JobManager:
                     await self._emit(job, messages.generic_error(cleaned), markup=retry_menu(job.rid, job.url),
                                       sanitize=False)
             except Exception as exc:  # noqa: BLE001
+                job.terminal = True
                 self._log_history(job, "failed")
                 log.exception("Job %s failed", job.rid)
                 job.header = "Failed"
                 cleaned = _sanitize_step(str(exc), job.url)
                 await self._emit(job, messages.generic_error(cleaned), markup=retry_menu(job.rid, job.url), sanitize=False)
             finally:
+                job.terminal = True
                 self._jobs_by_rid.pop(job.rid, None)
                 self._queue.task_done()
 
@@ -411,6 +432,9 @@ class JobManager:
             # plain file links) shouldn't be announced as "Video".
             if tool_name in ("gallerydl", "generic") and job.info and job.info.get("type") != "File":
                 job.info["type"] = "File"
+
+            if job.terminal:
+                return
 
             if size is not None:
                 job.info["size"] = size
@@ -472,7 +496,7 @@ class JobManager:
                 if stage and not adhd:
                     line = f"{stage} · {line}"
 
-            asyncio.create_task(self._emit(job, line, push=push, markup=queued_menu(job.rid, job.url)))
+            asyncio.create_task(self._emit_progress(job, line, push, queued_menu(job.rid, job.url)))
 
         with job_workspace() as workspace:
             files = await dispatch_download(job.url, workspace, job.settings, job.user_id, progress_cb,
@@ -566,6 +590,28 @@ class JobManager:
             pass
 
     async def _safe_edit(self, job: Job, text: str, markup: InlineKeyboardMarkup | None = None) -> None:
+        """Edit the job's status message - strictly in order, newest wins.
+
+        Every update used to be sent as its own concurrent request. On a slow
+        link they finish out of order, so an older "42%" could land after a
+        newer "80%" (the bar jumping backwards) or after the final "Didn't
+        work" (replacing it with a stale progress line). Now there is at most
+        one request in flight per job: new text replaces whatever is still
+        waiting, and the sender loops until nothing newer is left, so the
+        LAST thing rendered is always the last thing shown."""
+        job.pending_edit = (text, markup)
+        if job.editing:
+            return                      # the running sender will pick this up
+        job.editing = True
+        try:
+            while job.pending_edit is not None:
+                text, markup = job.pending_edit
+                job.pending_edit = None
+                await self._send_edit(job, text, markup)
+        finally:
+            job.editing = False
+
+    async def _send_edit(self, job: Job, text: str, markup: InlineKeyboardMarkup | None) -> None:
         try:
             if job.is_photo:
                 await self.bot.edit_message_caption(

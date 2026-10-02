@@ -39,6 +39,8 @@ def preview_failed_note(error: str) -> str:
             "You can still try downloading, but it may fail too. "
             "/cookies fixes this properly."
         )
+    if "timed out" in low:
+        return "The preview took too long to load (slow connection?), but you can still try downloading it."
     return "Couldn't load a preview for this link, but you can still try downloading it."
 
 

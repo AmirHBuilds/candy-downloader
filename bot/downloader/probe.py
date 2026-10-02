@@ -16,6 +16,12 @@ from settings.user_settings import get_settings
 
 log = logging.getLogger("candy.probe")
 
+# Seconds to wait for the preview before falling back to the plain menu. Real
+# downloads get 20 minutes; the old 15/25 s was too tight for a slow
+# connection, and the cookie path is slower still (JS challenge solving).
+PROBE_TIMEOUT = 30
+PROBE_TIMEOUT_WITH_COOKIES = 60
+
 
 @dataclass
 class ProbeResult:
@@ -60,9 +66,16 @@ async def probe(url: str, user_id: int | None = None) -> ProbeResult:
 
     try:
         loop = asyncio.get_running_loop()
-        info = await asyncio.wait_for(loop.run_in_executor(None, run), timeout=25 if cookie_path else 15)
+        info = await asyncio.wait_for(loop.run_in_executor(None, run),
+                                      timeout=PROBE_TIMEOUT_WITH_COOKIES if cookie_path else PROBE_TIMEOUT)
+    except asyncio.TimeoutError:
+        # A timeout has an EMPTY message, which used to log as "Probe failed for <url>:" with
+        # nothing after it. Cookies make YouTube run the JS challenge solver first, which is
+        # slow on a slow connection.
+        log.info("Probe timed out for %s after %ss", url, PROBE_TIMEOUT_WITH_COOKIES if cookie_path else PROBE_TIMEOUT)
+        return ProbeResult(ok=False, error="timed out")
     except Exception as exc:  # noqa: BLE001
-        log.info("Probe failed for %s: %s", url, exc)
+        log.info("Probe failed for %s: %s: %s", url, type(exc).__name__, exc)
         return ProbeResult(ok=False, error=str(exc).strip().splitlines()[0][:200] if str(exc).strip() else "")
 
     if not info:

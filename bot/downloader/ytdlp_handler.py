@@ -25,16 +25,31 @@ ProgressCB = Callable[[float, str | None, str | None, str | None], None]
 # otherwise freeze the UI forever with no error - bound it instead.
 DOWNLOAD_TIMEOUT_SECONDS = 20 * 60
 
+# yt-dlp reports each postprocessor by its short key ("Metadata", "MoveFiles",
+# "ExtractAudio"), not its class name - the table used to hold class names
+# ("FFmpegMetadata"), so those steps showed up as raw "Metadata"/"MoveFiles".
+# Both spellings are kept in case a yt-dlp version reports the long one.
 _POSTPROCESSOR_LABELS = {
     "Merger": "Merging video & audio",
+    "VideoConvertor": "Converting video",
     "FFmpegVideoConvertor": "Converting video",
+    "ExtractAudio": "Extracting audio",
     "FFmpegExtractAudio": "Extracting audio",
     "EmbedThumbnail": "Embedding thumbnail",
+    "Metadata": "Adding metadata",
     "FFmpegMetadata": "Adding metadata",
+    "MoveFiles": "Moving file",
+    "EmbedSubtitle": "Embedding subtitles",
     "FFmpegEmbedSubtitle": "Embedding subtitles",
     "SponsorBlock": "Checking for sponsor segments",
     "ModifyChapters": "Removing sponsor segments",
 }
+
+
+def _postprocessor_label(name: str) -> str:
+    if name.startswith(("Fixup", "FFmpegFixup")):
+        return "Fixing up file"
+    return _POSTPROCESSOR_LABELS.get(name, name or "Finishing up...")
 
 
 def _stream_label(info: dict, settings: dict) -> str:
@@ -234,29 +249,62 @@ async def download(url: str, workspace: Path, settings: dict, user_id: int,
 
     # progress_cb positional args: (percent, speed, eta, stage, label, size)
     # - positional because loop.call_soon_threadsafe can't pass kwargs.
+    adhd = bool(settings.get("adhd_mode"))
+    stream_peak: dict[str, float] = {}     # highest % shown per stream: a bar never moves backwards
+    stream_bytes: dict[str, int] = {}      # ADHD: bytes fetched so far per stream
+    overall_peak = 0.0
+    streams_finished = 0
+
+    def _expected(info: dict) -> tuple[int | None, int]:
+        """(total bytes across every stream of this download, how many streams),
+        when the site announced the sizes up front - YouTube does."""
+        formats = info.get("requested_formats") or [info]
+        sizes = [f.get("filesize") or f.get("filesize_approx") for f in formats]
+        return (sum(sizes) if all(sizes) else None), len(formats)
+
     def hook(d: dict) -> None:
+        nonlocal overall_peak, streams_finished
         _check_cancelled()
         status = d.get("status")
         if status not in ("downloading", "finished"):
             return
         info = d.get("info_dict") or {}
         label = _stream_label(info, settings)
+        key = str(info.get("format_id") or d.get("filename") or label)
+        # ADHD Mode shows one bar and no stream labels, so two 0-100% runs
+        # (video, then audio) looked like "finished, then downloading again".
+        # Count both streams toward ONE overall bar instead, when sizes are known.
+        expected, stream_count = _expected(info) if adhd else (None, 0)
 
         if status == "finished":
             # Fires once PER STREAM (video, then audio). Marks that
             # stream's line complete; the next stream's first tick starts
             # a new line (job_manager notices the label change), so the
             # finished line stays behind as "Video - 100%".
-            loop.call_soon_threadsafe(progress_cb, 100.0, None, None, None, label)
+            streams_finished += 1
+            if expected:
+                stream_bytes[key] = max(stream_bytes.get(key, 0), d.get("total_bytes") or d.get("downloaded_bytes") or 0)
+                overall = 100.0 if streams_finished >= stream_count else min(99.0, sum(stream_bytes.values()) / expected * 100)
+                overall_peak = max(overall_peak, overall)
+                loop.call_soon_threadsafe(progress_cb, overall_peak, None, None, None, label)
+            else:
+                loop.call_soon_threadsafe(progress_cb, 100.0, None, None, None, label)
             return
 
         total = d.get("total_bytes") or d.get("total_bytes_estimate")
         downloaded = d.get("downloaded_bytes", 0)
         percent = (downloaded / total * 100) if total else 0.0
+        # Size estimates change as a download goes on and some ticks carry no
+        # total at all (-> 0%): never let the bar step backwards because of it.
+        percent = max(percent, stream_peak.get(key, 0.0))
+        stream_peak[key] = percent
+        if expected:
+            stream_bytes[key] = downloaded
+            overall_peak = max(overall_peak, min(99.0, sum(stream_bytes.values()) / expected * 100))
+            percent = overall_peak
         speed = _fmt_speed(d.get("speed"))
         eta = d.get("_eta_str", "").strip() or None
 
-        key = str(info.get("format_id") or d.get("filename") or label)
         if total and key not in stream_sizes:
             stream_sizes[key] = total
             # overall size = every stream seen so far (video, then + audio)
@@ -267,8 +315,7 @@ async def download(url: str, workspace: Path, settings: dict, user_id: int,
         _check_cancelled()
         if d.get("status") == "started":
             name = d.get("postprocessor", "")
-            label = _POSTPROCESSOR_LABELS.get(name, name or "Finishing up...")
-            loop.call_soon_threadsafe(progress_cb, 100.0, None, None, label)
+            loop.call_soon_threadsafe(progress_cb, 100.0, None, None, _postprocessor_label(name))
 
     base_opts = _build_opts(url, workspace, settings, user_id, hook, pp_hook)
     using_cookies = "cookiefile" in base_opts

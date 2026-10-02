@@ -32,11 +32,18 @@ TITLE = "A long title cut mid-sentence "     # trailing space, like %(title).60B
 # progress=continue|end.
 PROGRESS = {"enabled": False, "streams": 2, "pause": 0.2}
 
+# Progress-hook events a plain (non-clip) download should emit, in order.
+HOOK_EVENTS: list[dict] = []
+# What extract_info() returns / how long it takes (for the preview lookup).
+EXTRACT = {"result": {"title": "T", "formats": []}, "delay": 0.0}
+
 
 def reset(script: list[str]) -> None:
     SCRIPT[:] = script
     CALLS.clear()
+    HOOK_EVENTS.clear()
     PROGRESS.update(enabled=False, streams=2, pause=0.2)
+    EXTRACT.update(result={"title": "T", "formats": []}, delay=0.0)
 
 
 def _block(out_us, status):
@@ -71,6 +78,10 @@ class YoutubeDL:
     def __exit__(self, *exc):
         return False
 
+    def extract_info(self, url, download=False):
+        time.sleep(EXTRACT["delay"])
+        return EXTRACT["result"]
+
     def download(self, urls):
         index = len(CALLS)
         CALLS.append(self.opts)
@@ -89,6 +100,12 @@ class YoutubeDL:
             code = child.wait()
             raise Exception(f"ffmpeg exited with code {code}")
 
+        if "download_ranges" not in self.opts:                     # a normal, whole-video download
+            (target.parent / "video.mp4").write_bytes(b"x" * 100)
+            for event in HOOK_EVENTS:
+                for hook in self.opts.get("progress_hooks", []):
+                    hook(event)
+            return
         section = self.opts["download_ranges"]({}, self)[0]
         length = section["end_time"] - section["start_time"]
         if action == "slow":
