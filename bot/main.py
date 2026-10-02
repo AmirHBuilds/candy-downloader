@@ -22,7 +22,7 @@ from ui.quick_menu import (
     extended_video_menu, simple_menu, fallback_menu, spotify_menu,
     queued_menu, redo_menu, quality_menu,
 )
-from ui.section_menu import editor_text, editor_menu, prompt_text, prompt_menu
+from ui.section_menu import editor_text, editor_menu, prompt_text, prompt_menu, sections_summary
 from ui.settings_menu import (
     main_menu, advanced_menu, confirm_reset_menu, back_to_main, ADVANCED_TEXT_FIELDS,
     bars_menu, bars_title,
@@ -32,9 +32,7 @@ from ui.history_menu import (
 )
 from ui.start_menu import start_menu
 from downloader.probe import probe, ProbeResult
-from downloader.sections import (
-    SectionDraft, SectionError, parse_timestamp, format_timestamp, validate_sections,
-)
+from downloader.sections import SectionDraft, SectionError, parse_timestamp
 from downloader import gallerydl_probe
 from downloader.cookies import inspect_cookie_file
 from downloader.site_map import tool_order_for
@@ -685,8 +683,36 @@ def _section_context(rid: str, user_id: int):
     _touch_rid(rid)
     draft = pending_sections.get(rid)
     if draft is None:
-        draft = pending_sections[rid] = SectionDraft(fmt="video" if probe_result.heights else "mp3")
+        draft = pending_sections[rid] = SectionDraft()
     return entry[1], probe_result, draft
+
+
+def _active_sections(rid: str) -> tuple[list[tuple[float, float]], bool]:
+    """(sections the person has chosen for this link, merge them?). Empty when
+    none - the normal case, in which every download button behaves as before."""
+    draft = pending_sections.get(rid)
+    probe_result = pending_probes.get(rid)
+    if not draft or not probe_result or not probe_result.duration:
+        return [], False
+    try:
+        sections = draft.active(probe_result.duration)
+    except SectionError:
+        return [], False       # values are validated as they're typed, so this shouldn't happen
+    return sections, bool(draft.merge and len(sections) > 1)
+
+
+def _quality_caption(rid: str, probe_result: ProbeResult) -> str:
+    """The quality menu's caption: the title, plus the chosen sections so it is
+    obvious the buttons below download only those parts."""
+    caption = esc(probe_result.title) if probe_result.title else messages.PICK_OPTION
+    sections, merge = _active_sections(rid)
+    if sections:
+        caption += "\n\n" + sections_summary(sections, merge)
+    return caption
+
+
+def _main_menu_for(rid: str, probe_result: ProbeResult):
+    return quality_menu(probe_result, rid, len(_active_sections(rid)[0]))
 
 
 async def sections_callback(context: ContextTypes.DEFAULT_TYPE, query, user_id: int, parts: list[str],
@@ -705,89 +731,69 @@ async def sections_callback(context: ContextTypes.DEFAULT_TYPE, query, user_id: 
     if ctx is None:
         await show("This link expired — send it again.", None)
         return
-    url, probe_result, draft = ctx
+    _, probe_result, draft = ctx
     duration = probe_result.duration
-    has_video = bool(probe_result.heights)
 
     async def editor(notice: str = "") -> None:
-        await show(editor_text(draft, duration, probe_result.title, notice), editor_menu(draft, rid, has_video))
+        count = len(_active_sections(rid)[0])
+        await show(editor_text(draft, duration, probe_result.title, notice), editor_menu(draft, rid, count))
+
+    def number_at(position: int) -> int | None:
+        return int(parts[position]) if len(parts) > position + 1 and parts[position].isdigit() else None
 
     if sub in ("open", "edit"):
         await editor()
 
-    elif sub in ("start", "end"):
-        pending_setting_input.pop(user_id, None)   # one free-text capture at a time
-        pending_section_input[user_id] = {
-            "rid": rid, "field": sub, "chat_id": chat_id, "message_id": message_id,
-            "is_photo": is_photo, "at": time.time(),
-        }
-        await show(prompt_text(sub, duration), prompt_menu(sub, rid))
-
-    elif sub == "clear" and len(parts) > 4 and parts[3] in ("start", "end"):
-        setattr(draft, parts[3], None)
-        await editor()
-
-    elif sub == "save":
+    elif sub == "add":
         try:
-            draft.save(duration)
+            draft.add_row()
         except SectionError as exc:
             await editor(str(exc))
         else:
             await editor()
 
-    elif sub == "del" and len(parts) > 4 and parts[3].isdigit():
-        draft.remove(int(parts[3]) - 1)
-        await editor()
+    elif sub in ("start", "end"):
+        index = number_at(3)
+        if index is None or index >= len(draft.rows):
+            await editor("That section no longer exists.")
+            return
+        pending_setting_input.pop(user_id, None)   # one free-text capture at a time
+        pending_section_input[user_id] = {
+            "rid": rid, "field": sub, "index": index, "chat_id": chat_id, "message_id": message_id,
+            "is_photo": is_photo, "at": time.time(),
+        }
+        number = index + 1 if len(draft.rows) > 1 else None
+        await show(prompt_text(sub, duration, section_number=number), prompt_menu(sub, index, rid))
+
+    elif sub == "clear" and len(parts) > 5 and parts[3] in ("start", "end") and parts[4].isdigit():
+        try:
+            draft.clear_value(int(parts[4]), parts[3])
+        except SectionError as exc:
+            await editor(str(exc))
+        else:
+            await editor()
+
+    elif sub == "del" and number_at(3) is not None:
+        try:
+            draft.remove_row(number_at(3))
+        except SectionError as exc:
+            await editor(str(exc))
+        else:
+            await editor()
 
     elif sub == "merge" and len(parts) > 4:
         draft.merge = parts[3] == "on"
         await editor()
 
-    elif sub == "fmt" and len(parts) > 4 and parts[3] in ("video", "mp3", "opus"):
-        if parts[3] != "video" or has_video:
-            draft.fmt = parts[3]
-        await editor()
-
     elif sub == "back":
-        title = esc(probe_result.title) if probe_result.title else messages.PICK_OPTION
-        await show(title, quality_menu(probe_result, rid))
-
-    elif sub == "go":
-        if draft.has_unsaved():
-            await editor("You have an unsaved section. Tap “Save section” first, or set Start/End to empty.")
-            return
-        try:
-            sections = validate_sections(draft.sections, duration)
-        except SectionError as exc:
-            await editor(str(exc))
-            return
-
-        preview_title = _preview_title(rid)   # read BEFORE the probe state is dropped below
-        pending_links.pop(rid, None)
-        pending_probes.pop(rid, None)
-        pending_sections.pop(rid, None)
-
-        job_settings = dict(get_settings(user_id))
-        if draft.fmt == "video":
-            job_settings["mode"] = "video"
-            job_settings["quality"] = "best"
-        else:
-            job_settings["mode"] = "audio"
-            job_settings["audio_format"] = draft.fmt
-        job_settings["sections"] = sections
-        job_settings["sections_merge"] = bool(draft.merge and len(sections) > 1)
-
-        last_download[rid] = (user_id, url, job_settings)   # Try again / Send as file reuse the sections
-        _touch_rid(rid)
-        await show(messages.QUEUED, queued_menu(rid, url))
-        await job_manager.enqueue(rid, user_id, chat_id, url, job_settings, message_id,
-                                  is_photo=is_photo, title=preview_title)
+        # Back to the quality menu - its buttons now download these sections.
+        await show(_quality_caption(rid, probe_result), _main_menu_for(rid, probe_result))
 
 
 async def handle_section_text_input(update: Update, user_id: int, text: str) -> None:
-    """The person typed a timestamp after tapping Start / End."""
+    """The person typed a timestamp after tapping a Start / End button."""
     state = pending_section_input[user_id]
-    rid, field = state["rid"], state["field"]
+    rid, field, index = state["rid"], state["field"], state["index"]
     await _delete_quietly(update.message)   # keep the chat tidy: the editor message is the UI
 
     async def show(text_: str, markup) -> None:
@@ -803,19 +809,17 @@ async def handle_section_text_input(update: Update, user_id: int, text: str) -> 
     duration = probe_result.duration
 
     try:
-        seconds = parse_timestamp(text)
-        if seconds > duration:
-            raise SectionError(f"{format_timestamp(seconds)} is past the end of the video "
-                               f"(it's {format_timestamp(duration)} long).")
+        draft.set_value(index, field, parse_timestamp(text), duration)
     except SectionError as exc:
         # Keep waiting on the same prompt, with the reason - a typo shouldn't
         # send the person back to the start.
-        await show(prompt_text(field, duration, str(exc)), prompt_menu(field, rid))
+        number = index + 1 if len(draft.rows) > 1 else None
+        await show(prompt_text(field, duration, str(exc), number), prompt_menu(field, index, rid))
         return
 
     pending_section_input.pop(user_id, None)
-    setattr(draft, field, seconds)
-    await show(editor_text(draft, duration, probe_result.title), editor_menu(draft, rid, bool(probe_result.heights)))
+    count = len(_active_sections(rid)[0])
+    await show(editor_text(draft, duration, probe_result.title), editor_menu(draft, rid, count))
 
 
 # ---------- link handling ----------
@@ -1053,21 +1057,26 @@ async def link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             return
         url = entry[1]
         probe_result = pending_probes.get(rid)
-        markup = quality_menu(probe_result, rid) if probe_result else fallback_menu(rid)
-        title = esc(probe_result.title) if probe_result and probe_result.title else messages.PICK_OPTION
+        markup = _main_menu_for(rid, probe_result) if probe_result else fallback_menu(rid)
+        title = _quality_caption(rid, probe_result) if probe_result else messages.PICK_OPTION
         await set_text(messages.with_link(title, url), markup=markup)
         return
 
     if action == "moreq":
         probe_result = pending_probes.get(rid)
-        markup = extended_video_menu(probe_result, rid) if probe_result else fallback_menu(rid)
-        await query.edit_message_reply_markup(reply_markup=markup)
+        if not probe_result:
+            await query.edit_message_reply_markup(reply_markup=fallback_menu(rid))
+            return
+        count = len(_active_sections(rid)[0])
+        await set_text(_quality_caption(rid, probe_result), markup=extended_video_menu(probe_result, rid, count))
         return
 
     if action == "backq":
         probe_result = pending_probes.get(rid)
-        markup = quality_menu(probe_result, rid) if probe_result else fallback_menu(rid)
-        await query.edit_message_reply_markup(reply_markup=markup)
+        if not probe_result:
+            await query.edit_message_reply_markup(reply_markup=fallback_menu(rid))
+            return
+        await set_text(_quality_caption(rid, probe_result), markup=_main_menu_for(rid, probe_result))
         return
 
     if action == "retry":
@@ -1127,8 +1136,10 @@ async def link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     if action in ("video", "audio", "simple") and len(parts) == 4:
         preview_title = _preview_title(rid)   # must be read BEFORE the probe state is dropped
+        clip_sections, clip_merge = _active_sections(rid)   # ditto: needs the probe's duration
         entry = pending_links.pop(rid, None)
         pending_probes.pop(rid, None)
+        pending_sections.pop(rid, None)
         if not entry or entry[0] != user_id:
             # State was lost (restart, long gap, etc.) but the link is
             # still right there in the message - recover it instead of
@@ -1153,6 +1164,11 @@ async def link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             job_settings["mode"] = "audio"
             job_settings["audio_format"] = value
         # "simple" (gallery/direct file): leave settings as-is
+        if clip_sections and action in ("video", "audio"):
+            # The person chose parts of the video in the editor: this button's
+            # quality / format applies to just those parts.
+            job_settings["sections"] = clip_sections
+            job_settings["sections_merge"] = clip_merge
 
         last_download[rid] = (user_id, url, job_settings)
         _touch_rid(rid)

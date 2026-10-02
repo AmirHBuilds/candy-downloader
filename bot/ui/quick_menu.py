@@ -21,22 +21,26 @@ def cancel_row(rid: str) -> list[InlineKeyboardButton]:
     return [InlineKeyboardButton("✕ Cancel", callback_data=f"dl|cancel|{rid}")]
 
 
-def _clip_row(probe: ProbeResult | None, rid: str) -> list[list[InlineKeyboardButton]]:
+def _clip_row(probe: ProbeResult | None, rid: str, section_count: int = 0) -> list[list[InlineKeyboardButton]]:
     """The "download only part of it" entry point. Offered only when the
     probe knows the length (never for playlists / live streams) - the editor
-    validates timestamps against it."""
+    validates timestamps against it. Once sections are chosen the label says
+    so, because every download button on the menu will then use them."""
     if probe is None or not probe.duration:
         return []
-    return [[InlineKeyboardButton("✄ Add section", callback_data=f"dl|sec|open|{rid}")]]
+    label = f"✄ Sections ({section_count}) ✓" if section_count else "✄ Add section"
+    return [[InlineKeyboardButton(label, callback_data=f"dl|sec|open|{rid}")]]
 
 
-def quality_menu(probe: ProbeResult, rid: str) -> InlineKeyboardMarkup:
+def quality_menu(probe: ProbeResult, rid: str, section_count: int = 0) -> InlineKeyboardMarkup:
     """The right first screen for a probed link: video picker, or - for an
-    audio-only source - just the audio formats, or a single Download button."""
+    audio-only source - just the audio formats, or a single Download button.
+    (section_count only matters for the audio-only menu, which has no
+    "More options" screen to hold the sections button.)"""
     if probe.heights:
         return video_menu(probe, rid)
     if probe.has_audio:
-        return audio_only_menu(rid, probe)
+        return audio_only_menu(rid, probe, section_count)
     return simple_menu(rid)
 
 
@@ -66,7 +70,7 @@ def video_menu(probe: ProbeResult, rid: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def extended_video_menu(probe: ProbeResult, rid: str) -> InlineKeyboardMarkup:
+def extended_video_menu(probe: ProbeResult, rid: str, section_count: int = 0) -> InlineKeyboardMarkup:
     rows = []
     picks = []
     for h in probe.heights or []:
@@ -77,16 +81,16 @@ def extended_video_menu(probe: ProbeResult, rid: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton(f"{h}p", callback_data=f"dl|video|{h}p|{rid}") for h in picks[i:i + 3]
         ])
     rows.append([InlineKeyboardButton("↓ Smallest size", callback_data=f"dl|video|worst|{rid}")])
-    rows.extend(_clip_row(probe, rid))
+    rows.extend(_clip_row(probe, rid, section_count))
     rows.append([InlineKeyboardButton("← Back", callback_data=f"dl|backq|{rid}")])
     return InlineKeyboardMarkup(rows)
 
 
-def audio_only_menu(rid: str, probe: ProbeResult | None = None) -> InlineKeyboardMarkup:
+def audio_only_menu(rid: str, probe: ProbeResult | None = None, section_count: int = 0) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("♪ MP3", callback_data=f"dl|audio|mp3|{rid}"),
          InlineKeyboardButton("♪ Opus", callback_data=f"dl|audio|opus|{rid}")],
-        *_clip_row(probe, rid),
+        *_clip_row(probe, rid, section_count),
         cancel_row(rid),
     ])
 

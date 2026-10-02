@@ -1,23 +1,30 @@
 """
 Screens for the time-range "sections" editor (see downloader/sections.py).
 
-Two screens, both shown by editing the quality-picker message in place:
-  editor - saved sections, the next section's Start/End, merge + format choice
-  prompt - "send the start time", shown while we wait for a typed timestamp
+The editor ONLY edits sections. Quality / audio is chosen on the normal quality
+menu afterwards, and those buttons then download just the sections chosen here
+(the menu's caption lists them, see sections_summary). So there is no Save and
+no Download button in here:
 
-Telegram inline buttons can't take typed input, so Start/End switch to the
-prompt screen and the next text message the person sends becomes the value
-(see handle_section_text_input in main.py).
+    [+ Add section]
+    [Start: 1:30:00] [End: 1:32:00] [✕]
+    [Start: —      ] [End: —      ] [✕]
+    [● Separate clips] [○ Merged into one]      <- only with 2+ sections
+    [← Back]
 
-Callback data is "dl|sec|<sub>[|<arg>]|<rid>" - the rid is always last, like
-every other dl| button, and the longest one here is well under 64 bytes.
+Start/End can't take typed input from a button, so tapping one switches to the
+prompt screen and the next text message becomes the value (see
+handle_section_text_input in main.py).
+
+Callback data is "dl|sec|<sub>[|<args>]|<rid>" - the rid is always last, like
+every other dl| button; the longest one here is well under Telegram's 64 bytes.
 """
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-from downloader.sections import SectionDraft, format_section, format_timestamp, section_length
+from downloader.sections import SectionDraft, format_section, format_timestamp
 from utils.text import esc
 
-_FMT_LABELS = {"video": "Video", "mp3": "MP3", "opus": "Opus"}
+MAX_SUMMARY_LINES = 4      # keep the quality menu's caption short (a photo caption is capped at 1024 chars)
 
 
 def _btn(text: str, data: str) -> InlineKeyboardButton:
@@ -37,53 +44,35 @@ def editor_text(draft: SectionDraft, duration: int, title: str = "", notice: str
     if notice:
         # SectionError text can echo what the person typed - escape it.
         lines += ["", f"⚠ {esc(notice)}"]
-
-    lines.append("")
-    if draft.sections:
-        lines.append("<b>Saved</b>")
-        for i, (start, end) in enumerate(draft.sections, 1):
-            lines.append(f"{i}. {format_section(start, end)} · {format_timestamp(section_length(start, end))}")
-    else:
-        lines.append("No sections saved yet.")
-
-    lines += [
-        "",
-        "<b>New section</b>",
-        f"Start: {_value(draft.start)}   End: {_value(draft.end)}",
-    ]
+    lines += ["", "<i>Go back and pick a quality to download.</i>"]
     return "\n".join(lines)
 
 
-def editor_menu(draft: SectionDraft, rid: str, has_video: bool) -> InlineKeyboardMarkup:
-    rows = [
-        [_btn(f"Start: {_value(draft.start)}", f"dl|sec|start|{rid}"),
-         _btn(f"End: {_value(draft.end)}", f"dl|sec|end|{rid}")],
-        [_btn("✓ Save section", f"dl|sec|save|{rid}")],
-    ]
+def editor_menu(draft: SectionDraft, rid: str, active_count: int) -> InlineKeyboardMarkup:
+    rows = [[_btn("+ Add section", f"dl|sec|add|{rid}")]]
 
-    count = len(draft.sections)
-    if count:
-        # One remove button per saved section, numbered like the list above.
-        for i in range(0, count, 5):
-            rows.append([_btn(f"✕ {n}", f"dl|sec|del|{n}|{rid}") for n in range(i + 1, min(i + 5, count) + 1)])
+    for i, row in enumerate(draft.rows):
+        line = [_btn(f"Start: {_value(row.start)}", f"dl|sec|start|{i}|{rid}"),
+                _btn(f"End: {_value(row.end)}", f"dl|sec|end|{i}|{rid}")]
+        # Removing: a lone empty row has nothing to remove; otherwise every row gets a ✕.
+        if len(draft.rows) > 1 or not row.is_empty():
+            line.append(_btn("✕", f"dl|sec|del|{i}|{rid}"))
+        rows.append(line)
 
-    if count >= 2:
+    if active_count >= 2:
         rows.append([
             _btn(("● " if not draft.merge else "○ ") + "Separate clips", f"dl|sec|merge|off|{rid}"),
             _btn(("● " if draft.merge else "○ ") + "Merged into one", f"dl|sec|merge|on|{rid}"),
         ])
 
-    formats = (["video"] if has_video else []) + ["mp3", "opus"]
-    rows.append([_btn(("● " if draft.fmt == f else "○ ") + _FMT_LABELS[f], f"dl|sec|fmt|{f}|{rid}") for f in formats])
-
-    rows.append([_btn(f"↓ Download {count} clip{'s' if count != 1 else ''}" if count else "↓ Download",
-                      f"dl|sec|go|{rid}")])
     rows.append([_btn("← Back", f"dl|sec|back|{rid}")])
     return InlineKeyboardMarkup(rows)
 
 
-def prompt_text(field: str, duration: int, notice: str = "") -> str:
-    lines = [f"Send the <b>{'start' if field == 'start' else 'end'}</b> time.", ""]
+def prompt_text(field: str, duration: int, notice: str = "", section_number: int | None = None) -> str:
+    which = "start" if field == "start" else "end"
+    where = f" for section {section_number}" if section_number else ""
+    lines = [f"Send the <b>{which}</b> time{where}.", ""]
     if notice:
         lines += [f"⚠ {esc(notice)}", ""]
     lines += [
@@ -93,10 +82,22 @@ def prompt_text(field: str, duration: int, notice: str = "") -> str:
     return "\n".join(lines)
 
 
-def prompt_menu(field: str, rid: str) -> InlineKeyboardMarkup:
+def prompt_menu(field: str, index: int, rid: str) -> InlineKeyboardMarkup:
     empty_label = "Leave empty (from the start)" if field == "start" else "Leave empty (to the end)"
     return InlineKeyboardMarkup([
-        [_btn(empty_label, f"dl|sec|clear|{field}|{rid}")],
+        [_btn(empty_label, f"dl|sec|clear|{field}|{index}|{rid}")],
         [_btn("← Back", f"dl|sec|edit|{rid}")],
     ])
 
+
+def sections_summary(sections: list[tuple[float, float]], merge: bool) -> str:
+    """The block added to the quality menu's caption while sections are chosen,
+    so it is obvious that the buttons below download only these parts."""
+    n = len(sections)
+    lines = [f"✄ {n} section{'s' if n != 1 else ''} — only {'these' if n != 1 else 'this'} will be downloaded"]
+    lines += [f"{i}. {format_section(a, b)}" for i, (a, b) in enumerate(sections[:MAX_SUMMARY_LINES], 1)]
+    if n > MAX_SUMMARY_LINES:
+        lines.append(f"+{n - MAX_SUMMARY_LINES} more")
+    if n > 1:
+        lines.append("Merged into one" if merge else "Separate clips")
+    return "\n".join(lines)

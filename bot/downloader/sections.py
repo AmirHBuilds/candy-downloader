@@ -155,32 +155,61 @@ def validate_sections(sections, duration: float | None = None) -> list[tuple[flo
 
 
 @dataclass
-class SectionDraft:
-    """Everything the person has entered in the sections editor for ONE link
-    (keyed by rid in main.py). start/end are the half-typed NEXT section;
-    `sections` are the saved ones; `fmt` is what to produce:
-    "video" | "mp3" | "opus"."""
-    fmt: str = "video"
-    merge: bool = False
+class SectionRow:
+    """One Start/End pair in the editor. Either side may be empty; both empty
+    means 'not a section' (the row is ignored when downloading)."""
     start: float | None = None
     end: float | None = None
-    sections: list[tuple[float, float]] = field(default_factory=list)
 
-    def has_unsaved(self) -> bool:
-        return self.start is not None or self.end is not None
+    def is_empty(self) -> bool:
+        return self.start is None and self.end is None
 
-    def save(self, duration: float | None) -> tuple[float, float]:
-        """Validate the draft and append it. On error nothing changes, so the
-        person can fix just the field that was wrong."""
-        check_can_add(len(self.sections))
-        section = make_section(self.start, self.end, duration)
-        if section in self.sections:
-            raise SectionError("That section is already in the list.")
-        self.sections.append(section)
-        self.start = self.end = None
-        return section
 
-    def remove(self, index: int) -> None:
-        """index is 0-based; out-of-range is ignored (a stale button)."""
-        if 0 <= index < len(self.sections):
-            del self.sections[index]
+@dataclass
+class SectionDraft:
+    """What the person has entered in the sections editor for ONE link (keyed
+    by rid in main.py). There is no Save step: a row counts as a section the
+    moment it has a Start or an End, and every value is validated as it is
+    typed (set_value), so whatever is in `rows` is always downloadable.
+
+    The editor always shows at least one row. Which quality / format to
+    download in is NOT stored here - that is chosen on the normal quality
+    menu, and the sections are simply applied to whichever button is tapped."""
+    merge: bool = False
+    rows: list[SectionRow] = field(default_factory=lambda: [SectionRow()])
+
+    def _row(self, index: int) -> SectionRow:
+        if not 0 <= index < len(self.rows):
+            raise SectionError("That section no longer exists.")   # a stale button
+        return self.rows[index]
+
+    def add_row(self) -> None:
+        """Start another section. Refused while the last row is still empty, so
+        the editor never fills up with blank rows."""
+        if self.rows[-1].is_empty():
+            raise SectionError("Fill in the current section before adding another.")
+        check_can_add(len(self.rows))
+        self.rows.append(SectionRow())
+
+    def set_value(self, index: int, which: str, seconds: float, duration: float | None) -> None:
+        """Set a row's 'start' or 'end'. Validated together with the row's other
+        side (End after Start, inside the video); on error nothing changes."""
+        row = self._row(index)
+        start, end = (seconds, row.end) if which == "start" else (row.start, seconds)
+        make_section(start, end, duration)
+        row.start, row.end = start, end
+
+    def clear_value(self, index: int, which: str) -> None:
+        setattr(self._row(index), which, None)
+
+    def remove_row(self, index: int) -> None:
+        self._row(index)                      # raises for a stale button
+        del self.rows[index]
+        if not self.rows:
+            self.rows.append(SectionRow())    # the editor always keeps one row to type into
+
+    def active(self, duration: float | None) -> list[tuple[float, float]]:
+        """The concrete sections to download, in the order they were added:
+        non-empty rows, validated, exact duplicates dropped."""
+        pairs = [(r.start, r.end) for r in self.rows if not r.is_empty()]
+        return validate_sections(pairs, duration) if pairs else []

@@ -6,7 +6,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from downloader.sections import (  # noqa: E402
-    MAX_SECTIONS, SectionError, check_can_add, filename_tag, format_section, format_timestamp,
+    MAX_SECTIONS, SectionDraft, SectionError, check_can_add, filename_tag, format_section, format_timestamp,
     make_section, parse_timestamp, validate_sections,
 )
 
@@ -104,6 +104,88 @@ class ValidateSections(unittest.TestCase):
         check_can_add(MAX_SECTIONS - 1)
         with self.assertRaises(SectionError):
             check_can_add(MAX_SECTIONS)
+
+
+class Draft(unittest.TestCase):
+    D = 6194
+
+    def test_starts_with_one_empty_row_and_no_sections(self):
+        draft = SectionDraft()
+        self.assertEqual(len(draft.rows), 1)
+        self.assertTrue(draft.rows[0].is_empty())
+        self.assertEqual(draft.active(self.D), [])
+
+    def test_a_single_value_makes_a_section(self):
+        draft = SectionDraft()
+        draft.set_value(0, "end", 120, self.D)
+        self.assertEqual(draft.active(self.D), [(0.0, 120.0)])
+        draft.clear_value(0, "end")
+        draft.set_value(0, "start", 6000, self.D)
+        self.assertEqual(draft.active(self.D), [(6000.0, 6194.0)])
+
+    def test_values_are_validated_together_with_the_other_side_and_nothing_changes_on_error(self):
+        draft = SectionDraft()
+        draft.set_value(0, "start", 600, self.D)
+        for which, value in [("end", 300), ("end", 9999), ("start", 7000)]:
+            with self.subTest(which=which, value=value), self.assertRaises(SectionError):
+                draft.set_value(0, which, value, self.D)
+        self.assertEqual((draft.rows[0].start, draft.rows[0].end), (600, None))
+
+    def test_moving_start_past_an_existing_end_is_refused(self):
+        draft = SectionDraft()
+        draft.set_value(0, "start", 100, self.D)
+        draft.set_value(0, "end", 200, self.D)
+        with self.assertRaisesRegex(SectionError, "after the start"):
+            draft.set_value(0, "start", 250, self.D)
+
+    def test_add_row_needs_the_last_row_filled(self):
+        draft = SectionDraft()
+        with self.assertRaisesRegex(SectionError, "Fill in the current section"):
+            draft.add_row()
+        draft.set_value(0, "end", 60, self.D)
+        draft.add_row()
+        self.assertEqual(len(draft.rows), 2)
+        with self.assertRaises(SectionError):
+            draft.add_row()                       # the new one is empty now
+
+    def test_the_row_limit(self):
+        draft = SectionDraft()
+        for i in range(MAX_SECTIONS):
+            draft.set_value(len(draft.rows) - 1, "end", (i + 1) * 60, self.D)
+            if i < MAX_SECTIONS - 1:
+                draft.add_row()
+        with self.assertRaisesRegex(SectionError, str(MAX_SECTIONS)):
+            draft.add_row()
+
+    def test_remove_keeps_order_and_always_leaves_a_row(self):
+        draft = SectionDraft()
+        for end in (60, 120, 180):
+            draft.set_value(len(draft.rows) - 1, "end", end, self.D)
+            draft.add_row() if end != 180 else None
+        draft.remove_row(1)
+        self.assertEqual(draft.active(self.D), [(0.0, 60.0), (0.0, 180.0)])
+        draft.remove_row(0)
+        draft.remove_row(0)
+        self.assertEqual(len(draft.rows), 1)
+        self.assertTrue(draft.rows[0].is_empty())
+
+    def test_stale_indexes_raise_a_readable_error(self):
+        draft = SectionDraft()
+        for call in (lambda: draft.remove_row(5), lambda: draft.set_value(5, "end", 10, self.D),
+                     lambda: draft.clear_value(5, "end")):
+            with self.assertRaisesRegex(SectionError, "no longer exists"):
+                call()
+
+    def test_empty_rows_in_the_middle_are_ignored_and_duplicates_dropped(self):
+        draft = SectionDraft()
+        draft.set_value(0, "end", 60, self.D)
+        draft.add_row()                           # stays empty
+        self.assertEqual(draft.active(self.D), [(0.0, 60.0)])
+        draft.set_value(1, "end", 60, self.D)     # identical to row 0
+        self.assertEqual(draft.active(self.D), [(0.0, 60.0)])
+
+    def test_merge_flag_defaults_to_separate(self):
+        self.assertFalse(SectionDraft().merge)
 
 
 if __name__ == "__main__":
