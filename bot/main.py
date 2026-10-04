@@ -14,15 +14,19 @@ from telegram.ext import (
 )
 
 import config
+from jobqueue.batch import Batch, BatchItem
 from jobqueue.job_manager import JobManager
 from settings import access_control as ac
 from settings.user_settings import get_settings, update_setting, reset_settings
-from ui import messages, admin_menu
+from ui import messages, admin_menu, batch_menu
 from ui.quick_menu import (
     extended_video_menu, simple_menu, fallback_menu, spotify_menu,
     queued_menu, redo_menu, quality_menu,
 )
-from ui.section_menu import editor_text, editor_menu, prompt_text, prompt_menu, sections_summary
+from ui.section_menu import (
+    editor_text, editor_menu, prompt_text, prompt_menu, sections_summary,
+    chapters_text, chapters_menu, chapter_pages,
+)
 from ui.settings_menu import (
     main_menu, advanced_menu, confirm_reset_menu, back_to_main, ADVANCED_TEXT_FIELDS,
     bars_menu, bars_title,
@@ -31,19 +35,24 @@ from ui.history_menu import (
     history_text, history_menu, confirm_clear_menu, PAGE_SIZE, ORIGIN_HOME, ORIGIN_SETTINGS,
 )
 from ui.start_menu import start_menu
+from downloader import cookie_health
 from downloader.probe import probe, ProbeResult
-from downloader.sections import SectionDraft, SectionError, parse_timestamp
+from downloader.sections import SectionDraft, SectionError, parse_timestamp, start_time_from_url
+from downloader.sizes import size_labels
 from downloader import gallerydl_probe
 from downloader.cookies import inspect_cookie_file
+from downloader.playlist import Entry, ListingError, MAX_LISTED, list_playlist, quick_titles, short_label
 from downloader.site_map import tool_order_for
 from downloader.dispatcher import FRIENDLY_TOOL
 from downloader.spotify_handler import get_track_info
 from updater.auto_update import daily_update_loop, run_update_once
 from utils.cleanup import sweep_orphaned_workspaces
+from utils.safe_logging import install_safe_logging
 from utils.text import esc
 from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+install_safe_logging(config.BOT_TOKEN)   # the token is in every Bot API URL - never let it reach the logs
 log = logging.getLogger("candy.main")
 
 URL_RE = re.compile(r"https?://\S+")
@@ -65,6 +74,8 @@ pending_sections: dict[str, SectionDraft] = {}          # rid -> the clip-sectio
 # unlike pending_admin_input, so a forgotten prompt can't swallow a message
 # minutes later.
 pending_section_input: dict[int, dict] = {}
+# bid -> a playlist / several-links picker, then the running batch (the id is also a "rid" for _touch_rid / sweeping)
+pending_batches: dict[str, Batch] = {}
 SECTION_INPUT_TTL_SECONDS = 10 * 60
 
 # None of the rid-keyed dicts above ever had anything removing an entry
@@ -89,23 +100,34 @@ def _touch_rid(rid: str) -> None:
     _rid_last_touch[rid] = time.time()
 
 
+def _sweep_stale_state_once() -> int:
+    now = time.time()
+    stale = [rid for rid, ts in _rid_last_touch.items() if now - ts > RID_STATE_TTL_SECONDS]
+    pruned = 0
+    for rid in stale:
+        batch = pending_batches.get(rid)
+        if batch is not None and batch.run_indices and not batch.finished:
+            _touch_rid(rid)       # still downloading: its Cancel button must keep working however long it takes
+            continue
+        pending_links.pop(rid, None)
+        pending_probes.pop(rid, None)
+        last_download.pop(rid, None)
+        pending_sections.pop(rid, None)
+        pending_batches.pop(rid, None)
+        cancelled_pre_job_rids.discard(rid)
+        _rid_last_touch.pop(rid, None)
+        pruned += 1
+    for uid in [u for u, st in pending_section_input.items() if now - st["at"] > SECTION_INPUT_TTL_SECONDS]:
+        pending_section_input.pop(uid, None)
+    return pruned
+
+
 async def _sweep_stale_link_state_loop() -> None:
     while True:
         await asyncio.sleep(15 * 60)
-        now = time.time()
-        stale = [rid for rid, ts in _rid_last_touch.items() if now - ts > RID_STATE_TTL_SECONDS]
-        for rid in stale:
-            pending_links.pop(rid, None)
-            pending_probes.pop(rid, None)
-            last_download.pop(rid, None)
-            pending_sections.pop(rid, None)
-            cancelled_pre_job_rids.discard(rid)
-            _rid_last_touch.pop(rid, None)
-        now = time.time()
-        for uid in [u for u, st in pending_section_input.items() if now - st["at"] > SECTION_INPUT_TTL_SECONDS]:
-            pending_section_input.pop(uid, None)
-        if stale:
-            log.info("Pruned %d stale link state entries", len(stale))
+        pruned = _sweep_stale_state_once()
+        if pruned:
+            log.info("Pruned %d stale link state entries", pruned)
 
 
 def new_rid() -> str:
@@ -346,6 +368,12 @@ async def cookies_file_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             "won't help with YouTube. Log in first, then export again "
             "from a private window. /cookies has the steps."
         )
+    elif check["expired"]:
+        note = (
+            "Saved — but the login in this file has already expired, so it "
+            "won't work. Log in again, export from a private window, and "
+            "send the file again. /cookies has the steps."
+        )
     else:
         note = "Cookies saved and turned on — just for you."
     await update.message.reply_text(note)
@@ -429,7 +457,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         if key == "__reset__":
             reset_settings(user_id)
         elif key in {"embed_thumbnail", "embed_metadata", "sponsorblock", "use_archive",
-                     "embed_subtitles", "cookies_enabled", "adhd_mode"}:
+                     "embed_subtitles", "cookies_enabled", "adhd_mode", "show_sizes"}:
             update_setting(user_id, key, value == "1")
         else:
             update_setting(user_id, key, value)
@@ -711,8 +739,45 @@ def _quality_caption(rid: str, probe_result: ProbeResult) -> str:
     return caption
 
 
-def _main_menu_for(rid: str, probe_result: ProbeResult):
-    return quality_menu(probe_result, rid, len(_active_sections(rid)[0]))
+def _prefill_start_time(rid: str, url: str, probe_result: ProbeResult) -> None:
+    """A link like youtu.be/ID?t=1h30m means "start here": pre-fill that as a
+    section from there to the end. It shows in the menu's caption and on its
+    button, and one tap on the section's remove button in the editor drops it."""
+    start_at = start_time_from_url(url)
+    if not start_at or not probe_result.duration or start_at >= probe_result.duration:
+        return
+    draft = SectionDraft()
+    try:
+        draft.set_value(0, "start", start_at, probe_result.duration)
+    except SectionError:
+        return
+    pending_sections[rid] = draft
+
+
+def _editor_markup(rid: str, draft: SectionDraft, probe_result: ProbeResult):
+    return editor_menu(draft, rid, len(_active_sections(rid)[0]), bool(probe_result.chapters))
+
+
+def _size_labels(rid: str, probe_result: ProbeResult, user_id: int) -> dict:
+    """Estimated sizes for the quality buttons ({} = show none): nothing when
+    the person turned sizes off, or the site announced none. With sections
+    chosen the numbers shrink to the share of the video being downloaded."""
+    if not probe_result.sizes or not get_settings(user_id).get("show_sizes", True):
+        return {}
+    sections, _ = _active_sections(rid)
+    scale = 1.0
+    if sections and probe_result.duration:
+        scale = sum(end - start for start, end in sections) / probe_result.duration
+    return size_labels(probe_result.sizes, scale)
+
+
+def _main_menu_for(rid: str, probe_result: ProbeResult, user_id: int):
+    return quality_menu(probe_result, rid, len(_active_sections(rid)[0]), _size_labels(rid, probe_result, user_id))
+
+
+def _more_menu_for(rid: str, probe_result: ProbeResult, user_id: int):
+    return extended_video_menu(probe_result, rid, len(_active_sections(rid)[0]),
+                               _size_labels(rid, probe_result, user_id))
 
 
 async def sections_callback(context: ContextTypes.DEFAULT_TYPE, query, user_id: int, parts: list[str],
@@ -735,8 +800,13 @@ async def sections_callback(context: ContextTypes.DEFAULT_TYPE, query, user_id: 
     duration = probe_result.duration
 
     async def editor(notice: str = "") -> None:
-        count = len(_active_sections(rid)[0])
-        await show(editor_text(draft, duration, probe_result.title, notice), editor_menu(draft, rid, count))
+        await show(editor_text(draft, duration, probe_result.title, notice), _editor_markup(rid, draft, probe_result))
+
+    async def chapters_screen(page: int, notice: str = "") -> None:
+        pages = chapter_pages(probe_result.chapters)
+        page = max(0, min(page, pages - 1))
+        await show(chapters_text(probe_result.title, duration, page, pages, notice),
+                   chapters_menu(probe_result.chapters, draft, rid, page))
 
     def number_at(position: int) -> int | None:
         return int(parts[position]) if len(parts) > position + 1 and parts[position].isdigit() else None
@@ -781,13 +851,29 @@ async def sections_callback(context: ContextTypes.DEFAULT_TYPE, query, user_id: 
         else:
             await editor()
 
+    elif sub == "chap" and probe_result.chapters:
+        await chapters_screen(number_at(3) or 0)
+
+    elif sub == "ch" and probe_result.chapters and number_at(3) is not None:
+        index, page = number_at(3), number_at(4) or 0
+        if index >= len(probe_result.chapters):
+            await chapters_screen(page, "That chapter no longer exists.")
+            return
+        _title, start, end = probe_result.chapters[index]
+        try:
+            draft.toggle_range(start, end, duration)
+        except SectionError as exc:
+            await chapters_screen(page, str(exc))
+        else:
+            await chapters_screen(page)
+
     elif sub == "merge" and len(parts) > 4:
         draft.merge = parts[3] == "on"
         await editor()
 
     elif sub == "back":
         # Back to the quality menu - its buttons now download these sections.
-        await show(_quality_caption(rid, probe_result), _main_menu_for(rid, probe_result))
+        await show(_quality_caption(rid, probe_result), _main_menu_for(rid, probe_result, user_id))
 
 
 async def handle_section_text_input(update: Update, user_id: int, text: str) -> None:
@@ -818,8 +904,167 @@ async def handle_section_text_input(update: Update, user_id: int, text: str) -> 
         return
 
     pending_section_input.pop(user_id, None)
-    count = len(_active_sections(rid)[0])
-    await show(editor_text(draft, duration, probe_result.title), editor_menu(draft, rid, count))
+    await show(editor_text(draft, duration, probe_result.title), _editor_markup(rid, draft, probe_result))
+
+
+# ---------- batches: a playlist, or several links in one message ----------
+
+_URL_TRAILING_PUNCTUATION = ".,;:!?)]}>\"'"
+
+
+def _unique_urls(text: str) -> list[str]:
+    """Every link in a message, in order, without repeats. Chat text puts
+    punctuation right after a link ("see https://x.com/a, then..."), which
+    would otherwise become part of the URL."""
+    seen: set[str] = set()
+    urls = []
+    for raw in URL_RE.findall(text):
+        url = raw.rstrip(_URL_TRAILING_PUNCTUATION)
+        if url and url not in seen:
+            seen.add(url)
+            urls.append(url)
+    return urls
+
+
+def _batch_settings(quality: str, user_id: int) -> dict:
+    settings = dict(get_settings(user_id))
+    if quality in ("mp3", "opus"):
+        settings["mode"], settings["audio_format"] = "audio", quality
+    else:
+        settings["mode"], settings["quality"] = "video", quality
+    return settings
+
+
+def _batch_settings_for(base: dict):
+    def settings_for(url: str) -> dict:
+        settings = dict(base)
+        if tool_order_for(url)[0] == "spotify":
+            settings["mode"] = "audio"        # Spotify is only ever audio, whatever was picked for the rest
+        return settings
+    return settings_for
+
+
+async def _open_picker(bot, batch: Batch, status_msg, notice: str = "") -> None:
+    """Show the selection list, reusing the "checking…" message if there is one."""
+    text, markup = batch_menu.picker_text(batch, 0, notice), batch_menu.picker_menu(batch, 0)
+    if status_msg is not None:
+        await status_msg.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        batch.status_message_id = status_msg.message_id
+    else:
+        sent = await bot.send_message(batch.chat_id, text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        batch.status_message_id = sent.message_id
+    pending_batches[batch.bid] = batch
+    _touch_rid(batch.bid)
+
+
+async def start_playlist_picker(bot, user_id: int, chat_id: int, url: str, status_msg) -> None:
+    try:
+        title, entries = await list_playlist(url, user_id)
+    except ListingError as exc:
+        await status_msg.edit_text(str(exc))
+        return
+    batch = Batch(bid=new_rid(), user_id=user_id, chat_id=chat_id, status_message_id=status_msg.message_id,
+                  items=[BatchItem(e.url, e.title, e.duration) for e in entries], title=title, kind="playlist")
+    notice = f"Showing the first {MAX_LISTED} videos." if len(entries) >= MAX_LISTED else ""
+    await _open_picker(bot, batch, status_msg, notice)
+
+
+async def start_links_picker(bot, user_id: int, chat_id: int, urls: list[str]) -> None:
+    limit = batch_menu.MAX_BATCH_DOWNLOAD
+    notice = f"Only the first {limit} links are used." if len(urls) > limit else ""
+    urls = urls[:limit]
+    status_msg = await bot.send_message(chat_id, f"Checking {len(urls)} links…")
+    lookup = [u for u in urls if tool_order_for(u)[0] == "ytdlp"]       # titles only make sense where yt-dlp is the tool
+    found = {e.url: e for e in await quick_titles(lookup, user_id)} if lookup else {}
+    entries = [found.get(u) or Entry(u, short_label(u)) for u in urls]
+    batch = Batch(bid=new_rid(), user_id=user_id, chat_id=chat_id, status_message_id=status_msg.message_id,
+                  items=[BatchItem(e.url, e.title, e.duration) for e in entries], kind="links")
+    await _open_picker(bot, batch, status_msg, notice)
+
+
+def _select_all(batch: Batch) -> str:
+    limit = batch_menu.MAX_BATCH_DOWNLOAD
+    batch.selected = set(range(min(len(batch.items), limit)))
+    return f"Selected the first {limit} - the most one batch downloads." if len(batch.items) > limit else ""
+
+
+async def batch_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not await gate_callback(update, context):
+        return
+    user_id = update.effective_user.id
+    parts = (query.data or "").split("|")
+    action = parts[1] if len(parts) > 1 else ""
+    batch = pending_batches.get(parts[-1]) if len(parts) > 2 else None
+
+    async def show(text: str, markup) -> None:
+        await _show_screen(context.bot, query.message.chat_id, query.message.message_id, False, text, markup)
+
+    if batch is None or batch.user_id != user_id:
+        await show("This list expired — send the links again.", None)
+        return
+    _touch_rid(batch.bid)
+    running = bool(batch.run_indices)
+
+    def number(position: int, default: int = 0) -> int:
+        return int(parts[position]) if len(parts) > position + 1 and parts[position].isdigit() else default
+
+    async def picker(page: int, notice: str = "") -> None:
+        batch.page = batch_menu.clamp_page(batch, page)
+        await show(batch_menu.picker_text(batch, batch.page, notice), batch_menu.picker_menu(batch, batch.page))
+
+    async def quality_screen() -> None:
+        await show(batch_menu.quality_text(batch), batch_menu.quality_menu(batch))
+
+    # ---- while it is running or finished: only these buttons do anything
+    if action == "cx":
+        batch.cancel(job_manager)
+        return
+    if action == "rt":
+        await batch.retry_failed(job_manager, _batch_settings_for(batch.settings))
+        return
+    if action in ("dm", "x"):
+        batch.closed = True
+        pending_batches.pop(batch.bid, None)
+        await _delete_quietly(query.message)
+        return
+    if running:
+        return                                          # a stale picker button on a batch that has already started
+
+    # ---- the selection list
+    if action == "t":
+        index = number(2, -1)
+        if not 0 <= index < len(batch.items):
+            return
+        if index in batch.selected:
+            batch.selected.discard(index)
+            await picker(number(3))
+        elif len(batch.selected) >= batch_menu.MAX_BATCH_DOWNLOAD:
+            await picker(number(3), f"You can select up to {batch_menu.MAX_BATCH_DOWNLOAD} at a time.")
+        else:
+            batch.selected.add(index)
+            await picker(number(3))
+    elif action == "p":
+        await picker(number(2))
+    elif action == "sa":
+        await picker(number(2), _select_all(batch))
+    elif action == "cl":
+        batch.selected.clear()
+        await picker(number(2))
+    elif action == "q":
+        if batch.selected:
+            await quality_screen()
+        else:
+            await picker(batch.page, "Select at least one item first.")
+    elif action == "qa":
+        _select_all(batch)
+        await quality_screen()
+    elif action == "bk":
+        await picker(batch.page)
+    elif action == "go" and len(parts) > 3 and parts[2] in batch_menu.QUALITIES and batch.selected:
+        batch.settings = _batch_settings(parts[2], user_id)
+        await batch.start(job_manager, _batch_settings_for(batch.settings), sorted(batch.selected))
 
 
 # ---------- link handling ----------
@@ -929,6 +1174,11 @@ async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await handle_adhd_download(update, context, url, rid, user_id)
         return
 
+    urls = _unique_urls(raw_text)
+    if len(urls) >= 2:
+        await start_links_picker(context.bot, user_id, update.effective_chat.id, urls)
+        return
+
     if "spotify.com" in url:
         await handle_spotify_link(update, context, url, rid)
         return
@@ -946,12 +1196,27 @@ async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         cancelled_pre_job_rids.discard(rid)
         return
 
+    if probe_result and cookie_health.cookies_in_use(user_id, get_settings(user_id), url):
+        # A preview is a request with the person's cookies too: it feeds the same
+        # "have they stopped working?" tracking as downloads.
+        if probe_result.ok:
+            cookie_health.watch.record_success(user_id)
+        elif cookie_health.watch.record_failure(user_id, probe_result.error):
+            await update.effective_chat.send_message(cookie_health.COOKIE_ALERT, parse_mode=ParseMode.HTML)
+
+    if probe_result and probe_result.ok and probe_result.is_playlist:
+        # A playlist link: list what is in it so the person can pick, instead of guessing.
+        pending_links.pop(rid, None)
+        await start_playlist_picker(context.bot, user_id, update.effective_chat.id, url, status_msg)
+        return
+
     if probe_result and probe_result.ok and not probe_result.is_playlist:
         pending_probes[rid] = probe_result
         _touch_rid(rid)
-        caption = messages.with_link(esc(probe_result.title) if probe_result.title else messages.PICK_OPTION, url)
+        _prefill_start_time(rid, url, probe_result)
+        caption = messages.with_link(_quality_caption(rid, probe_result), url)
         # Audio-only sources (SoundCloud, etc.) get audio formats only - see quality_menu.
-        markup = quality_menu(probe_result, rid)
+        markup = _main_menu_for(rid, probe_result, user_id)
         if probe_result.thumbnail:
             try:
                 await context.bot.send_photo(
@@ -1057,7 +1322,7 @@ async def link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             return
         url = entry[1]
         probe_result = pending_probes.get(rid)
-        markup = _main_menu_for(rid, probe_result) if probe_result else fallback_menu(rid)
+        markup = _main_menu_for(rid, probe_result, user_id) if probe_result else fallback_menu(rid)
         title = _quality_caption(rid, probe_result) if probe_result else messages.PICK_OPTION
         await set_text(messages.with_link(title, url), markup=markup)
         return
@@ -1067,8 +1332,7 @@ async def link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if not probe_result:
             await query.edit_message_reply_markup(reply_markup=fallback_menu(rid))
             return
-        count = len(_active_sections(rid)[0])
-        await set_text(_quality_caption(rid, probe_result), markup=extended_video_menu(probe_result, rid, count))
+        await set_text(_quality_caption(rid, probe_result), markup=_more_menu_for(rid, probe_result, user_id))
         return
 
     if action == "backq":
@@ -1076,7 +1340,7 @@ async def link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if not probe_result:
             await query.edit_message_reply_markup(reply_markup=fallback_menu(rid))
             return
-        await set_text(_quality_caption(rid, probe_result), markup=_main_menu_for(rid, probe_result))
+        await set_text(_quality_caption(rid, probe_result), markup=_main_menu_for(rid, probe_result, user_id))
         return
 
     if action == "retry":
@@ -1162,13 +1426,18 @@ async def link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             job_settings["quality"] = value
         elif action == "audio":
             job_settings["mode"] = "audio"
-            job_settings["audio_format"] = value
+            if value == "mp3split":                    # one MP3 per chapter
+                job_settings["audio_format"] = "mp3"
+                job_settings["split_chapters"] = True
+            else:
+                job_settings["audio_format"] = value
         # "simple" (gallery/direct file): leave settings as-is
         if clip_sections and action in ("video", "audio"):
             # The person chose parts of the video in the editor: this button's
             # quality / format applies to just those parts.
             job_settings["sections"] = clip_sections
             job_settings["sections_merge"] = clip_merge
+            job_settings.pop("split_chapters", None)       # the chosen sections already say which parts to take
 
         last_download[rid] = (user_id, url, job_settings)
         _touch_rid(rid)
@@ -1295,6 +1564,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(force_join_callback, pattern=r"^fj\|"))
     app.add_handler(CallbackQueryHandler(misc_callback, pattern=r"^misc\|"))
     app.add_handler(CallbackQueryHandler(link_callback, pattern=r"^dl\|"))
+    app.add_handler(CallbackQueryHandler(batch_callback, pattern=r"^bt\|"))
     app.add_handler(CallbackQueryHandler(settings_callback, pattern=r"^(s\||nav\|)"))
     app.add_handler(CallbackQueryHandler(history_callback, pattern=r"^hist\|"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, link_handler))

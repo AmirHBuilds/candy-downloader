@@ -24,6 +24,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from downloader.sections import SectionDraft, format_section, format_timestamp
 from utils.text import esc
 
+CHAPTERS_PER_PAGE = 8
 MAX_SUMMARY_LINES = 4      # keep the quality menu's caption short (a photo caption is capped at 1024 chars)
 
 
@@ -48,8 +49,11 @@ def editor_text(draft: SectionDraft, duration: int, title: str = "", notice: str
     return "\n".join(lines)
 
 
-def editor_menu(draft: SectionDraft, rid: str, active_count: int) -> InlineKeyboardMarkup:
-    rows = [[_btn("+ Add section", f"dl|sec|add|{rid}")]]
+def editor_menu(draft: SectionDraft, rid: str, active_count: int, has_chapters: bool = False) -> InlineKeyboardMarkup:
+    top = [_btn("+ Add section", f"dl|sec|add|{rid}")]
+    if has_chapters:
+        top.append(_btn("Chapters", f"dl|sec|chap|0|{rid}"))     # one-tap ranges from the video's own chapters
+    rows = [top]
 
     for i, row in enumerate(draft.rows):
         line = [_btn(f"Start: {_value(row.start)}", f"dl|sec|start|{i}|{rid}"),
@@ -66,6 +70,47 @@ def editor_menu(draft: SectionDraft, rid: str, active_count: int) -> InlineKeybo
         ])
 
     rows.append([_btn("← Back", f"dl|sec|back|{rid}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def chapter_pages(chapters: list) -> int:
+    return max(1, -(-len(chapters) // CHAPTERS_PER_PAGE))
+
+
+def chapters_text(title: str, duration: int, page: int, pages: int, notice: str = "") -> str:
+    lines = ["✄ <b>Chapters</b>"]
+    if title:
+        shown = " ".join(title.split())
+        lines.append(f"<i>{esc(shown[:60] + ('…' if len(shown) > 60 else ''))}</i>")
+    lines.append("Tap a chapter to add it as a section; tap again to remove it.")
+    if pages > 1:
+        lines.append(f"Page {page + 1} of {pages}")
+    if notice:
+        lines += ["", f"⚠ {esc(notice)}"]
+    return "\n".join(lines)
+
+
+def chapters_menu(chapters: list, draft: SectionDraft, rid: str, page: int) -> InlineKeyboardMarkup:
+    """chapters = [(title, start, end)]. A chapter shows ✓ once it is one of the
+    sections. Button text is plain text, so titles need no escaping."""
+    pages = chapter_pages(chapters)
+    page = max(0, min(page, pages - 1))
+    chosen = {(row.start, row.end) for row in draft.rows}
+    rows = []
+    first = page * CHAPTERS_PER_PAGE
+    for offset, (name, start, end) in enumerate(chapters[first:first + CHAPTERS_PER_PAGE]):
+        mark = "✓ " if (float(start), float(end)) in chosen else ""
+        shown = " ".join(name.split())
+        label = f"{mark}{format_timestamp(start)} · {shown[:28] + ('…' if len(shown) > 28 else '')}"
+        rows.append([_btn(label, f"dl|sec|ch|{first + offset}|{page}|{rid}")])
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(_btn("◀ Prev", f"dl|sec|chap|{page - 1}|{rid}"))
+        if page < pages - 1:
+            nav.append(_btn("Next ▶", f"dl|sec|chap|{page + 1}|{rid}"))
+        rows.append(nav)
+    rows.append([_btn("← Back", f"dl|sec|edit|{rid}")])
     return InlineKeyboardMarkup(rows)
 
 

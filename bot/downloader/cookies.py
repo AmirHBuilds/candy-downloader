@@ -7,6 +7,7 @@ never received a user id, so it always ran logged-out - which is why a
 freshly uploaded cookies.txt "did nothing": the preview kept demanding a
 login no matter what.
 """
+import time
 from pathlib import Path
 
 from config import COOKIES_DIR
@@ -43,8 +44,11 @@ _LOGIN_COOKIE_NAMES = {"SAPISID", "__Secure-3PSID", "__Secure-1PSID", "LOGIN_INF
 def inspect_cookie_file(path: str | Path) -> dict:
     """Cheap sanity check of an uploaded cookies file, so the person finds
     out immediately if it can't possibly work rather than after a failed
-    download. Returns {"netscape": bool, "youtube": bool, "logged_in": bool}."""
-    result = {"netscape": False, "youtube": False, "logged_in": False}
+    download. Returns {"netscape", "youtube", "logged_in", "expired"} (all bool);
+    "expired" = there are login cookies and every one of them is already past
+    its expiry date (session cookies, which carry none, never count as expired)."""
+    result = {"netscape": False, "youtube": False, "logged_in": False, "expired": False}
+    login_expiries: list[int] = []
     try:
         text = Path(path).read_text(encoding="utf-8", errors="ignore")
     except OSError:
@@ -68,4 +72,10 @@ def inspect_cookie_file(path: str | Path) -> dict:
             result["youtube"] = True
             if name in _LOGIN_COOKIE_NAMES:
                 result["logged_in"] = True
+                try:
+                    login_expiries.append(int(float(fields[4])))   # 0 = a session cookie
+                except ValueError:
+                    login_expiries.append(0)
+    if login_expiries and all(0 < expiry < time.time() for expiry in login_expiries):
+        result["expired"] = True
     return result

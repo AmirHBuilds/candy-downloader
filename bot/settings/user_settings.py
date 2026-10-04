@@ -40,6 +40,9 @@ DEFAULTS: dict[str, Any] = {
     # --- ADHD mode: skip every prompt, always grab the best video quality ---
     "adhd_mode": False,
 
+    # --- Show an estimated size on the quality buttons ("720p ~45MB"): on by default ---
+    "show_sizes": True,
+
     # --- Progress bar look: auto | candy | jar | pacman | slider | moon ---
     # "auto" = moon in ADHD Mode, candy otherwise (see ui/progress.py).
     "bar_style": "auto",

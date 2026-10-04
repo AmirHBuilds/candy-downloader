@@ -12,6 +12,8 @@ import yt_dlp
 
 from config import BGUTIL_POT_URL
 from downloader.cookies import apply_cookies, cookie_file_for
+from downloader.playlist import wants_single_video
+from downloader.sizes import estimate_sizes
 from settings.user_settings import get_settings
 
 log = logging.getLogger("candy.probe")
@@ -35,7 +37,37 @@ class ProbeResult:
     # site doesn't report. Time-range sections are only offered when this is
     # known (it's also what timestamps are validated against).
     duration: int | None = None
+    # Estimated bytes per quality button ("1080", "best", "worst", "mp3", "opus"); see downloader/sizes.py.
+    sizes: dict = field(default_factory=dict)
+    # [(title, start_s, end_s)] when the video has chapters - one-tap time ranges in the sections editor.
+    chapters: list = field(default_factory=list)
     error: str = ""                                     # populated when ok=False, for a better user message
+
+
+def _safe_sizes(formats: list, duration, heights: list) -> dict:
+    """Sizes are a nicety: a surprise in some site's format list must never break the preview."""
+    try:
+        return estimate_sizes(formats, duration, heights)
+    except Exception:  # noqa: BLE001
+        log.debug("Size estimation failed", exc_info=True)
+        return {}
+
+
+def _chapters(info: dict, duration) -> list:
+    """[(title, start, end)] from the video's chapter list, cleaned: ends are
+    clamped to the (whole-second) duration, junk entries dropped."""
+    result = []
+    for chapter in info.get("chapters") or []:
+        try:
+            start = float(chapter["start_time"])
+            end = float(chapter.get("end_time") or duration or 0)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if duration:
+            end = min(end, float(duration))
+        if end - start >= 1:
+            result.append(((chapter.get("title") or "Chapter")[:80], start, end))
+    return result[:200]
 
 
 async def probe(url: str, user_id: int | None = None) -> ProbeResult:
@@ -49,6 +81,8 @@ async def probe(url: str, user_id: int | None = None) -> ProbeResult:
         "skip_download": True,
         "extract_flat": "discard_in_playlist",
         "socket_timeout": 8,
+        # watch?v=X&list=Y means "this video": don't turn it into a playlist preview.
+        "noplaylist": wants_single_video(url),
     }
     if BGUTIL_POT_URL:
         opts["extractor_args"] = {"youtubepot-bgutilhttp": {"base_url": [BGUTIL_POT_URL]}}
@@ -114,4 +148,6 @@ async def probe(url: str, user_id: int | None = None) -> ProbeResult:
         heights=heights if has_video else [],
         has_audio=has_audio,
         duration=duration,
+        sizes=_safe_sizes(formats, duration, heights if has_video else []),
+        chapters=_chapters(info, duration),
     )

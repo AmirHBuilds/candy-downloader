@@ -13,6 +13,7 @@ import yt_dlp
 from config import DATA_DIR, BGUTIL_POT_URL
 from downloader.cookies import apply_cookies, cookie_file_for
 from downloader.errors import JobCancelled
+from downloader.music import MAX_TRACKS, clean_title, music_tags, polish_mp3, split_by_chapters, valid_chapters
 from downloader.sections import SectionError, filename_tag, format_section, validate_sections
 
 log = logging.getLogger("candy.ytdlp")
@@ -242,6 +243,7 @@ async def download(url: str, workspace: Path, settings: dict, user_id: int,
 
     loop = asyncio.get_running_loop()
     stream_sizes: dict[str, int] = {}   # per-stream totals seen so far -> running overall size
+    seen_info: dict = {}                # the video's info (title, artist, chapters...) as the hooks saw it
 
     def _check_cancelled() -> None:
         if cancel_event is not None and cancel_event.is_set():
@@ -269,6 +271,8 @@ async def download(url: str, workspace: Path, settings: dict, user_id: int,
         if status not in ("downloading", "finished"):
             return
         info = d.get("info_dict") or {}
+        if info:
+            seen_info["info"] = info
         label = _stream_label(info, settings)
         key = str(info.get("format_id") or d.get("filename") or label)
         # ADHD Mode shows one bar and no stream labels, so two 0-100% runs
@@ -313,6 +317,8 @@ async def download(url: str, workspace: Path, settings: dict, user_id: int,
 
     def pp_hook(d: dict) -> None:
         _check_cancelled()
+        if d.get("info_dict"):
+            seen_info["info"] = d["info_dict"]
         if d.get("status") == "started":
             name = d.get("postprocessor", "")
             loop.call_soon_threadsafe(progress_cb, 100.0, None, None, _postprocessor_label(name))
@@ -378,7 +384,47 @@ async def download(url: str, workspace: Path, settings: dict, user_id: int,
 
     # filter out leftover thumbnail/metadata sidecar files, keep final media
     media = [p for p in results if p.suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp", ".part", ".ytdl"}]
-    return media or results
+    files = media or results
+    if settings.get("mode") == "audio":
+        files = await _finish_audio(files, seen_info.get("info") or {}, settings, progress_cb, cancel_event)
+    return files
+
+
+async def _finish_audio(files: list[Path], info: dict, settings: dict, progress_cb: ProgressCB,
+                        cancel_event: asyncio.Event | None) -> list[Path]:
+    """The music finishing touches (see downloader/music.py): proper tags and a
+    square cover on an mp3, and - when asked for - one track per chapter. Only
+    for a single audio file (a playlist is left exactly as downloaded), and
+    never at the cost of the download itself."""
+    audio_format = settings.get("audio_format")
+    candidates = [f for f in files if f.suffix.lower() == f".{audio_format}"]
+    if len(candidates) != 1 or audio_format not in ("mp3", "opus"):
+        return files
+    path = candidates[0]
+
+    try:
+        tags = music_tags(info)
+        if audio_format == "mp3":
+            await polish_mp3(path, tags, cancel_event)
+
+        if settings.get("split_chapters"):
+            chapters = valid_chapters(info)
+            if 2 <= len(chapters) <= MAX_TRACKS:
+                progress_cb(None, None, None, f"Splitting into {len(chapters)} tracks")
+                shared = {k: v for k, v in tags.items() if k != "title"}
+                shared.setdefault("album", clean_title(info.get("title") or ""))      # the mix is the album
+                tracks = await split_by_chapters(path, chapters, {k: v for k, v in shared.items() if v}, cancel_event)
+                if tracks:
+                    path.unlink(missing_ok=True)
+                    return tracks
+                progress_cb(None, None, None, "Couldn't split - sending the whole file")
+            else:
+                progress_cb(None, None, None, "No chapters to split by - sending the whole file")
+    except JobCancelled:
+        raise
+    except Exception:  # noqa: BLE001
+        log.exception("Music finishing failed for %s; using the file as downloaded", path.name)
+    return files
 
 
 # ---------------------------------------------------------------------------
@@ -593,7 +639,10 @@ async def _run_ffmpeg(args: list[str], cancel_event: asyncio.Event | None) -> tu
         await asyncio.wait({waiter}, timeout=0.5)
         cancelled = cancel_event is not None and cancel_event.is_set()
         if cancelled or time.monotonic() - started > DOWNLOAD_TIMEOUT_SECONDS:
-            proc.kill()
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass                        # it finished in the instant between the check and the kill
             await waiter
             if cancelled:
                 raise JobCancelled("Cancelled by user")

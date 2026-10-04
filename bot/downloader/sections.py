@@ -16,6 +16,7 @@ that put it in a parse_mode=HTML message must escape it (utils.text.esc).
 """
 import re
 from dataclasses import dataclass, field
+from urllib.parse import parse_qs, urlparse
 
 MAX_SECTIONS = 10
 MIN_SECTION_SECONDS = 1
@@ -154,6 +155,41 @@ def validate_sections(sections, duration: float | None = None) -> list[tuple[flo
     return result
 
 
+_YT_TIME = re.compile(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?")
+
+
+def _youtube_time(raw: str | None) -> float | None:
+    """YouTube's own time syntax: '90', '90s', '1m30s', '1h2m3s'."""
+    if not raw:
+        return None
+    raw = raw.strip().lower()
+    if re.fullmatch(r"\d+(\.\d+)?s?", raw):
+        return float(raw.rstrip("s"))
+    match = _YT_TIME.fullmatch(raw)
+    if match and any(match.groups()):
+        hours, minutes, seconds = (int(g) if g else 0 for g in match.groups())
+        return float(hours * 3600 + minutes * 60 + seconds)
+    return None
+
+
+def start_time_from_url(url: str) -> float | None:
+    """The 'start here' time in a YouTube link (?t=1h30m, &start=5400,
+    youtu.be/ID?t=90, #t=90), or None. Other sites and t=0 give None."""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return None
+    host = (parsed.hostname or "").lower()
+    if not (host == "youtu.be" or host == "youtube.com" or host.endswith(".youtube.com")):
+        return None
+    query, fragment = parse_qs(parsed.query), parse_qs(parsed.fragment)
+    for source, key in ((query, "t"), (query, "start"), (fragment, "t")):
+        seconds = _youtube_time((source.get(key) or [None])[0])
+        if seconds:
+            return seconds
+    return None
+
+
 @dataclass
 class SectionRow:
     """One Start/End pair in the editor. Either side may be empty; both empty
@@ -198,6 +234,23 @@ class SectionDraft:
         start, end = (seconds, row.end) if which == "start" else (row.start, seconds)
         make_section(start, end, duration)
         row.start, row.end = start, end
+
+    def toggle_range(self, start: float, end: float, duration: float | None) -> bool:
+        """Add a ready-made range (a chapter) as a section, or remove it if it
+        is already there. True = added, False = removed. It goes into the empty
+        row if there is one, so tapping a chapter first doesn't leave a blank
+        row behind."""
+        for index, row in enumerate(self.rows):
+            if (row.start, row.end) == (float(start), float(end)):
+                self.remove_row(index)
+                return False
+        section = make_section(start, end, duration)
+        if self.rows[-1].is_empty():
+            self.rows[-1].start, self.rows[-1].end = section
+        else:
+            check_can_add(len(self.rows))
+            self.rows.append(SectionRow(*section))
+        return True
 
     def clear_value(self, index: int, which: str) -> None:
         setattr(self._row(index), which, None)

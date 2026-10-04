@@ -23,6 +23,7 @@ from . import utils  # noqa: F401  (yt_dlp.utils.X is used by the code under tes
 REAL_FFMPEG = shutil.which("ffmpeg")
 SCRIPT: list[str] = []
 CALLS: list[dict] = []
+EXTRACT_CALLS: list[tuple] = []     # (url, opts) for every extract_info
 TITLE = "A long title cut mid-sentence "     # trailing space, like %(title).60B can leave
 
 
@@ -32,18 +33,40 @@ TITLE = "A long title cut mid-sentence "     # trailing space, like %(title).60B
 # progress=continue|end.
 PROGRESS = {"enabled": False, "streams": 2, "pause": 0.2}
 
+# When enabled, a plain download writes a REAL audio file (ffmpeg-generated, with a 16:9 cover like a
+# YouTube thumbnail) instead of a 100-byte placeholder.
+PLAIN_AUDIO = {"enabled": False, "suffix": "mp3", "seconds": 30, "cover": True}
+
 # Progress-hook events a plain (non-clip) download should emit, in order.
 HOOK_EVENTS: list[dict] = []
 # What extract_info() returns / how long it takes (for the preview lookup).
-EXTRACT = {"result": {"title": "T", "formats": []}, "delay": 0.0}
+EXTRACT = {"result": {"title": "T", "formats": []}, "delay": 0.0, "by_url": {}}
 
 
 def reset(script: list[str]) -> None:
     SCRIPT[:] = script
     CALLS.clear()
     HOOK_EVENTS.clear()
+    PLAIN_AUDIO.update(enabled=False, suffix="mp3", seconds=30, cover=True)
     PROGRESS.update(enabled=False, streams=2, pause=0.2)
-    EXTRACT.update(result={"title": "T", "formats": []}, delay=0.0)
+    EXTRACT.update(result={"title": "T", "formats": []}, delay=0.0, by_url={})
+    EXTRACT_CALLS.clear()
+
+
+def _write_audio(path):
+    """A real audio file of the configured length, with an attached 640x360 cover when asked."""
+    seconds, codec = PLAIN_AUDIO["seconds"], {"mp3": "libmp3lame", "opus": "libopus"}[PLAIN_AUDIO["suffix"]]
+    tone = [REAL_FFMPEG, "-v", "error", "-y", "-f", "lavfi", "-i", f"sine=frequency=440:d={seconds}"]
+    if PLAIN_AUDIO["cover"] and PLAIN_AUDIO["suffix"] == "mp3":
+        cover = path.with_suffix(".cover.jpg")
+        subprocess.run([REAL_FFMPEG, "-v", "error", "-y", "-f", "lavfi", "-i", "color=c=blue:s=640x360:d=1",
+                        "-frames:v", "1", str(cover)], check=True)
+        subprocess.run([*tone, "-i", str(cover), "-map", "0:a", "-map", "1", "-c:a", codec, "-c:v", "copy",
+                        "-id3v2_version", "3", "-metadata", "comment=a long video description",
+                        "-disposition:v", "attached_pic", str(path)], check=True)
+        cover.unlink()
+    else:
+        subprocess.run([*tone, "-c:a", codec, str(path)], check=True)
 
 
 def _block(out_us, status):
@@ -79,8 +102,12 @@ class YoutubeDL:
         return False
 
     def extract_info(self, url, download=False):
+        EXTRACT_CALLS.append((url, dict(self.opts)))
         time.sleep(EXTRACT["delay"])
-        return EXTRACT["result"]
+        outcome = EXTRACT["by_url"].get(url, EXTRACT["result"])
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
 
     def download(self, urls):
         index = len(CALLS)
@@ -101,7 +128,10 @@ class YoutubeDL:
             raise Exception(f"ffmpeg exited with code {code}")
 
         if "download_ranges" not in self.opts:                     # a normal, whole-video download
-            (target.parent / "video.mp4").write_bytes(b"x" * 100)
+            if PLAIN_AUDIO["enabled"]:
+                _write_audio(target.parent / f"song.{PLAIN_AUDIO['suffix']}")
+            else:
+                (target.parent / "video.mp4").write_bytes(b"x" * 100)
             for event in HOOK_EVENTS:
                 for hook in self.opts.get("progress_hooks", []):
                     hook(event)

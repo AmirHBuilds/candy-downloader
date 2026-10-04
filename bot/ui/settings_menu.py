@@ -17,10 +17,14 @@ def _row(*buttons):
 
 def main_menu(s: dict) -> InlineKeyboardMarkup:
     adhd_on = s.get("adhd_mode", False)
+    sizes_on = s.get("show_sizes", True)
     rows = [
         _row(InlineKeyboardButton(
             f"{'🧠⚡ ADHD Mode: ON' if adhd_on else '🧠 ADHD Mode: off'}",
             callback_data="s|adhd_mode|" + ("0" if adhd_on else "1"))),
+        _row(InlineKeyboardButton(
+            f"📏 Sizes on buttons: {'ON' if sizes_on else 'off'}",
+            callback_data="s|show_sizes|" + ("0" if sizes_on else "1"))),
         _row(InlineKeyboardButton("🎨 Progress bar style", callback_data="nav|bars")),
         _row(InlineKeyboardButton("📜 History", callback_data="misc|history")),
         _row(InlineKeyboardButton("⚙️ Advanced (speed / proxy)", callback_data="nav|advanced")),

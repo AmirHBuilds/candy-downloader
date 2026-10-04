@@ -33,6 +33,7 @@ from telegram.error import TelegramError
 
 from config import OWNER_EMOJI
 from ui.steplog import step_line
+from downloader import cookie_health
 from downloader.dispatcher import download as dispatch_download, NoToolSucceeded
 from downloader.errors import JobCancelled
 from settings import access_control as ac
@@ -70,6 +71,12 @@ _UNSUPPORTED_MARKERS = ("unsupported url", "produced no files", "not a downloada
 _STREAMABLE_VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".webm"}
 
 
+def _plain_reason(text: str) -> str:
+    """First line of an error, short, as plain text (the batch summary escapes it)."""
+    text = (text or "").strip()
+    return text.splitlines()[0][:100] if text else ""
+
+
 @dataclass
 class Job:
     rid: str
@@ -97,6 +104,12 @@ class Job:
     # Progress that is still in flight after that is dropped, so a stale
     # "One moment…" can't overwrite the final message.
     terminal: bool = False
+    # Part of a Batch (playlist / several links)? Then the batch owns the status
+    # message and these jobs only report into it (see jobqueue/batch.py).
+    batch: Optional[object] = field(default=None, repr=False)
+    percent: Optional[float] = None       # latest progress, for the batch's shared message
+    outcome: str = ""                     # "success" | "failed" | "cancelled" once it has finished
+    error_text: str = ""                  # plain one-line reason when it failed
     # Status-message edit pump (see _safe_edit): the newest text waiting to be
     # sent, and whether a sender is already running.
     pending_edit: Optional[tuple] = field(default=None, repr=False)
@@ -121,7 +134,7 @@ class JobManager:
 
     async def enqueue(self, rid: str, user_id: int, chat_id: int, url: str, settings: dict,
                        status_message_id: int, is_photo: bool = False,
-                       force_document: bool = False, title: str = "") -> Job:
+                       force_document: bool = False, title: str = "", batch: object = None) -> Job:
         job = Job(
             rid=rid,
             user_id=user_id,
@@ -133,10 +146,12 @@ class JobManager:
             force_document=force_document,
             title=title,
             header="Queued",
+            batch=batch,
         )
         self._jobs_by_rid[rid] = job
         await self._queue.put(job)
-        asyncio.create_task(self._queued_heartbeat(job))
+        if batch is None:      # a batch has its own shared message; "waiting" is a count there
+            asyncio.create_task(self._queued_heartbeat(job))
         log.info("Enqueued job rid=%s force_document=%s quality=%s mode=%s",
                  rid, force_document, settings.get("quality"), settings.get("mode"))
         return job
@@ -204,6 +219,7 @@ class JobManager:
         return f"{base} ✄{len(sections)}" if sections else base
 
     def _log_history(self, job: Job, status: str) -> None:
+        job.outcome = status
         ac.log_download(job.user_id, job.url, status, job.settings.get("mode", ""),
                         self._history_quality(job.settings), job.title)
 
@@ -240,6 +256,10 @@ class JobManager:
         """Re-render without touching the steps - used when only the info line changed."""
         if job.terminal:
             return
+        if job.batch is not None:
+            job.batch.note(job)
+            await job.batch.refresh(self)
+            return
         await self._safe_edit(job, self._render(job), markup=queued_menu(job.rid, job.url))
 
     _ADHD_HEADERS = {
@@ -269,6 +289,10 @@ class JobManager:
                 job.steps.pop(0)
         else:
             job.steps[-1] = text
+        if job.batch is not None:
+            job.batch.note(job)
+            await job.batch.refresh(self)
+            return
         await self._safe_edit(job, self._render(job), markup=markup)
 
     def _drop_cached(self, rid: str) -> None:
@@ -370,12 +394,15 @@ class JobManager:
                 await self._emit(job, "Cancelled before it started", markup=cancelled_menu(job.rid, job.url))
                 self._jobs_by_rid.pop(job.rid, None)
                 self._queue.task_done()
+                await self._tell_batch(job)
                 continue
 
             job.task = asyncio.current_task()
             try:
                 await self._run_job(job)
                 self._log_history(job, "success")
+                if cookie_health.cookies_in_use(job.user_id, job.settings, job.url):
+                    cookie_health.watch.record_success(job.user_id)
             except (asyncio.CancelledError, JobCancelled):
                 job.terminal = True
                 self._log_history(job, "cancelled")
@@ -386,6 +413,7 @@ class JobManager:
                 self._log_history(job, "failed")
                 log.exception("Job %s failed", job.rid)
                 job.header = "Failed"
+                job.error_text = _plain_reason(exc.primary_error)
                 if all(any(m in v.lower() for m in _UNSUPPORTED_MARKERS) for v in exc.attempts.values()):
                     await self._emit(job, "None of our downloaders support this link.",
                                       markup=retry_menu(job.rid, job.url), sanitize=False)
@@ -393,17 +421,44 @@ class JobManager:
                     cleaned = _sanitize_step(exc.primary_error, job.url)
                     await self._emit(job, messages.generic_error(cleaned), markup=retry_menu(job.rid, job.url),
                                       sanitize=False)
+                await self._warn_if_cookies_died(job, " ".join([exc.primary_error, *exc.attempts.values()]))
             except Exception as exc:  # noqa: BLE001
                 job.terminal = True
                 self._log_history(job, "failed")
                 log.exception("Job %s failed", job.rid)
                 job.header = "Failed"
+                job.error_text = _plain_reason(str(exc))
                 cleaned = _sanitize_step(str(exc), job.url)
                 await self._emit(job, messages.generic_error(cleaned), markup=retry_menu(job.rid, job.url), sanitize=False)
+                await self._warn_if_cookies_died(job, str(exc))
             finally:
                 job.terminal = True
                 self._jobs_by_rid.pop(job.rid, None)
                 self._queue.task_done()
+                await self._tell_batch(job)
+
+    async def _tell_batch(self, job: Job) -> None:
+        """A job that belongs to a batch reports its outcome there. Never lets a
+        problem in the batch's message stop the worker loop."""
+        if job.batch is None:
+            return
+        try:
+            await job.batch.job_finished(self, job)
+        except Exception:  # noqa: BLE001
+            log.exception("Batch update failed for job %s", job.rid)
+
+    async def _warn_if_cookies_died(self, job: Job, error_text: str) -> None:
+        """After a failed download: if it looks like a sign-in problem with the
+        cookies this person has set up, tell them - once, in a separate
+        message so it isn't lost when the status message changes."""
+        if not cookie_health.cookies_in_use(job.user_id, job.settings, job.url):
+            return
+        if not cookie_health.watch.record_failure(job.user_id, error_text):
+            return
+        try:
+            await self.bot.send_message(job.chat_id, cookie_health.COOKIE_ALERT, parse_mode=ParseMode.HTML)
+        except TelegramError as exc:
+            log.warning("Could not send the cookie warning to %s: %s", job.user_id, exc)
 
     async def _run_job(self, job: Job) -> None:
         job.header = "Downloading"
@@ -435,6 +490,9 @@ class JobManager:
 
             if job.terminal:
                 return
+
+            if percent is not None:
+                job.percent = percent
 
             if size is not None:
                 job.info["size"] = size
@@ -512,7 +570,7 @@ class JobManager:
                     # "Title [01-30-00–01-32-00]" -> "Title": the range isn't a title
                     job.title = re.sub(r"\s*\[[^\]]*\]$", "", job.title) or job.title
 
-            if job.settings.get("mode") in ("video", "audio"):
+            if job.settings.get("mode") in ("video", "audio") and job.batch is None:
                 self._drop_cached(job.rid)
                 for f in files:
                     if f.suffix.lower() not in _NON_MEDIA_EXTS:
@@ -557,6 +615,10 @@ class JobManager:
                 audio_note = "\n\nWant it sent as a plain file instead?"
             if multi and not is_last:
                 video_note = audio_note = ""
+            if job.batch is not None:
+                # "Send as file instead" re-runs ONE job from its own message and cache -
+                # neither exists for a batch item, so don't offer a dead-end button.
+                send_menu, video_note, audio_note = sent_menu(job.url), "", ""
 
             if suffix in _STREAMABLE_VIDEO_EXTS:
                 await self._emit(job, f"Sending {size_mb:.1f} MB...", markup=None)
@@ -584,10 +646,11 @@ class JobManager:
                     await self.bot.send_document(job.chat_id, input_file, caption=caption,
                                                   parse_mode=ParseMode.HTML, reply_markup=sent_menu(job.url),
                                                   read_timeout=120, write_timeout=120, connect_timeout=60)
-        try:
-            await self.bot.delete_message(job.chat_id, job.status_message_id)
-        except TelegramError:
-            pass
+        if job.batch is None:                    # the shared message belongs to the batch
+            try:
+                await self.bot.delete_message(job.chat_id, job.status_message_id)
+            except TelegramError:
+                pass
 
     async def _safe_edit(self, job: Job, text: str, markup: InlineKeyboardMarkup | None = None) -> None:
         """Edit the job's status message - strictly in order, newest wins.

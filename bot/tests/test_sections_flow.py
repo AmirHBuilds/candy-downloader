@@ -405,6 +405,179 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         edit = await self.tap(f"dl|redo|{RID}")
         self.assertIn("✄ 1 section — only this will be downloaded", edit["text"])
 
+    # ------------------------------------------------------------ chapters
+    CHAPTERS = [("Intro", 0.0, 60.0), ("Main part", 60.0, 3000.0), ("Outro", 3000.0, float(DURATION))]
+
+    def with_chapters(self, chapters=None):
+        main.pending_probes[RID] = ProbeResult(ok=True, title="My long video", heights=[1080, 720, 480],
+                                               has_audio=True, duration=DURATION,
+                                               chapters=list(chapters or self.CHAPTERS))
+
+    async def test_the_chapters_button_only_exists_when_the_video_has_chapters(self):
+        edit = await self.tap(f"dl|sec|open|{RID}")
+        self.assertNotIn("Chapters", labels(edit["markup"]))
+        edits_before = len(self.bot.edits)
+        await self.tap(f"dl|sec|chap|0|{RID}")                      # a forged button: nothing to show, nothing happens
+        self.assertEqual(len(self.bot.edits), edits_before)
+        self.with_chapters()
+        edit = await self.tap(f"dl|sec|open|{RID}")
+        self.assertEqual(labels(edit["markup"])[:2], ["+ Add section", "Chapters"])
+
+    async def test_chapters_screen_lists_them_with_start_times(self):
+        self.with_chapters()
+        edit = await self.tap(f"dl|sec|chap|0|{RID}")
+        self.assertIn("✄ <b>Chapters</b>", edit["text"])
+        self.assertEqual(labels(edit["markup"]), ["0:00 · Intro", "1:00 · Main part", "50:00 · Outro", "← Back"])
+
+    async def test_tapping_a_chapter_adds_it_as_a_section_and_tapping_again_removes_it(self):
+        self.with_chapters()
+        await self.tap(f"dl|sec|chap|0|{RID}")
+        edit = await self.tap(f"dl|sec|ch|1|0|{RID}")
+        self.assertIn("✓ 1:00 · Main part", labels(edit["markup"]))
+        self.assertEqual([(r.start, r.end) for r in self.draft.rows], [(60.0, 3000.0)])     # filled the empty row, no blank left
+        edit = await self.tap(f"dl|sec|ch|2|0|{RID}")
+        self.assertEqual(len(self.draft.rows), 2)
+        self.assertEqual(self.draft.active(DURATION), [(60.0, 3000.0), (3000.0, float(DURATION))])
+        edit = await self.tap(f"dl|sec|ch|1|0|{RID}")
+        self.assertNotIn("✓ 1:00 · Main part", labels(edit["markup"]))
+        self.assertEqual(self.draft.active(DURATION), [(3000.0, float(DURATION))])
+
+    async def test_chapters_and_typed_sections_mix_and_back_lists_them(self):
+        self.with_chapters()
+        await self.fill(0, "start", "10:00")
+        await self.fill(0, "end", "11:00")
+        await self.tap(f"dl|sec|chap|0|{RID}")
+        await self.tap(f"dl|sec|ch|0|0|{RID}")
+        edit = await self.tap(f"dl|sec|back|{RID}")
+        self.assertIn("✄ 2 sections", edit["text"])
+        self.assertIn("1. 10:00 – 11:00", edit["text"])
+        self.assertIn("2. 0:00 – 1:00", edit["text"])
+
+    async def test_chapters_are_paged_and_the_pages_navigate(self):
+        self.with_chapters([(f"Chapter {i}", i * 100.0, i * 100.0 + 90) for i in range(20)])
+        edit = await self.tap(f"dl|sec|chap|0|{RID}")
+        self.assertIn("Page 1 of 3", edit["text"])
+        self.assertEqual(len([l for l in labels(edit["markup"]) if "Chapter" in l]), 8)
+        self.assertIn("Next ▶", labels(edit["markup"]))
+        self.assertNotIn("◀ Prev", labels(edit["markup"]))
+        edit = await self.tap(f"dl|sec|chap|2|{RID}")
+        self.assertIn("Page 3 of 3", edit["text"])
+        self.assertEqual(len([l for l in labels(edit["markup"]) if "Chapter" in l]), 4)
+        self.assertIn("◀ Prev", labels(edit["markup"]))
+        self.assertNotIn("Next ▶", labels(edit["markup"]))
+        edit = await self.tap(f"dl|sec|ch|17|2|{RID}")                      # a chapter on the last page
+        self.assertIn("✓ ", " ".join(labels(edit["markup"])))
+        self.assertIn("Page 3 of 3", edit["text"])                         # stays on the page
+        edit = await self.tap(f"dl|sec|chap|99|{RID}")                      # out-of-range page is clamped
+        self.assertIn("Page 3 of 3", edit["text"])
+
+    async def test_the_section_limit_shows_a_notice_on_the_chapters_screen(self):
+        self.with_chapters([(f"C{i}", i * 100.0, i * 100.0 + 90) for i in range(MAX_SECTIONS + 2)])
+        await self.tap(f"dl|sec|chap|0|{RID}")
+        for i in range(MAX_SECTIONS):
+            await self.tap(f"dl|sec|ch|{i}|0|{RID}")
+        edit = await self.tap(f"dl|sec|ch|{MAX_SECTIONS}|1|{RID}")
+        self.assertIn(str(MAX_SECTIONS), edit["text"])
+        self.assertEqual(len(self.draft.rows), MAX_SECTIONS)
+
+    async def test_a_stale_chapter_button_is_handled(self):
+        self.with_chapters()
+        edit = await self.tap(f"dl|sec|ch|9|0|{RID}")
+        self.assertIn("no longer exists", edit["text"])
+
+    async def test_chapter_buttons_fit_the_64_byte_limit_and_long_titles_are_cut(self):
+        self.with_chapters([("x" * 80, 0.0, 60.0)] * 1)
+        edit = await self.tap(f"dl|sec|chap|0|{RID}")
+        for _, data in buttons(edit["markup"]):
+            self.assertLessEqual(len(data.encode()), 64)
+        self.assertLessEqual(len(labels(edit["markup"])[0]), 40)
+        self.assertTrue(labels(edit["markup"])[0].endswith("…"))
+
+    # ------------------------------------------------------------ one MP3 per chapter
+    async def test_the_split_button_appears_in_more_options_when_there_are_chapters(self):
+        self.with_chapters()
+        edit = await self.tap(f"dl|moreq|{RID}")
+        self.assertIn("♪ MP3 · 3 tracks", labels(edit["markup"]))
+        self.assertIn(f"dl|audio|mp3split|{RID}", datas(edit["markup"]))
+
+    async def test_the_split_button_is_hidden_without_enough_chapters_or_with_too_many(self):
+        for chapters in ([], [("Only", 0.0, 60.0)], [(f"C{i}", i * 10.0, i * 10.0 + 9) for i in range(51)]):
+            with self.subTest(count=len(chapters)):
+                if chapters:
+                    self.with_chapters(chapters)
+                else:
+                    main.pending_probes[RID] = ProbeResult(ok=True, heights=[720], has_audio=True, duration=DURATION)
+                edit = await self.tap(f"dl|moreq|{RID}")
+                self.assertFalse([l for l in labels(edit["markup"]) if "tracks" in l])
+
+    async def test_the_split_button_is_hidden_while_sections_are_chosen(self):
+        self.with_chapters()
+        await self.add_section(end="2:00")
+        edit = await self.tap(f"dl|moreq|{RID}")
+        self.assertFalse([l for l in labels(edit["markup"]) if "tracks" in l])
+
+    async def test_the_split_button_also_sits_on_an_audio_only_sources_menu(self):
+        main.pending_probes[RID] = ProbeResult(ok=True, heights=[], has_audio=True, duration=DURATION,
+                                               chapters=list(self.CHAPTERS))
+        self.assertIn("♪ MP3 · 3 tracks", labels(main._main_menu_for(RID, main.pending_probes[RID], USER)))
+
+    async def test_the_split_button_shows_an_estimated_size(self):
+        main.pending_probes[RID] = ProbeResult(ok=True, heights=[720], has_audio=True, duration=DURATION,
+                                               chapters=list(self.CHAPTERS), sizes={"mp3": 86_000_000})
+        self.assertIn("♪ MP3 · 3 tracks ~86MB", labels(main._more_menu_for(RID, main.pending_probes[RID], USER)))
+
+    async def test_tapping_it_downloads_mp3_and_asks_for_the_split(self):
+        self.with_chapters()
+        await self.tap(f"dl|audio|mp3split|{RID}")
+        settings = self.jobs.enqueued[0]["settings"]
+        self.assertEqual((settings["mode"], settings["audio_format"], settings["split_chapters"]), ("audio", "mp3", True))
+        self.assertNotIn("sections", settings)
+
+    async def test_an_ordinary_mp3_button_does_not_split(self):
+        self.with_chapters()
+        await self.tap(f"dl|audio|mp3|{RID}")
+        self.assertNotIn("split_chapters", self.jobs.enqueued[0]["settings"])
+
+    async def test_a_stale_split_button_does_not_override_chosen_sections(self):
+        self.with_chapters()
+        await self.add_section(end="2:00")
+        await self.tap(f"dl|audio|mp3split|{RID}")                  # a button from before the sections were chosen
+        settings = self.jobs.enqueued[0]["settings"]
+        self.assertEqual(settings["sections"], [(0.0, 120.0)])
+        self.assertNotIn("split_chapters", settings)
+
+    # ------------------------------------------------------------ ?t= links
+    def test_a_start_time_in_the_link_prefills_a_section_to_the_end(self):
+        main._prefill_start_time(RID, "https://youtu.be/abc?t=1h30m", main.pending_probes[RID])
+        self.assertEqual(main.pending_sections[RID].active(DURATION), [(5400.0, float(DURATION))])
+        self.assertIn("✄ 1 section", main._quality_caption(RID, main.pending_probes[RID]))
+        self.assertIn("1:30:00 – 1:43:14", main._quality_caption(RID, main.pending_probes[RID]))
+
+    def test_no_prefill_for_plain_links_other_sites_or_times_past_the_end(self):
+        probe = main.pending_probes[RID]
+        for url in ("https://youtu.be/abc", "https://vimeo.com/1?t=90", "https://youtu.be/abc?t=0",
+                    "https://youtu.be/abc?t=9999999", "https://youtu.be/abc?t=junk"):
+            with self.subTest(url=url):
+                main._prefill_start_time(RID, url, probe)
+                self.assertNotIn(RID, main.pending_sections)
+        main._prefill_start_time(RID, "https://youtu.be/abc?t=90", ProbeResult(ok=True, duration=None))
+        self.assertNotIn(RID, main.pending_sections)
+
+    async def test_a_prefilled_link_downloads_from_that_point_and_can_be_cleared(self):
+        main._prefill_start_time(RID, "https://youtu.be/abc?t=5400", main.pending_probes[RID])
+        edit = await self.tap(f"dl|moreq|{RID}")
+        self.assertIn("✄ Sections (1) ✓", labels(edit["markup"]))
+        await self.tap(f"dl|video|720p|{RID}")
+        self.assertEqual(self.jobs.enqueued[0]["settings"]["sections"], [(5400.0, float(DURATION))])
+
+    async def test_removing_the_prefilled_section_gives_back_the_whole_video(self):
+        main._prefill_start_time(RID, "https://youtu.be/abc?t=5400", main.pending_probes[RID])
+        await self.tap(f"dl|sec|del|0|{RID}")
+        edit = await self.tap(f"dl|sec|back|{RID}")
+        self.assertEqual(edit["text"], "My long video")
+        await self.tap(f"dl|video|best|{RID}")
+        self.assertNotIn("sections", self.jobs.enqueued[0]["settings"])
+
     # ------------------------------------------------------------ housekeeping
     async def test_expired_link_says_so_instead_of_crashing(self):
         main.pending_links.clear()
