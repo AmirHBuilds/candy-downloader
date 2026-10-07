@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from config import TMP_DIR, CACHE_DIR
+from utils.procs import kill_processes_under
 
 log = logging.getLogger("candy.cleanup")
 
@@ -46,5 +47,10 @@ def job_workspace():
     try:
         yield workspace
     finally:
+        # Whatever the job was running (ffmpeg merging/converting, aria2c) must not outlive it:
+        # an orphan can sit at 0% CPU holding hundreds of MB.
+        stray = kill_processes_under(workspace)
+        if stray:
+            log.info("Reaped %d stray process(es) left over from %s", stray, workspace.name)
         shutil.rmtree(workspace, ignore_errors=True)
 

@@ -53,6 +53,10 @@ async def download(url: str, workspace: Path, settings: dict, user_id: int,
 
     Raises NoToolSucceeded if every candidate fails."""
     order = tool_order_for(url)
+    if settings.get("prefer_ytdlp") and "ytdlp" in order:
+        # The person chose a quality / time range / subtitles from a yt-dlp preview (on a site that
+        # normally tries gallery-dl first, like X): honour that by trying yt-dlp first.
+        order = ["ytdlp"] + [tool for tool in order if tool != "ytdlp"]
     attempts: dict[str, str] = {}
 
     if settings.get("sections"):

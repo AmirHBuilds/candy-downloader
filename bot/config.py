@@ -43,3 +43,15 @@ DB_PATH = os.path.join(DATA_DIR, "candy.db")
 # Telegram's own hard ceiling regardless of local server, for sanity checks
 MAX_FILE_SIZE_BYTES = 2 * 1024 * 1024 * 1024  # 2GB
 
+
+# --- YouTube routing (see downloader/proxy.py) -------------------------------------------------
+# Comma-separated proxy URLs used ONLY for YouTube, e.g. socks5h://warp:1080 (the bundled WARP container).
+# Empty = never use a proxy. socks5h makes the proxy do the DNS lookup too.
+YT_PROXIES = [p.strip() for p in os.getenv("YT_PROXIES", "").split(",") if p.strip()]
+# auto   = go direct; if YouTube blocks this server's address, switch to the proxy for a while
+# always = always use the proxy when it is reachable
+# off    = never
+YT_PROXY_MODE = os.getenv("YT_PROXY_MODE", "auto").strip().lower()
+# Politeness for the host machine: child processes (ffmpeg!) inherit this, so a conversion can't starve
+# your PC. 0 = off; 10 is "low priority".
+PROCESS_NICE = int(os.getenv("PROCESS_NICE", "10"))

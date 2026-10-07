@@ -1,10 +1,11 @@
 import asyncio
+import contextvars
 import logging
 import os
 import re
 import shutil
-import signal
 import time
+from collections import deque
 from pathlib import Path
 from typing import Callable
 
@@ -13,10 +14,48 @@ import yt_dlp
 from config import DATA_DIR, BGUTIL_POT_URL
 from downloader.cookies import apply_cookies, cookie_file_for
 from downloader.errors import JobCancelled
+from downloader.proxy import policy
 from downloader.music import MAX_TRACKS, clean_title, music_tags, polish_mp3, split_by_chapters, valid_chapters
+from utils.procs import kill_processes_under
 from downloader.sections import SectionError, filename_tag, format_section, validate_sections
 
 log = logging.getLogger("candy.ytdlp")
+
+_CAPTURE: contextvars.ContextVar = contextvars.ContextVar("ytdlp_capture", default=None)
+_FFMPEG_HINTS = ("ffmpeg", "error", "invalid", "unable", "no such", "conversion", "codec", "failed", "unknown encoder")
+_LONG_URL = re.compile(r"https?://\S{60,}")
+_CREDENTIALS = re.compile(r"(?<=://)[^/\s:@]+:[^/\s@]+@")
+
+
+def _scrub(line: str) -> str:
+    """For logs people paste around: no signed media URLs, no user:password@ in proxy URLs."""
+    return _CREDENTIALS.sub("", _LONG_URL.sub("<url>", str(line)))
+
+
+class _Capture:
+    """yt-dlp's own log, kept in memory. Its one-line error ("Conversion failed!") hides ffmpeg's
+    real complaint, which only appears in the verbose log - so run verbose, keep the last few
+    hundred lines, and print only the relevant ones when something goes wrong."""
+
+    def __init__(self):
+        self.lines: deque = deque(maxlen=300)
+
+    def debug(self, message):
+        self.lines.append(str(message))
+
+    info = debug
+
+    def warning(self, message):
+        self.lines.append(str(message))
+        log.info("yt-dlp warning: %s", _scrub(message))
+
+    def error(self, message):
+        self.lines.append(str(message))
+        log.warning("yt-dlp: %s", _scrub(message))
+
+    def tail(self, limit: int = 12) -> list[str]:
+        relevant = [_scrub(line) for line in self.lines if any(h in line.lower() for h in _FFMPEG_HINTS)]
+        return relevant[-limit:]
 
 # percent, speed, eta, stage-label-override (used during post-processing,
 # when yt-dlp's own download-progress hook goes silent for a while)
@@ -173,6 +212,18 @@ def _build_opts(url: str, workspace: Path, s: dict, user_id: int, progress_hook,
     else:
         opts["merge_output_format"] = "mp4"
 
+    sub_langs = s.get("sub_langs") or []
+    if sub_langs and s["mode"] == "video":
+        mode = s.get("sub_mode", "embed")
+        # Human-made subtitles where they exist, YouTube's auto-generated ones otherwise (per language).
+        opts.update(writesubtitles=True, writeautomaticsub=True, subtitleslangs=list(sub_langs),
+                    subtitlesformat="srt/vtt/best")
+        chain = [{"key": "FFmpegSubtitlesConvertor", "format": "srt", "when": "before_dl"}]   # one format everywhere
+        if mode in ("embed", "both"):
+            # already_have_subtitle keeps the .srt files next to the video ("both"); otherwise they are removed once embedded.
+            chain.append({"key": "FFmpegEmbedSubtitle", "already_have_subtitle": mode == "both"})
+        opts["postprocessors"][0:0] = chain
+
     if s["embed_thumbnail"]:
         opts["writethumbnail"] = True
         opts["postprocessors"].append({"key": "EmbedThumbnail"})
@@ -197,6 +248,10 @@ def _build_opts(url: str, workspace: Path, s: dict, user_id: int, progress_hook,
             "remove_sponsor_segments": ["sponsor"],
         })
 
+    capture = _CAPTURE.get()
+    if capture is not None:
+        opts["logger"] = capture
+        opts["verbose"] = True            # goes to capture.debug, never to the console
     return opts
 
 
@@ -215,8 +270,150 @@ def _looks_like_bot_check(error: Exception) -> bool:
     return any(marker in text for marker in _SIGN_IN_MARKERS)
 
 
+def _add_note(settings: dict, text: str) -> None:
+    """Something to tell the person once the files have been delivered (job_manager sends these)."""
+    settings.setdefault("delivery_notes", []).append(text)
+
+
+def _is_postprocessing_failure(exc: Exception) -> bool:
+    # yt-dlp reports these as "ERROR: Postprocessing: <what ffmpeg said>". Deliberately NOT a loose
+    # "postprocessing"/"ffmpeg" match: our own timeout message says "postprocessing step", and a
+    # timeout must not start a chain of retries that could each take as long again.
+    text = str(exc).lower()
+    return "postprocessing:" in text or "conversion failed" in text
+
+
+def _clear(workspace: Path) -> None:
+    for leftover in workspace.iterdir():
+        shutil.rmtree(leftover, ignore_errors=True) if leftover.is_dir() else leftover.unlink(missing_ok=True)
+
+
 async def download(url: str, workspace: Path, settings: dict, user_id: int,
-                    progress_cb: ProgressCB, cancel_event: asyncio.Event | None = None) -> list[Path]:
+                   progress_cb: ProgressCB, cancel_event: asyncio.Event | None = None) -> list[Path]:
+    """The real entry point: picks the route (direct, or via the proxy when YouTube is blocking this
+    server's address - see downloader/proxy.py) and retries once on a different route if the first
+    one is refused. Someone's own proxy setting bypasses all of it."""
+    if settings.get("proxy"):
+        return await _download_resilient(url, workspace, settings, user_id, progress_cb, cancel_event)
+    proxy = policy.route(url)
+    for attempt in (1, 2):
+        trial = {**settings, "proxy": proxy} if proxy else settings
+        try:
+            files = await _download_resilient(url, workspace, trial, user_id, progress_cb, cancel_event)
+        except JobCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            if attempt == 1 and policy.report_failure(url, proxy, str(exc)):
+                progress_cb(None, None, None, "Switching route - YouTube blocked this address")
+                _clear(workspace)
+                proxy = policy.route(url)
+                continue
+            raise
+        if trial is not settings:
+            for note in trial.get("delivery_notes", []):
+                _add_note(settings, note)
+        policy.report_success(url, proxy)
+        return files
+
+
+async def _download_resilient(url: str, workspace: Path, settings: dict, user_id: int,
+                              progress_cb: ProgressCB, cancel_event: asyncio.Event | None = None) -> list[Path]:
+    """The download itself is the point; cover art, subtitles and format conversion are
+    extras, so when a post-processing step fails the download is retried with fewer extras (and the person
+    is told) rather than being thrown away. ffmpeg's real error is logged either way."""
+    capture = _Capture()
+    token = _CAPTURE.set(capture)
+    try:
+        try:
+            return await _download_with_subtitles(url, workspace, settings, user_id, progress_cb, cancel_event)
+        except JobCancelled:
+            raise
+        except Exception as first:  # noqa: BLE001
+            if not _is_postprocessing_failure(first):
+                raise
+            log.warning("Post-processing failed for %s: %s | ffmpeg said: %s", url, first, capture.tail() or "(nothing captured)")
+            fallbacks = []
+            if settings.get("embed_thumbnail", True):
+                fallbacks.append(({"embed_thumbnail": False},
+                                  "◧ Cover art couldn't be added this time, so the file was sent without it."))
+            if settings.get("mode") == "audio" and settings.get("audio_format") == "opus":
+                fallbacks.append(({"embed_thumbnail": False, "audio_format": "mp3"},
+                                  "◧ Opus conversion failed on this server, so this one is an MP3."))
+            for override, note in fallbacks:
+                _clear(workspace)
+                try:
+                    files = await _download_with_subtitles(url, workspace, {**settings, **override}, user_id,
+                                                           progress_cb, cancel_event)
+                except JobCancelled:
+                    raise
+                except Exception as again:  # noqa: BLE001
+                    if not _is_postprocessing_failure(again):
+                        raise
+                    log.warning("Still failing with %s: %s | ffmpeg said: %s", override, again, capture.tail())
+                    continue
+                _add_note(settings, note)
+                return files
+            raise first
+    finally:
+        _CAPTURE.reset(token)
+
+
+async def _download_with_subtitles(url: str, workspace: Path, settings: dict, user_id: int,
+                                   progress_cb: ProgressCB, cancel_event: asyncio.Event | None = None) -> list[Path]:
+    """Subtitles are the one thing that can break an otherwise fine download
+    (a postprocessor yt-dlp doesn't like, a subtitle host that refuses), so when they were asked
+    for, a failure is retried once WITHOUT them - the video matters more - and the person is told."""
+    if not settings.get("sub_langs") or settings.get("sections"):    # (clips never carry subtitles)
+        return await _download_main(url, workspace, settings, user_id, progress_cb, cancel_event)
+    try:
+        files = await _download_main(url, workspace, settings, user_id, progress_cb, cancel_event)
+    except JobCancelled:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        if _looks_like_bot_check(exc):
+            raise                                    # not a subtitle problem
+        log.warning("Download with subtitles failed (%s); retrying without them", exc)
+        _add_note(settings, "◧ Subtitles couldn't be added this time, so the video was sent without them.")
+        for leftover in workspace.iterdir():
+            shutil.rmtree(leftover, ignore_errors=True) if leftover.is_dir() else leftover.unlink(missing_ok=True)
+        plain = {k: v for k, v in settings.items() if k not in ("sub_langs", "sub_mode")}
+        return await _download_main(url, workspace, plain, user_id, progress_cb, cancel_event)
+    return await _verify_subtitles(files, settings)
+
+
+async def _subtitle_streams(path: Path) -> int:
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error", "-select_streams", "s", "-show_entries", "stream=index", "-of", "csv=p=0", str(path),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await proc.communicate()
+        return len([line for line in out.decode().splitlines() if line.strip()])
+    except OSError:
+        return -1                                     # can't tell: don't claim anything is missing
+
+
+async def _verify_subtitles(files: list[Path], settings: dict) -> list[Path]:
+    """yt-dlp only WARNS when a subtitle track can't be fetched (YouTube rate-limits them),
+    so the video arrives without subtitles and nobody knows. Check, and say so."""
+    wanted = list(settings["sub_langs"])
+    mode = settings.get("sub_mode", "embed")
+    video = next((f for f in files if f.suffix.lower() in (".mp4", ".mkv", ".webm", ".mov")), None)
+    srt_count = sum(1 for f in files if f.suffix.lower() == ".srt")
+    embedded = await _subtitle_streams(video) if video and mode in ("embed", "both") else None
+
+    got = {"embed": embedded, "file": srt_count, "both": max(embedded or 0, srt_count)}[mode]
+    if got == -1:
+        return files
+    if got == 0:
+        _add_note(settings, "◧ No subtitles could be fetched (YouTube may be limiting subtitle requests). "
+                            "The video was sent without them.")
+    elif got < len(wanted):
+        _add_note(settings, f"◧ Only {got} of {len(wanted)} subtitle languages could be fetched.")
+    return files
+
+
+async def _download_main(url: str, workspace: Path, settings: dict, user_id: int,
+                         progress_cb: ProgressCB, cancel_event: asyncio.Event | None = None) -> list[Path]:
     """Runs yt-dlp in a worker thread (it's blocking) and reports progress
     back onto the asyncio event loop via progress_cb.
 
@@ -342,16 +539,34 @@ async def download(url: str, workspace: Path, settings: dict, user_id: int,
             except OSError:
                 pass
 
+    async def reap_when_cancelled() -> None:
+        # yt-dlp only notices a cancel at its next progress callback, which never comes while ffmpeg
+        # is merging/converting - so stop that ffmpeg (repeatedly: yt-dlp may start another) ourselves.
+        while True:
+            await asyncio.sleep(1)
+            if cancel_event is not None and cancel_event.is_set():
+                kill_processes_under(workspace)
+
     async def run_with_timeout(opts: dict) -> list[Path]:
+        reaper = asyncio.create_task(reap_when_cancelled())
         try:
             return await asyncio.wait_for(
                 loop.run_in_executor(None, run, opts), timeout=DOWNLOAD_TIMEOUT_SECONDS,
             )
         except asyncio.TimeoutError:
+            kill_processes_under(workspace)      # the thread can't be stopped, but its ffmpeg can
             raise RuntimeError(
                 f"Timed out after {DOWNLOAD_TIMEOUT_SECONDS // 60} minutes - "
                 "something (likely a postprocessing step) got stuck."
             )
+        except yt_dlp.utils.DownloadCancelled:
+            raise
+        except Exception:
+            # Killing ffmpeg makes yt-dlp fail with a generic error: if that is why we are here, it's a cancel.
+            _raise_if_cancelled(cancel_event)
+            raise
+        finally:
+            reaper.cancel()
 
     try:
         results = await run_with_timeout(base_opts)
@@ -385,6 +600,13 @@ async def download(url: str, workspace: Path, settings: dict, user_id: int,
     # filter out leftover thumbnail/metadata sidecar files, keep final media
     media = [p for p in results if p.suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp", ".part", ".ytdl"}]
     files = media or results
+    try:
+        chosen = (seen_info.get("info") or {}).get("requested_formats") or [seen_info.get("info") or {}]
+        log.info("Size check: formats %s, announced %s, actually fetched %s bytes",
+                 "+".join(str(f.get("format_id")) for f in chosen),
+                 [f.get("filesize") or f.get("filesize_approx") for f in chosen], sum(stream_sizes.values()))
+    except Exception:  # noqa: BLE001
+        pass
     if settings.get("mode") == "audio":
         files = await _finish_audio(files, seen_info.get("info") or {}, settings, progress_cb, cancel_event)
     return files
@@ -455,26 +677,8 @@ def _raise_if_cancelled(cancel_event: asyncio.Event | None) -> None:
 
 
 def _kill_ffmpeg_under(workspace: Path) -> int:
-    """SIGKILL every ffmpeg whose command line mentions this job's workspace.
-
-    That is how a clip download is cancelled: the transfer runs inside an
-    ffmpeg child of yt-dlp that no hook can reach. The workspace path is
-    unique per job (see utils.cleanup.job_workspace), so other jobs' ffmpegs
-    are never touched. Reads /proc, so it is a harmless no-op off Linux."""
-    needle = str(workspace).rstrip("/") + "/"
-    killed = 0
-    for cmdline in Path("/proc").glob("[0-9]*/cmdline"):
-        try:
-            argv = cmdline.read_bytes().split(b"\0")
-            if not argv or b"ffmpeg" not in os.path.basename(argv[0]):
-                continue
-            if needle.encode() not in b" ".join(argv):
-                continue
-            os.kill(int(cmdline.parent.name), signal.SIGKILL)
-            killed += 1
-        except (OSError, ValueError):
-            continue   # process vanished, or not ours to kill
-    return killed
+    """Kept under this name for the clip code; see utils/procs.py."""
+    return kill_processes_under(workspace)
 
 
 def _tidy_clip_name(path: Path) -> Path:
@@ -737,6 +941,7 @@ async def _download_sections(url: str, workspace: Path, settings: dict, user_id:
         clip_dir = workspace / f"clip{index:02d}"
         clip_dir.mkdir(exist_ok=True)
         clip_settings = dict(settings)
+        clip_settings.pop("sub_langs", None)        # subtitles are downloaded for the WHOLE video: out of sync on a clip
         clip_settings["filename_template"] = f"%(title).60B [{filename_tag(start, end)}].%(ext)s"
         base_opts = _build_opts(url, clip_dir, clip_settings, user_id, _check_cancelled_hook, _check_cancelled_hook)
         # Cut exactly where asked (re-encodes just this small piece) instead

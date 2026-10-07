@@ -17,6 +17,7 @@ import yt_dlp
 
 from config import BGUTIL_POT_URL
 from downloader.cookies import apply_cookies, cookie_file_for
+from downloader.proxy import policy
 from settings.user_settings import get_settings
 
 log = logging.getLogger("candy.playlist")
@@ -64,6 +65,17 @@ def wants_single_video(url: str) -> bool:
     if parsed.path.startswith(("/shorts/", "/live/", "/embed/")):
         return True
     return "v" in parse_qs(parsed.query)
+
+
+def looks_like_playlist(url: str) -> bool:
+    """A link that is plainly a YouTube playlist (/playlist?list=..., or watch?list=... with no video).
+    These skip the single-video preview entirely and go straight to the item list."""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").lower()
+    return _is_youtube(host) and "list" in parse_qs(parsed.query) and not wants_single_video(url)
 
 
 def entry_url(entry: dict) -> str | None:
@@ -117,9 +129,28 @@ def _base_opts(user_id: int | None, **extra) -> tuple[dict, bool]:
 
 
 async def list_playlist(url: str, user_id: int | None = None, limit: int = MAX_LISTED) -> tuple[str, list[Entry]]:
-    """(playlist title, entries). Flat extraction: titles and durations only,
-    without opening every video, so even a long playlist lists in seconds."""
+    """(playlist title, entries), routed like the preview (direct, or via the proxy when YouTube is blocking
+    this address); a block-type failure is retried once on the new route."""
+    explicit = (get_settings(user_id).get("proxy") if user_id is not None else "") or ""
+    proxy = explicit or policy.route(url)
+    try:
+        result = await _list_once(url, user_id, limit, proxy)
+    except ListingError as exc:
+        if explicit or not policy.report_failure(url, proxy, str(exc.__cause__ or "")):
+            raise
+        proxy = policy.route(url)
+        result = await _list_once(url, user_id, limit, proxy)
+    if not explicit:
+        policy.report_success(url, proxy)
+    return result
+
+
+async def _list_once(url: str, user_id: int | None, limit: int, proxy: str | None) -> tuple[str, list[Entry]]:
+    """Flat extraction: titles and durations only, without opening every video, so even a long
+    playlist lists in seconds."""
     opts, with_cookies = _base_opts(user_id, extract_flat="in_playlist", playlistend=limit)
+    if proxy:
+        opts["proxy"] = proxy
 
     def run() -> dict:
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -134,7 +165,7 @@ async def list_playlist(url: str, user_id: int | None = None, limit: int = MAX_L
         raise ListingError("The playlist took too long to load.")
     except Exception as exc:  # noqa: BLE001
         log.info("Listing %s failed: %s: %s", url, type(exc).__name__, exc)
-        raise ListingError("Couldn't read this playlist.")
+        raise ListingError("Couldn't read this playlist.") from exc
     entries = entries_from_info(info or {}, limit)
     if not entries:
         raise ListingError("That playlist has nothing downloadable in it.")

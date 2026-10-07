@@ -40,6 +40,16 @@ def _clip_row(probe: ProbeResult | None, rid: str, section_count: int = 0) -> li
     return [[InlineKeyboardButton(label, callback_data=f"dl|sec|open|{rid}")]]
 
 
+def _subtitles_row(probe: ProbeResult | None, rid: str, section_count: int,
+                   subtitle_count: int) -> list[list[InlineKeyboardButton]]:
+    """Subtitles for a video. Not offered with time-range sections: yt-dlp downloads
+    the subtitles for the WHOLE video, so on a clip they would be out of sync."""
+    if probe is None or not probe.subtitles or section_count:
+        return []
+    label = f"◧ Subtitles ({subtitle_count}) ✓" if subtitle_count else "◧ Subtitles"
+    return [[InlineKeyboardButton(label, callback_data=f"dl|sub|open|0|{rid}")]]
+
+
 def _split_row(probe: ProbeResult | None, rid: str, section_count: int,
                size_labels: dict | None) -> list[list[InlineKeyboardButton]]:
     """One MP3 per chapter, for a long mix or an album in one video. Not offered
@@ -92,7 +102,7 @@ def video_menu(probe: ProbeResult, rid: str, size_labels: dict | None = None) ->
 
 
 def extended_video_menu(probe: ProbeResult, rid: str, section_count: int = 0,
-                        size_labels: dict | None = None) -> InlineKeyboardMarkup:
+                        size_labels: dict | None = None, subtitle_count: int = 0) -> InlineKeyboardMarkup:
     rows = []
     picks = []
     for h in probe.heights or []:
@@ -106,6 +116,7 @@ def extended_video_menu(probe: ProbeResult, rid: str, section_count: int = 0,
     rows.append([InlineKeyboardButton(_sized("↓ Smallest size", size_labels, "worst"),
                                        callback_data=f"dl|video|worst|{rid}")])
     rows.extend(_split_row(probe, rid, section_count, size_labels))
+    rows.extend(_subtitles_row(probe, rid, section_count, subtitle_count))
     rows.extend(_clip_row(probe, rid, section_count))
     rows.append([InlineKeyboardButton("← Back", callback_data=f"dl|backq|{rid}")])
     return InlineKeyboardMarkup(rows)

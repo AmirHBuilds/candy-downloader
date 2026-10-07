@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import re
 import time
 import uuid
@@ -19,6 +20,7 @@ from jobqueue.job_manager import JobManager
 from settings import access_control as ac
 from settings.user_settings import get_settings, update_setting, reset_settings
 from ui import messages, admin_menu, batch_menu
+from ui.subtitle_menu import subtitles_menu, subtitles_text
 from ui.quick_menu import (
     extended_video_menu, simple_menu, fallback_menu, spotify_menu,
     queued_menu, redo_menu, quality_menu,
@@ -29,7 +31,7 @@ from ui.section_menu import (
 )
 from ui.settings_menu import (
     main_menu, advanced_menu, confirm_reset_menu, back_to_main, ADVANCED_TEXT_FIELDS,
-    bars_menu, bars_title,
+    bars_menu, bars_title, look_menu, look_title,
 )
 from ui.history_menu import (
     history_text, history_menu, confirm_clear_menu, PAGE_SIZE, ORIGIN_HOME, ORIGIN_SETTINGS,
@@ -39,9 +41,12 @@ from downloader import cookie_health
 from downloader.probe import probe, ProbeResult
 from downloader.sections import SectionDraft, SectionError, parse_timestamp, start_time_from_url
 from downloader.sizes import size_labels
+from downloader.subtitles import SubChoice, SubtitleError, clamp_page as sub_clamp_page, summary as subtitle_summary
 from downloader import gallerydl_probe
 from downloader.cookies import inspect_cookie_file
-from downloader.playlist import Entry, ListingError, MAX_LISTED, list_playlist, quick_titles, short_label
+from downloader.playlist import (
+    Entry, ListingError, MAX_LISTED, list_playlist, looks_like_playlist, quick_titles, short_label,
+)
 from downloader.site_map import tool_order_for
 from downloader.dispatcher import FRIENDLY_TOOL
 from downloader.spotify_handler import get_track_info
@@ -76,6 +81,7 @@ pending_sections: dict[str, SectionDraft] = {}          # rid -> the clip-sectio
 pending_section_input: dict[int, dict] = {}
 # bid -> a playlist / several-links picker, then the running batch (the id is also a "rid" for _touch_rid / sweeping)
 pending_batches: dict[str, Batch] = {}
+pending_subs: dict[str, SubChoice] = {}                  # rid -> the subtitle languages picked for that link
 SECTION_INPUT_TTL_SECONDS = 10 * 60
 
 # None of the rid-keyed dicts above ever had anything removing an entry
@@ -113,6 +119,7 @@ def _sweep_stale_state_once() -> int:
         pending_probes.pop(rid, None)
         last_download.pop(rid, None)
         pending_sections.pop(rid, None)
+        pending_subs.pop(rid, None)
         pending_batches.pop(rid, None)
         cancelled_pre_job_rids.discard(rid)
         _rid_last_touch.pop(rid, None)
@@ -442,6 +449,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         s = get_settings(user_id)
         screens = {
             "main": (main_menu, settings_title()),
+            "look": (look_menu, look_title(s)),
             "bars": (bars_menu, bars_title()),
             "advanced": (advanced_menu, "⚙️ Advanced settings"),
             "reset": (confirm_reset_menu, "Reset ALL your settings to default?"),
@@ -466,6 +474,9 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         if key == "bar_style":
             # stay on the picker so the ✓ moves and they can compare styles
             await query.edit_message_text(bars_title(), parse_mode=ParseMode.HTML, reply_markup=bars_menu(s))
+            return
+        if key == "show_sizes":
+            await query.edit_message_text(look_title(s), parse_mode=ParseMode.HTML, reply_markup=look_menu(s))
             return
         await query.edit_message_text(settings_title(), parse_mode=ParseMode.HTML,
                                        reply_markup=main_menu(s))
@@ -729,13 +740,24 @@ def _active_sections(rid: str) -> tuple[list[tuple[float, float]], bool]:
     return sections, bool(draft.merge and len(sections) > 1)
 
 
+def _active_subs(rid: str) -> SubChoice | None:
+    choice = pending_subs.get(rid)
+    return choice if choice and choice.langs else None
+
+
 def _quality_caption(rid: str, probe_result: ProbeResult) -> str:
     """The quality menu's caption: the title, plus the chosen sections so it is
     obvious the buttons below download only those parts."""
     caption = esc(probe_result.title) if probe_result.title else messages.PICK_OPTION
     sections, merge = _active_sections(rid)
+    subs = _active_subs(rid)
     if sections:
         caption += "\n\n" + sections_summary(sections, merge)
+        if subs:
+            # Subtitles are fetched for the whole video, so on a clip they would be out of sync.
+            caption += "\n◧ Subtitles are skipped for time ranges."
+    elif subs:
+        caption += "\n\n◧ Subtitles: " + esc(subtitle_summary(subs, probe_result.subtitles))
     return caption
 
 
@@ -776,8 +798,9 @@ def _main_menu_for(rid: str, probe_result: ProbeResult, user_id: int):
 
 
 def _more_menu_for(rid: str, probe_result: ProbeResult, user_id: int):
+    subs = _active_subs(rid)
     return extended_video_menu(probe_result, rid, len(_active_sections(rid)[0]),
-                               _size_labels(rid, probe_result, user_id))
+                               _size_labels(rid, probe_result, user_id), len(subs.langs) if subs else 0)
 
 
 async def sections_callback(context: ContextTypes.DEFAULT_TYPE, query, user_id: int, parts: list[str],
@@ -874,6 +897,56 @@ async def sections_callback(context: ContextTypes.DEFAULT_TYPE, query, user_id: 
     elif sub == "back":
         # Back to the quality menu - its buttons now download these sections.
         await show(_quality_caption(rid, probe_result), _main_menu_for(rid, probe_result, user_id))
+
+
+async def subtitles_callback(context: ContextTypes.DEFAULT_TYPE, query, user_id: int, parts: list[str],
+                             rid: str, is_photo: bool) -> None:
+    """Every dl|sub|... button (see ui/subtitle_menu.py)."""
+    sub = parts[2] if len(parts) > 3 else ""
+    chat_id, message_id = query.message.chat_id, query.message.message_id
+
+    async def show(text: str, markup) -> None:
+        await _show_screen(context.bot, chat_id, message_id, is_photo, text, markup)
+
+    entry, probe_result = pending_links.get(rid), pending_probes.get(rid)
+    if not entry or entry[0] != user_id or not probe_result or not probe_result.subtitles:
+        await show("This link expired — send it again.", None)
+        return
+    _touch_rid(rid)
+    tracks = probe_result.subtitles
+    choice = pending_subs.setdefault(rid, SubChoice())
+
+    def number(position: int, default: int = 0) -> int:
+        return int(parts[position]) if len(parts) > position + 1 and parts[position].isdigit() else default
+
+    async def screen(page: int, notice: str = "") -> None:
+        page = sub_clamp_page(tracks, page)
+        await show(subtitles_text(choice, tracks, page, probe_result.title, notice),
+                   subtitles_menu(choice, tracks, page, rid))
+
+    if sub == "open":
+        await screen(number(3))
+    elif sub == "t":
+        index, page = number(3, -1), number(4)
+        if not 0 <= index < len(tracks):
+            await screen(page, "That language is no longer listed.")
+            return
+        try:
+            choice.toggle(tracks[index].code)
+        except SubtitleError as exc:
+            await screen(page, str(exc))
+        else:
+            await screen(page)
+    elif sub == "m" and len(parts) > 4:
+        try:
+            choice.set_mode(parts[3])
+        except SubtitleError as exc:
+            await screen(number(4), str(exc))
+        else:
+            await screen(number(4))
+    elif sub == "clr":
+        choice.langs.clear()
+        await screen(0)
 
 
 async def handle_section_text_input(update: Update, user_id: int, text: str) -> None:
@@ -1191,7 +1264,17 @@ async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         update.effective_chat.id, checking_text, reply_markup=queued_menu(rid, url),
     )
 
-    probe_result = await probe(url, user_id) if order[0] == "ytdlp" else None
+    if order[0] == "ytdlp" and looks_like_playlist(url):
+        # No point previewing "a video" that isn't one: list the playlist's items directly.
+        pending_links.pop(rid, None)
+        await start_playlist_picker(context.bot, user_id, update.effective_chat.id, url, status_msg)
+        return
+
+    # Preview with yt-dlp wherever it can be used - not only where it is the FIRST tool. X/Twitter and
+    # Pinterest try gallery-dl first (right for image posts), but a post with a video deserves the same
+    # quality picker, sizes and time ranges; an image post simply fails the preview and falls through
+    # to the gallery-dl menu below, as before.
+    probe_result = await probe(url, user_id) if "ytdlp" in order else None
     if rid in cancelled_pre_job_rids:
         cancelled_pre_job_rids.discard(rid)
         return
@@ -1299,6 +1382,10 @@ async def link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     pending_section_input.pop(user_id, None)   # any other button abandons a half-typed time
 
+    if action == "sub":
+        await subtitles_callback(context, query, user_id, parts, rid, is_photo)
+        return
+
     if action == "dismiss":
         await _delete_quietly(query.message)
         return
@@ -1401,9 +1488,12 @@ async def link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if action in ("video", "audio", "simple") and len(parts) == 4:
         preview_title = _preview_title(rid)   # must be read BEFORE the probe state is dropped
         clip_sections, clip_merge = _active_sections(rid)   # ditto: needs the probe's duration
+        sub_choice = _active_subs(rid)
+        had_preview = rid in pending_probes
         entry = pending_links.pop(rid, None)
         pending_probes.pop(rid, None)
         pending_sections.pop(rid, None)
+        pending_subs.pop(rid, None)
         if not entry or entry[0] != user_id:
             # State was lost (restart, long gap, etc.) but the link is
             # still right there in the message - recover it instead of
@@ -1438,6 +1528,10 @@ async def link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             job_settings["sections"] = clip_sections
             job_settings["sections_merge"] = clip_merge
             job_settings.pop("split_chapters", None)       # the chosen sections already say which parts to take
+        elif sub_choice and action == "video":
+            job_settings.update(sub_choice.settings())     # sub_langs + sub_mode (never on a clip: wrong timing)
+        if had_preview and tool_order_for(url)[0] != "ytdlp":
+            job_settings["prefer_ytdlp"] = True            # what was chosen only means something to yt-dlp
 
         last_download[rid] = (user_id, url, job_settings)
         _touch_rid(rid)
@@ -1534,7 +1628,18 @@ async def post_init(application: Application) -> None:
     log.info("%s is ready %s", config.OWNER_NAME, config.OWNER_EMOJI)
 
 
+def _lower_priority() -> None:
+    """Run at low CPU priority. ffmpeg and the other child processes inherit it, so a heavy conversion
+    or exact clip cut can't make the host machine sluggish. Harmless where it isn't supported."""
+    if config.PROCESS_NICE:
+        try:
+            os.nice(config.PROCESS_NICE)
+        except (AttributeError, OSError):
+            pass
+
+
 def main() -> None:
+    _lower_priority()
     if config.OWNER_USER_ID is None:
         log.warning(
             "OWNER_USER_ID is not set in .env — the admin panel and "

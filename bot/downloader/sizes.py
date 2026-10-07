@@ -116,3 +116,28 @@ def size_labels(sizes: dict[str, int], scale: float = 1.0) -> dict[str, str]:
     them to the share of the video being downloaded when time-range sections
     are chosen."""
     return {key: f"~{format_size(value * scale)}" for key, value in sizes.items() if value > 0}
+
+
+def _source(fmt: dict) -> str:
+    if fmt.get("filesize"):
+        return "exact"
+    if fmt.get("filesize_approx"):
+        return "approx"
+    return "bitrate" if fmt.get("tbr") else "unknown"
+
+
+def describe_best(formats: list[dict], duration: float | None) -> str:
+    """'137 avc1 1080p 700MB (exact) + 140 mp4a 50MB (exact)': which formats the "best" estimate
+    is made of and how trustworthy each number is. Logged by the preview so a surprising size on a
+    button can be explained after the fact instead of guessed at."""
+    video_only, audio_only, muxed = _split(formats)
+    chosen = [f for f in (_video_at(video_only, 10**9), _best_audio(audio_only)) if f]
+    if len(chosen) < 2 and muxed:
+        chosen = [max(muxed, key=lambda f: (f["height"], _quality_key(f)))]
+    parts = []
+    for fmt in chosen:
+        size = _size(fmt, duration)
+        kind = fmt.get("height") and f"{fmt['height']}p" or ""
+        codec = str(fmt.get("vcodec") if _has(fmt, "vcodec") else fmt.get("acodec"))[:4]
+        parts.append(f"{fmt.get('format_id')} {codec} {kind} {format_size(size) if size else '?'} ({_source(fmt)})".replace("  ", " "))
+    return " + ".join(parts) or "nothing"

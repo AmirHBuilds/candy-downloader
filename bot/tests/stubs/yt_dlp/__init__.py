@@ -116,6 +116,13 @@ class YoutubeDL:
         target = Path(self.opts["outtmpl"].replace("%(title).60B", TITLE).replace("%(ext)s", "mp4"))
         target.parent.mkdir(parents=True, exist_ok=True)
 
+        if action == "ppfail":                      # what yt-dlp raises when an ffmpeg step fails
+            logger = self.opts.get("logger")
+            if logger:
+                logger.debug("[debug] ffmpeg command line: ffmpeg -y -i in.webm -c:a libopus out.opus")
+                logger.debug("[ffmpeg] Invalid argument for option b:a")
+                logger.debug("[download] something unrelated")
+            raise Exception("ERROR: Postprocessing: Conversion failed!")
         if action == "fail":
             raise Exception("boom")
         if action == "botcheck":

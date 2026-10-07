@@ -14,9 +14,10 @@ from tests import _env  # noqa: F401  (must come first)
 
 import yt_dlp  # noqa: E402  (the stub)
 import main  # noqa: E402
-from downloader import playlist as playlist_module, probe as probe_module  # noqa: E402
+from downloader import dispatcher, playlist as playlist_module, probe as probe_module  # noqa: E402
 from downloader.playlist import (  # noqa: E402
-    Entry, ListingError, entries_from_info, entry_url, list_playlist, quick_titles, short_label, wants_single_video,
+    Entry, ListingError, entries_from_info, entry_url, list_playlist, looks_like_playlist, quick_titles, short_label,
+    wants_single_video,
 )
 from downloader.probe import ProbeResult  # noqa: E402
 from jobqueue import batch as batch_module, job_manager as jm  # noqa: E402
@@ -53,6 +54,15 @@ class SingleVideoRule(unittest.TestCase):
 
     def test_a_lookalike_domain_is_not_youtube(self):
         self.assertFalse(wants_single_video("https://notyoutube.com/watch?v=abc"))
+
+
+class PlaylistLinks(unittest.TestCase):
+    def test_only_real_playlist_links_skip_the_video_preview(self):
+        for url in (PLAYLIST_URL, "https://www.youtube.com/watch?list=PLx", "https://music.youtube.com/playlist?list=OL"):
+            self.assertTrue(looks_like_playlist(url), url)
+        for url in ("https://www.youtube.com/watch?v=a&list=PLx", "https://youtu.be/a?list=PLx", "https://www.youtube.com/watch?v=a",
+                    "https://soundcloud.com/a/sets/b", "https://notyoutube.com/playlist?list=x"):
+            self.assertFalse(looks_like_playlist(url), url)
 
 
 class EntryParsing(unittest.TestCase):
@@ -157,6 +167,7 @@ class Listing(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(yt_dlp.EXTRACT_CALLS[-1][1]["noplaylist"])
         await probe_module.probe(PLAYLIST_URL, USER)
         self.assertFalse(yt_dlp.EXTRACT_CALLS[-1][1]["noplaylist"])
+        self.assertEqual(yt_dlp.EXTRACT_CALLS[-1][1]["playlistend"], 1)           # never walk a whole playlist just to label it
 
 
 # ============================================================ the picker screens
@@ -432,11 +443,11 @@ class OpeningThePicker(BatchFlowBase):
         self.assertEqual(spotify.title, short_label(spotify.url))
         self.assertNotIn("https://open.spotify.com/track/abc", [u for u, _ in yt_dlp.EXTRACT_CALLS])
 
-    async def test_a_playlist_link_opens_the_picker(self):
-        async def fake_probe(url, user_id=None):
-            return ProbeResult(ok=True, is_playlist=True, title="PL")
+    async def test_a_youtube_playlist_link_goes_straight_to_the_list_without_a_preview(self):
+        async def must_not_probe(url, user_id=None):
+            raise AssertionError("a playlist link must not be previewed as a video")
         self.addCleanup(setattr, main, "probe", main.probe)
-        main.probe = fake_probe
+        main.probe = must_not_probe
         yt_dlp.EXTRACT["by_url"][PLAYLIST_URL] = {"title": "Road trip", "entries": [
             {"url": "https://youtu.be/a", "title": "One", "duration": 61}, {"url": "https://youtu.be/b", "title": "Two"}]}
         await self.send_text(PLAYLIST_URL)
@@ -444,11 +455,17 @@ class OpeningThePicker(BatchFlowBase):
         self.assertEqual((batch.kind, batch.title, [i.title for i in batch.items]), ("playlist", "Road trip", ["One", "Two"]))
         self.assertEqual(len(main.pending_links), 0)                              # no single-link state left behind
 
-    async def test_an_unreadable_playlist_says_so(self):
+    async def test_another_sites_playlist_is_still_found_by_the_preview(self):
         async def fake_probe(url, user_id=None):
-            return ProbeResult(ok=True, is_playlist=True)
+            return ProbeResult(ok=True, is_playlist=True, title="PL")
         self.addCleanup(setattr, main, "probe", main.probe)
         main.probe = fake_probe
+        url = "https://soundcloud.com/artist/sets/album"
+        yt_dlp.EXTRACT["by_url"][url] = {"title": "Album", "entries": [{"url": "https://soundcloud.com/artist/one", "title": "One"}]}
+        await self.send_text(url)
+        self.assertEqual((self.batch.kind, self.batch.title), ("playlist", "Album"))
+
+    async def test_an_unreadable_playlist_says_so(self):
         yt_dlp.EXTRACT["by_url"][PLAYLIST_URL] = RuntimeError("404")
         await self.send_text(PLAYLIST_URL)
         self.assertEqual(main.pending_batches, {})
@@ -462,6 +479,83 @@ class OpeningThePicker(BatchFlowBase):
         main.pending_probes.clear()
         await self.send_text("https://www.youtube.com/watch?v=abc&list=PLmix")
         self.assertEqual(main.pending_batches, {})                                # a video inside a playlist stays a single video
+
+
+# ============================================================ sites where gallery-dl is tried first
+class PreviewWherever(BatchFlowBase):
+    """X and Pinterest try gallery-dl first (right for images), but a video post deserves the full menu too."""
+
+    def set_probe(self, result):
+        calls = []
+
+        async def fake(url, user_id=None):
+            calls.append(url)
+            return result
+        self.addCleanup(setattr, main, "probe", main.probe)
+        main.probe = fake
+        return calls
+
+    def last_markup(self):
+        return next(m for _, _, m in reversed(self.bot.edits) if m is not None)
+
+    async def test_an_x_post_with_a_video_gets_the_full_quality_menu(self):
+        calls = self.set_probe(ProbeResult(ok=True, title="Clip", heights=[720], has_audio=True, duration=30,
+                                           sizes={"best": 5_000_000}))
+        await self.send_text("https://x.com/someone/status/123")
+        self.assertEqual(calls, ["https://x.com/someone/status/123"])
+        texts = labels(self.last_markup())
+        self.assertIn("★ Best available ~5.0MB", texts)
+        self.assertIn("More options…", texts)
+
+    async def test_an_x_image_post_still_gets_the_gallery_menu(self):
+        self.set_probe(ProbeResult(ok=False, error="No video could be found in this tweet"))
+
+        async def gallery_info(url):
+            return {"title": "A picture", "thumbnail": ""}
+        from downloader import gallerydl_probe
+        self.addCleanup(setattr, gallerydl_probe, "probe", gallerydl_probe.probe)
+        gallerydl_probe.probe = gallery_info
+        await self.send_text("https://x.com/someone/status/456")
+        data = datas(self.last_markup())
+        self.assertFalse([d for d in data if d.startswith("dl|video|")])
+        self.assertTrue([d for d in data if d.startswith("dl|simple")])
+
+    async def test_a_gallery_only_site_is_never_previewed_with_yt_dlp(self):
+        calls = self.set_probe(ProbeResult(ok=True, heights=[720], has_audio=True, duration=30))
+
+        async def gallery_info(url):
+            return {"title": "Art", "thumbnail": ""}
+        from downloader import gallerydl_probe
+        self.addCleanup(setattr, gallerydl_probe, "probe", gallerydl_probe.probe)
+        gallerydl_probe.probe = gallery_info
+        await self.send_text("https://www.pixiv.net/en/artworks/1")
+        self.assertEqual(calls, [])
+
+
+class PreferYtDlp(unittest.IsolatedAsyncioTestCase):
+    async def order_for(self, url, **settings):
+        order = []
+
+        def handler(name):
+            async def run(*a, **k):
+                order.append(name)
+                raise Exception(f"{name} failed")
+            return run
+        original = dict(dispatcher.HANDLERS)
+        dispatcher.HANDLERS.update({name: handler(name) for name in original})
+        self.addCleanup(dispatcher.HANDLERS.update, original)
+        with self.assertRaises(dispatcher.NoToolSucceeded):
+            await dispatcher.download(url, Path("/tmp"), settings, 1, lambda *a, **k: None)
+        return order
+
+    async def test_x_normally_tries_gallery_dl_first(self):
+        self.assertEqual((await self.order_for("https://x.com/u/status/1"))[:2], ["gallerydl", "ytdlp"])
+
+    async def test_a_choice_made_from_the_video_preview_tries_yt_dlp_first(self):
+        self.assertEqual((await self.order_for("https://x.com/u/status/1", prefer_ytdlp=True))[:2], ["ytdlp", "gallerydl"])
+
+    async def test_the_preference_cannot_invent_a_tool_a_site_does_not_have(self):
+        self.assertEqual(await self.order_for("https://www.pixiv.net/en/artworks/1", prefer_ytdlp=True), ["gallerydl"])
 
 
 # ============================================================ picking

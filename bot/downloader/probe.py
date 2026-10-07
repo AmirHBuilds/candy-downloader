@@ -6,6 +6,8 @@ offering quality choices at all on a site that has none).
 """
 import asyncio
 import logging
+import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 import yt_dlp
@@ -13,7 +15,9 @@ import yt_dlp
 from config import BGUTIL_POT_URL
 from downloader.cookies import apply_cookies, cookie_file_for
 from downloader.playlist import wants_single_video
-from downloader.sizes import estimate_sizes
+from downloader.proxy import policy
+from downloader.sizes import describe_best, estimate_sizes
+from downloader.subtitles import available_tracks
 from settings.user_settings import get_settings
 
 log = logging.getLogger("candy.probe")
@@ -41,16 +45,79 @@ class ProbeResult:
     sizes: dict = field(default_factory=dict)
     # [(title, start_s, end_s)] when the video has chapters - one-tap time ranges in the sections editor.
     chapters: list = field(default_factory=list)
+    # [SubTrack] - the subtitle languages on offer, Persian and English first (downloader/subtitles.py).
+    subtitles: list = field(default_factory=list)
     error: str = ""                                     # populated when ok=False, for a better user message
+
+
+HEAD_MAX_FORMATS = 5          # at most this many formats are asked about
+HEAD_TIMEOUT = 4              # seconds per request
+
+
+def _head_size(url: str, headers: dict | None) -> int | None:
+    """The size the server itself reports, without downloading: Content-Length from a HEAD
+    request, or from a one-byte ranged GET for servers that refuse HEAD."""
+    import httpx
+    try:
+        with httpx.Client(timeout=HEAD_TIMEOUT, follow_redirects=True, headers=headers or {}) as client:
+            response = client.head(url)
+            length = response.headers.get("content-length", "")
+            if response.status_code < 400 and length.isdigit() and int(length) > 0:
+                return int(length)
+            response = client.get(url, headers={"Range": "bytes=0-0"})
+            match = re.search(r"/(\d+)$", response.headers.get("content-range", ""))
+            return int(match.group(1)) if match else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _fill_missing_sizes(info: dict) -> None:
+    """Some sites (Instagram, for one) announce no file sizes and no bitrates, so the quality
+    buttons had nothing to estimate from. Ask the server about the few formats that matter - only
+    when NOTHING in the list has size information, so sites like YouTube never pay for this."""
+    formats = info.get("formats") or []
+    if not formats or any(f.get("filesize") or f.get("filesize_approx") or f.get("tbr") for f in formats):
+        return
+    candidates = [f for f in formats
+                  if str(f.get("url", "")).startswith(("http://", "https://"))
+                  and not str(f.get("protocol", "")).startswith(("m3u8", "http_dash", "mhtml"))]
+    # the best of each height, plus the best audio-only stream
+    best_by_height: dict = {}
+    for f in sorted(candidates, key=lambda f: (f.get("height") or 0, f.get("tbr") or 0), reverse=True):
+        if f.get("vcodec") not in (None, "none") or f.get("acodec") in (None, "none"):
+            best_by_height.setdefault(f.get("height") or 0, f)
+    audio = next((f for f in candidates if f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")), None)
+    chosen = list(best_by_height.values())[:HEAD_MAX_FORMATS] + ([audio] if audio else [])
+    if not chosen:
+        return
+    try:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            for fmt, size in zip(chosen, pool.map(lambda f: _head_size(f["url"], f.get("http_headers")), chosen)):
+                if size:
+                    fmt["filesize"] = size
+    except Exception:  # noqa: BLE001
+        log.debug("Asking for sizes failed", exc_info=True)
 
 
 def _safe_sizes(formats: list, duration, heights: list) -> dict:
     """Sizes are a nicety: a surprise in some site's format list must never break the preview."""
     try:
+        try:
+            log.info("Size estimate (best): %s", describe_best(formats, duration))
+        except Exception:  # noqa: BLE001
+            pass
         return estimate_sizes(formats, duration, heights)
     except Exception:  # noqa: BLE001
         log.debug("Size estimation failed", exc_info=True)
         return {}
+
+
+def _safe_tracks(info: dict) -> list:
+    try:
+        return available_tracks(info)
+    except Exception:  # noqa: BLE001 - a nicety; a strange subtitle list must never break the preview
+        log.debug("Subtitle listing failed", exc_info=True)
+        return []
 
 
 def _chapters(info: dict, duration) -> list:
@@ -71,6 +138,21 @@ def _chapters(info: dict, duration) -> list:
 
 
 async def probe(url: str, user_id: int | None = None) -> ProbeResult:
+    """The preview, routed: direct, or through the proxy when YouTube is blocking this server's address
+    (see downloader/proxy.py). A block-type failure is retried once on the new route."""
+    explicit = (get_settings(user_id).get("proxy") if user_id is not None else "") or ""
+    proxy = explicit or policy.route(url)
+    result = await _probe_once(url, user_id, proxy)
+    if not explicit:
+        if not result.ok and policy.report_failure(url, proxy, result.error):
+            proxy = policy.route(url)
+            result = await _probe_once(url, user_id, proxy)
+        if result.ok:
+            policy.report_success(url, proxy)
+    return result
+
+
+async def _probe_once(url: str, user_id: int | None, proxy: str | None) -> ProbeResult:
     """Fast, download-free metadata lookup. Any failure just returns
     ok=False (with the error message attached) so the caller can fall
     back to a generic menu instead of crashing the whole flow over a
@@ -83,7 +165,12 @@ async def probe(url: str, user_id: int | None = None) -> ProbeResult:
         "socket_timeout": 8,
         # watch?v=X&list=Y means "this video": don't turn it into a playlist preview.
         "noplaylist": wants_single_video(url),
+        # Only need to know "this is a playlist", not walk all of it (discarding entries still pages through
+        # every one of them, which is what made big playlists time out here).
+        "playlistend": 1,
     }
+    if proxy:
+        opts["proxy"] = proxy
     if BGUTIL_POT_URL:
         opts["extractor_args"] = {"youtubepot-bgutilhttp": {"base_url": [BGUTIL_POT_URL]}}
 
@@ -96,7 +183,9 @@ async def probe(url: str, user_id: int | None = None) -> ProbeResult:
 
     def run() -> dict:
         with yt_dlp.YoutubeDL(opts) as ydl:
-            return ydl.extract_info(url, download=False)
+            info = ydl.extract_info(url, download=False)
+        _fill_missing_sizes(info)
+        return info
 
     try:
         loop = asyncio.get_running_loop()
@@ -150,4 +239,5 @@ async def probe(url: str, user_id: int | None = None) -> ProbeResult:
         duration=duration,
         sizes=_safe_sizes(formats, duration, heights if has_video else []),
         chapters=_chapters(info, duration),
+        subtitles=_safe_tracks(info),
     )

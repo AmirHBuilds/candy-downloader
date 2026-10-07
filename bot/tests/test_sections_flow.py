@@ -13,6 +13,7 @@ from telegram.error import BadRequest  # noqa: E402  (the stub)
 import main  # noqa: E402
 from downloader.probe import ProbeResult  # noqa: E402
 from downloader.sections import MAX_SECTIONS, SectionDraft, SectionRow  # noqa: E402
+from downloader.subtitles import SubTrack  # noqa: E402
 from settings.user_settings import DEFAULTS  # noqa: E402
 from ui import quick_menu  # noqa: E402
 from ui.section_menu import editor_menu, prompt_menu  # noqa: E402
@@ -115,7 +116,8 @@ def labels(markup):
 class FlowTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.bot, self.jobs = FakeBot(), FakeJobManager()
-        for name in ("pending_links", "pending_probes", "pending_sections", "pending_section_input", "last_download"):
+        for name in ("pending_links", "pending_probes", "pending_sections", "pending_section_input", "last_download",
+                     "pending_subs"):
             setattr(main, name, {})
         main.pending_links[RID] = (USER, URL)
         main.pending_probes[RID] = ProbeResult(ok=True, title="My long video", heights=[1080, 720, 480],
@@ -545,6 +547,157 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         settings = self.jobs.enqueued[0]["settings"]
         self.assertEqual(settings["sections"], [(0.0, 120.0)])
         self.assertNotIn("split_chapters", settings)
+
+    # ------------------------------------------------------------ subtitles
+    TRACKS = [SubTrack("fa", "Persian"), SubTrack("en", "English"), SubTrack("de", "German"), SubTrack("ar", "Arabic", True)]
+
+    def with_subs(self, tracks=None):
+        main.pending_probes[RID] = ProbeResult(ok=True, title="My long video", heights=[1080, 720, 480],
+                                               has_audio=True, duration=DURATION, subtitles=list(tracks or self.TRACKS))
+
+    async def test_the_subtitles_button_lives_in_more_options_only_when_there_are_tracks(self):
+        edit = await self.tap(f"dl|moreq|{RID}")
+        self.assertFalse([l for l in labels(edit["markup"]) if "Subtitles" in l])
+        self.with_subs()
+        edit = await self.tap(f"dl|moreq|{RID}")
+        self.assertIn("◧ Subtitles", labels(edit["markup"]))
+        self.assertIn(f"dl|sub|open|0|{RID}", datas(edit["markup"]))
+        self.assertNotIn("◧ Subtitles", labels((await self.tap(f"dl|backq|{RID}"))["markup"]))     # not on the main menu
+
+    async def test_opening_it_lists_persian_and_english_first_and_nothing_is_chosen(self):
+        self.with_subs()
+        edit = await self.tap(f"dl|sub|open|0|{RID}")
+        names = [l for l in labels(edit["markup"]) if l[0] in "●○" and "Embedded" not in l and ".srt" not in l and "Both" not in l]
+        self.assertEqual(names, ["○ Persian", "○ English", "○ German", "○ Arabic · auto"])
+        self.assertIn("Selected: none", edit["text"])
+
+    async def test_choosing_languages_and_a_mode_and_clearing(self):
+        self.with_subs()
+        await self.tap(f"dl|sub|open|0|{RID}")
+        await self.tap(f"dl|sub|t|0|0|{RID}")
+        edit = await self.tap(f"dl|sub|t|1|0|{RID}")
+        self.assertIn("● Persian", labels(edit["markup"]))
+        self.assertIn("Selected: Persian, English · embedded track", edit["text"])
+        edit = await self.tap(f"dl|sub|m|both|0|{RID}")
+        self.assertIn("● Both", labels(edit["markup"]))
+        self.assertIn("embedded + .srt file", edit["text"])
+        edit = await self.tap(f"dl|sub|t|0|0|{RID}")                      # tapping again removes
+        self.assertIn("Selected: English", edit["text"])
+        edit = await self.tap(f"dl|sub|clr|{RID}")
+        self.assertIn("Selected: none", edit["text"])
+
+    async def test_the_language_limit_and_stale_buttons(self):
+        self.with_subs([SubTrack(f"l{i}", f"Lang {i}") for i in range(6)])
+        for i in range(4):
+            await self.tap(f"dl|sub|t|{i}|0|{RID}")
+        edit = await self.tap(f"dl|sub|t|4|0|{RID}")
+        self.assertIn("up to 4 languages", edit["text"])
+        edit = await self.tap(f"dl|sub|t|99|0|{RID}")
+        self.assertIn("no longer listed", edit["text"])
+        edit = await self.tap(f"dl|sub|m|burn|0|{RID}")                    # burned-in isn't offered: refused
+        self.assertIn("Unknown option", edit["text"])
+        self.assertEqual(main.pending_subs[RID].mode, "embed")
+
+    async def test_the_languages_are_paged(self):
+        self.with_subs([SubTrack(f"l{i}", f"Lang {i}") for i in range(20)])
+        edit = await self.tap(f"dl|sub|open|0|{RID}")
+        self.assertIn("Page 1 of 3", edit["text"])
+        edit = await self.tap(f"dl|sub|open|2|{RID}")
+        self.assertIn("Page 3 of 3", edit["text"])
+        edit = await self.tap(f"dl|sub|t|17|2|{RID}")
+        self.assertIn("● Lang 17", labels(edit["markup"]))
+        self.assertIn("Page 3 of 3", edit["text"])                         # stays on the page
+
+    async def test_back_returns_to_more_options_with_the_choice_in_the_caption_and_on_the_button(self):
+        self.with_subs()
+        await self.tap(f"dl|sub|t|0|0|{RID}")
+        await self.tap(f"dl|sub|t|1|0|{RID}")
+        edit = await self.tap(f"dl|moreq|{RID}")
+        self.assertIn("◧ Subtitles (2) ✓", labels(edit["markup"]))
+        self.assertIn("◧ Subtitles: Persian, English · embedded track", edit["text"])
+        edit = await self.tap(f"dl|backq|{RID}")
+        self.assertIn("◧ Subtitles: Persian, English", edit["text"])       # the main menu says so too
+
+    async def test_a_quality_button_downloads_with_the_subtitles(self):
+        self.with_subs()
+        await self.tap(f"dl|sub|t|0|0|{RID}")
+        await self.tap(f"dl|sub|m|file|0|{RID}")
+        await self.tap(f"dl|video|720p|{RID}")
+        settings = self.jobs.enqueued[0]["settings"]
+        self.assertEqual((settings["sub_langs"], settings["sub_mode"]), (["fa"], "file"))
+        self.assertEqual(settings["quality"], "720p")
+        self.assertNotIn(RID, main.pending_subs)
+        self.assertEqual(main.last_download[RID][2]["sub_langs"], ["fa"])  # Try again keeps them
+
+    async def test_audio_downloads_ignore_subtitles(self):
+        self.with_subs()
+        await self.tap(f"dl|sub|t|0|0|{RID}")
+        await self.tap(f"dl|audio|mp3|{RID}")
+        self.assertNotIn("sub_langs", self.jobs.enqueued[0]["settings"])
+
+    async def test_nothing_chosen_means_no_subtitle_settings(self):
+        self.with_subs()
+        await self.tap(f"dl|sub|open|0|{RID}")                             # looked, chose nothing
+        await self.tap(f"dl|video|best|{RID}")
+        self.assertNotIn("sub_langs", self.jobs.enqueued[0]["settings"])
+
+    async def test_time_ranges_win_over_subtitles_and_the_caption_says_so(self):
+        self.with_subs()
+        await self.tap(f"dl|sub|t|0|0|{RID}")
+        await self.add_section(end="2:00")
+        edit = await self.tap(f"dl|moreq|{RID}")
+        self.assertFalse([l for l in labels(edit["markup"]) if "Subtitles" in l])      # the button is hidden meanwhile
+        self.assertIn("◧ Subtitles are skipped for time ranges.", edit["text"])
+        self.assertNotIn("◧ Subtitles: Persian", edit["text"])
+        await self.tap(f"dl|video|720p|{RID}")
+        settings = self.jobs.enqueued[0]["settings"]
+        self.assertEqual(settings["sections"], [(0.0, 120.0)])
+        self.assertNotIn("sub_langs", settings)
+
+    async def test_removing_the_sections_brings_the_subtitles_back(self):
+        self.with_subs()
+        await self.tap(f"dl|sub|t|0|0|{RID}")
+        await self.add_section(end="2:00")
+        await self.tap(f"dl|sec|del|0|{RID}")
+        edit = await self.tap(f"dl|moreq|{RID}")
+        self.assertIn("◧ Subtitles (1) ✓", labels(edit["markup"]))
+        self.assertIn("◧ Subtitles: Persian", edit["text"])
+
+    async def test_expired_link_and_other_peoples_buttons(self):
+        self.with_subs()
+        main.pending_links.clear()
+        self.assertIn("expired", (await self.tap(f"dl|sub|open|0|{RID}"))["text"])
+        main.pending_links[RID] = (999, URL)
+        self.assertIn("expired", (await self.tap(f"dl|sub|open|0|{RID}"))["text"])
+        self.assertNotIn(RID, main.pending_subs)
+
+    async def test_the_caption_escapes_language_names(self):
+        self.with_subs([SubTrack("x", "<b>Odd</b>")])
+        await self.tap(f"dl|sub|t|0|0|{RID}")
+        edit = await self.tap(f"dl|moreq|{RID}")
+        self.assertIn("&lt;b&gt;Odd&lt;/b&gt;", edit["text"])
+
+    # ------------------------------------------------------------ sites where gallery-dl comes first
+    async def test_a_video_chosen_on_x_or_pinterest_is_downloaded_with_yt_dlp_first(self):
+        for url in ("https://x.com/u/status/1", "https://www.pinterest.com/pin/1/"):
+            with self.subTest(url=url):
+                self.jobs.enqueued.clear()
+                main.pending_links[RID] = (USER, url)
+                main.pending_probes[RID] = ProbeResult(ok=True, heights=[720], has_audio=True, duration=60)
+                await self.tap(f"dl|video|best|{RID}")
+                self.assertTrue(self.jobs.enqueued[0]["settings"]["prefer_ytdlp"])
+
+    async def test_sections_on_x_prefer_yt_dlp_as_well(self):
+        main.pending_links[RID] = (USER, "https://x.com/u/status/1")
+        await self.add_section(end="0:30")
+        await self.tap(f"dl|video|best|{RID}")
+        settings = self.jobs.enqueued[0]["settings"]
+        self.assertTrue(settings["prefer_ytdlp"])
+        self.assertEqual(settings["sections"], [(0.0, 30.0)])
+
+    async def test_sites_that_already_try_yt_dlp_first_are_left_alone(self):
+        await self.tap(f"dl|video|best|{RID}")                    # the default test link is YouTube
+        self.assertNotIn("prefer_ytdlp", self.jobs.enqueued[0]["settings"])
 
     # ------------------------------------------------------------ ?t= links
     def test_a_start_time_in_the_link_prefills_a_section_to_the_end(self):

@@ -62,7 +62,11 @@ MAX_STEP_LINES = 5   # room for: tool line + clip line + Video line + Audio line
 # got cached, so "Send as file instead" would find no cache and quietly
 # have to fall through to a slower re-download instead of behaving
 # identically to the max-quality case.
-_NON_MEDIA_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".part", ".ytdl", ".json", ".txt"}
+_SUBTITLE_EXTS = {".srt", ".vtt", ".ass"}
+# Never a title for /history and never kept for the "send as file" resend (subtitle files included:
+# they are sent as documents right after the video, see _send_files).
+_NON_MEDIA_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".part", ".ytdl", ".json", ".txt"} | _SUBTITLE_EXTS
+_LANG_SUFFIX = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]+)*$")
 _UNSUPPORTED_MARKERS = ("unsupported url", "produced no files", "not a downloadable file", "no extractor")
 # Containers Telegram will actually render as an inline, scrubbable video
 # preview via sendVideo. Anything else we get (e.g. yt-dlp falling back to
@@ -579,11 +583,21 @@ class JobManager:
             job.header = "Sending"
             await self._emit(job, "Uploading to Telegram...", markup=queued_menu(job.rid, job.url))
             await self._send_files(job, files)
+            # Things the downloader wants the person to know (e.g. subtitles couldn't be fetched).
+            for note in job.settings.pop("delivery_notes", []):
+                try:
+                    await self.bot.send_message(job.chat_id, note)
+                except TelegramError as exc:
+                    log.warning("Could not send a delivery note for job %s: %s", job.rid, exc)
 
     async def _send_files(self, job: Job, files: list[Path]) -> None:
         # With several videos/audios (multi-clip job, playlist) the "send as
         # file" button goes on the LAST one only, labelled "all": it re-sends
         # the whole batch, so repeating it under every clip would be misleading.
+        # Subtitle files go out AFTER the video, as plain documents, and don't count toward
+        # "several files" (which decides where the send-as-file button goes).
+        subtitle_files = [f for f in files if f.suffix.lower() in _SUBTITLE_EXTS]
+        files = [f for f in files if f.suffix.lower() not in _SUBTITLE_EXTS]
         multi = len(files) > 1
         for index, f in enumerate(files):
             is_last = index == len(files) - 1
@@ -646,6 +660,13 @@ class JobManager:
                     await self.bot.send_document(job.chat_id, input_file, caption=caption,
                                                   parse_mode=ParseMode.HTML, reply_markup=sent_menu(job.url),
                                                   read_timeout=120, write_timeout=120, connect_timeout=60)
+        for f in subtitle_files:
+            parts = f.suffixes
+            language = parts[-2].lstrip(".") if len(parts) >= 2 and _LANG_SUFFIX.match(parts[-2].lstrip(".")) else ""
+            with open(f, "rb") as fh:
+                await self.bot.send_document(job.chat_id, InputFile(fh, filename=f.name),
+                                             caption=f"◧ Subtitles{f' · {language}' if language else ''}",
+                                             read_timeout=120, write_timeout=120, connect_timeout=60)
         if job.batch is None:                    # the shared message belongs to the batch
             try:
                 await self.bot.delete_message(job.chat_id, job.status_message_id)

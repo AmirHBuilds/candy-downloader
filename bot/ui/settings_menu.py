@@ -7,7 +7,6 @@ Kept short because Telegram limits callback_data to 64 bytes.
 """
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-from settings.user_settings import DEFAULTS
 from ui.progress import BAR_STYLES
 
 
@@ -17,22 +16,37 @@ def _row(*buttons):
 
 def main_menu(s: dict) -> InlineKeyboardMarkup:
     adhd_on = s.get("adhd_mode", False)
-    sizes_on = s.get("show_sizes", True)
-    rows = [
+    return InlineKeyboardMarkup([
         _row(InlineKeyboardButton(
-            f"{'🧠⚡ ADHD Mode: ON' if adhd_on else '🧠 ADHD Mode: off'}",
+            "🧠⚡ ADHD Mode: ON" if adhd_on else "🧠 ADHD Mode: off",
             callback_data="s|adhd_mode|" + ("0" if adhd_on else "1"))),
-        _row(InlineKeyboardButton(
-            f"📏 Sizes on buttons: {'ON' if sizes_on else 'off'}",
-            callback_data="s|show_sizes|" + ("0" if sizes_on else "1"))),
-        _row(InlineKeyboardButton("🎨 Progress bar style", callback_data="nav|bars")),
-        _row(InlineKeyboardButton("📜 History", callback_data="misc|history")),
-        _row(InlineKeyboardButton("⚙️ Advanced (speed / proxy)", callback_data="nav|advanced")),
-        _row(InlineKeyboardButton("🔑 Cookies help", callback_data="nav|cookies")),
-        _row(InlineKeyboardButton("↻ Reset to defaults", callback_data="nav|reset")),
+        _row(InlineKeyboardButton("🎨 Appearance", callback_data="nav|look"),
+             InlineKeyboardButton("⚙️ Advanced", callback_data="nav|advanced")),
+        _row(InlineKeyboardButton("🔑 Cookies", callback_data="nav|cookies"),
+             InlineKeyboardButton("↻ Reset", callback_data="nav|reset")),
         _row(InlineKeyboardButton("← Back to start", callback_data="nav|home")),
-    ]
-    return InlineKeyboardMarkup(rows)
+    ])
+
+
+def _bar_style_name(s: dict) -> str:
+    key = s.get("bar_style", "auto")
+    return BAR_STYLES[key][0] if key in BAR_STYLES else "Auto"
+
+
+def look_title(s: dict) -> str:
+    sizes = "on" if s.get("show_sizes", True) else "off"
+    return (f"🎨 <b>Appearance</b>\n\nSizes on buttons: <b>{sizes}</b>\n"
+            f"Progress bar: <b>{_bar_style_name(s)}</b>")
+
+
+def look_menu(s: dict) -> InlineKeyboardMarkup:
+    sizes_on = s.get("show_sizes", True)
+    return InlineKeyboardMarkup([
+        _row(InlineKeyboardButton(f"📏 Sizes: {'ON' if sizes_on else 'off'}",
+                                  callback_data="s|show_sizes|" + ("0" if sizes_on else "1")),
+             InlineKeyboardButton("🎨 Bar style", callback_data="nav|bars")),
+        _row(InlineKeyboardButton("← Back", callback_data="nav|main")),
+    ])
 
 
 def bars_title() -> str:
@@ -50,7 +64,7 @@ def bars_menu(s: dict) -> InlineKeyboardMarkup:
             InlineKeyboardButton(("✓ " if current == key else "") + label, callback_data=f"s|bar_style|{key}")
             for key, (label, _fn) in names[i:i + 2]
         ])
-    rows.append([InlineKeyboardButton("← Back", callback_data="nav|main")])
+    rows.append([InlineKeyboardButton("← Back", callback_data="nav|look")])
     return InlineKeyboardMarkup(rows)
 
 
