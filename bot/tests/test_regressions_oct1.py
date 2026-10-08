@@ -66,6 +66,10 @@ class ProbeTimeoutTests(unittest.IsolatedAsyncioTestCase):
     def test_timeout_note_is_friendly(self):
         self.assertIn("took too long", messages.preview_failed_note("timed out"))
         self.assertIn("login", messages.preview_failed_note("Sign in to confirm"))
+        self.assertEqual(messages.preview_failed_reason(""), "")
+        self.assertEqual(messages.preview_failed_reason("ERROR: [youtube] abc-DEF_1: Sign in <now>"),
+                         "\n<i>Sign in &lt;now&gt;</i>")
+        self.assertLessEqual(len(messages.preview_failed_reason("x" * 500)), 150)
 
 
 # ---------------------------------------------------------------- progress bars

@@ -520,6 +520,17 @@ class PreviewWherever(BatchFlowBase):
         self.assertFalse([d for d in data if d.startswith("dl|video|")])
         self.assertTrue([d for d in data if d.startswith("dl|simple")])
 
+    async def test_a_failed_instagram_preview_says_why_in_the_sites_own_words(self):
+        calls = self.set_probe(ProbeResult(
+            ok=False, error="ERROR: [instagram] DABC123: Requested content is not available, rate-limit reached or login required"))
+        await self.send_text("https://www.instagram.com/reel/DABC123/")
+        self.assertEqual(calls, ["https://www.instagram.com/reel/DABC123/"])               # yt-dlp IS what looks first
+        text = next(t for _, t, m in reversed(self.bot.edits) if m is not None)
+        self.assertIn("needs a login", text)
+        self.assertIn("rate-limit reached or login required", text)
+        self.assertNotIn("DABC123:", text)                                                   # no "[instagram] id:" noise
+        self.assertTrue([d for d in datas(self.last_markup()) if d.startswith("dl|")])       # and it can still try downloading
+
     async def test_a_gallery_only_site_is_never_previewed_with_yt_dlp(self):
         calls = self.set_probe(ProbeResult(ok=True, heights=[720], has_audio=True, duration=30))
 

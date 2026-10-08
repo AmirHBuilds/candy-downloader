@@ -53,7 +53,8 @@ from downloader.site_map import is_image_site, tool_order_for
 from downloader.dispatcher import FRIENDLY_TOOL
 from downloader.spotify_handler import get_track_info
 from updater.auto_update import daily_update_loop, run_update_once
-from utils.cleanup import sweep_orphaned_workspaces
+from utils.cleanup import drop_server_copy, sweep_orphaned_workspaces
+from utils import housekeeping
 from utils.safe_logging import install_safe_logging
 from utils.text import esc
 from pathlib import Path
@@ -364,6 +365,7 @@ async def cookies_file_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         tg_file = await doc.get_file()
         await tg_file.download_to_drive(custom_path=str(dest))
+        drop_server_copy(getattr(tg_file, "file_path", None))      # cookies are secrets: don't leave a copy behind
     except Exception:  # noqa: BLE001
         log.exception("Couldn't fetch the uploaded cookies file")
         hint = ""
@@ -961,7 +963,7 @@ async def subtitles_callback(context: ContextTypes.DEFAULT_TYPE, query, user_id:
             await screen(page)
     elif sub == "m" and len(parts) > 4:
         try:
-            choice.set_mode(parts[3])
+            choice.toggle_option(parts[3])
         except SubtitleError as exc:
             await screen(number(4), str(exc))
         else:
@@ -1052,6 +1054,7 @@ async def media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     try:
         telegram_file = await media.get_file()
         await telegram_file.download_to_drive(custom_path=path, read_timeout=600)
+        drop_server_copy(getattr(telegram_file, "file_path", None))     # our copy is enough; free the server's
         info = await tools.probe(path)
     except tools.ToolError as exc:
         tools.store.discard(rid)
@@ -1068,8 +1071,7 @@ async def media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 def _toolbox_screen(item, rid: str, notice: str = ""):
-    return (tools_menu.toolbox_text(item.name, item.info, notice),
-            tools_menu.toolbox_menu(item.info, rid, burn_ok=tools.burn_allowed(item.info.duration)))
+    return tools_menu.toolbox_screen(item, rid, notice)
 
 
 async def _edit(bot, chat_id: int, message_id: int, text: str, markup=None) -> None:
@@ -1241,6 +1243,7 @@ async def srt_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     try:
         telegram_file = await document.get_file()
         await telegram_file.download_to_drive(custom_path=srt_path)
+        drop_server_copy(getattr(telegram_file, "file_path", None))
         tools.normalize_srt(srt_path)
     except tools.ToolError as exc:
         await _edit(bot, chat_id, message_id, tools_menu.burn_prompt(item.info, str(exc)), tools_menu.prompt_menu(rid))
@@ -1639,7 +1642,8 @@ async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         caption = messages.with_link(messages.PICK_OPTION, url)
         await status_msg.edit_text(caption, parse_mode=ParseMode.HTML, reply_markup=simple_menu(rid))
     else:
-        note = messages.preview_failed_note(probe_result.error if probe_result else "")
+        error = probe_result.error if probe_result else ""
+        note = messages.preview_failed_note(error) + messages.preview_failed_reason(error)
         caption = messages.with_link(note, url)
         await status_msg.edit_text(caption, parse_mode=ParseMode.HTML, reply_markup=fallback_menu(rid))
 
@@ -1911,6 +1915,7 @@ async def post_init(application: Application) -> None:
     asyncio.create_task(run_update_once(application.bot, notify_admins=False))
     asyncio.create_task(daily_update_loop(application.bot, config.AUTO_UPDATE_HOUR_UTC))
     asyncio.create_task(_sweep_stale_link_state_loop())
+    asyncio.create_task(housekeeping.loop(extra=tools.store.expire))
     log.info("%s is ready %s", config.OWNER_NAME, config.OWNER_EMOJI)
 
 

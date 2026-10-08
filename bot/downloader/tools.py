@@ -247,6 +247,21 @@ def burn_args(src: Path, srt_name: str, dst: Path) -> list[str]:
             "-movflags", "+faststart", str(dst)]
 
 
+def embed_args(video: Path, srts: list[tuple[str, Path]], dst: Path) -> list[str]:
+    """Add each (language, .srt) as a selectable subtitle track of an mp4 (mov_text), without re-encoding."""
+    args = ["-i", str(video)]
+    for _, path in srts:
+        args += ["-i", str(path)]
+    args += ["-map", "0"]
+    for index in range(len(srts)):
+        args += ["-map", str(index + 1)]
+    args += ["-c", "copy", "-c:s", "mov_text"]
+    for index, (lang, _) in enumerate(srts):
+        args += [f"-metadata:s:s:{index}", f"language={lang.split('-')[0]}"]
+    args += ["-movflags", "+faststart", str(dst)]
+    return args
+
+
 # ---------------------------------------------------------------- the runner
 _OUT_TIME = re.compile(r"^out_time_(?:us|ms)=(\d+)")      # both are microseconds in practice
 _SPEED = re.compile(r"^speed=\s*([\d.]+)x")
@@ -254,7 +269,9 @@ _SPEED = re.compile(r"^speed=\s*([\d.]+)x")
 
 async def run_ffmpeg(args: list[str], *, duration: float | None, cb, cancel_event: asyncio.Event | None,
                      stage: str, cwd: Path | None = None) -> None:
-    """Run ffmpeg with a progress report (cb(percent, speed, eta, stage)), cancel and timeout.
+    """Run ffmpeg with a progress report, cancel and timeout. `cb(percent, speed, eta, stage, label)` is the job
+    manager's progress callback: the work is reported under `label` (= `stage` here), so the bar is ONE line that
+    updates in place - passing it as `stage` would start a new line at every tick.
     Raises JobCancelled on cancel, ToolError (with ffmpeg's own complaint) on failure."""
     cmd = ["ffmpeg", "-y", "-nostdin", "-hide_banner", "-loglevel", "error", "-progress", "pipe:1", "-nostats", *args]
     proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
@@ -284,7 +301,7 @@ async def run_ffmpeg(args: list[str], *, duration: float | None, cb, cancel_even
                     if speed and speed > 0:
                         remaining = max(0.0, (duration - done) / speed)
                         eta = f"{int(remaining // 60)}:{int(remaining % 60):02d}"
-                    cb(percent, f"{speed:.1f}x" if speed else None, eta, stage)
+                    cb(percent, f"{speed:.1f}x" if speed else None, eta, None, stage)     # a LABEL: one line, updated in place
 
     pump_task = asyncio.create_task(pump())
     started = time.monotonic()
@@ -312,7 +329,7 @@ async def run_ffmpeg(args: list[str], *, duration: float | None, cb, cancel_even
         tail = " ".join(err.splitlines()[-2:])[-250:] or f"ffmpeg exited with code {proc.returncode}"
         log.warning("ffmpeg failed (%s): %s", stage, err[-600:])
         raise ToolError(f"ffmpeg couldn't do that: {tail}")
-    cb(100.0, None, None, stage)
+    cb(100.0, None, None, None, stage)
 
 
 # ---------------------------------------------------------------- one entry point for the job manager
@@ -427,6 +444,12 @@ class InputStore:
         self._items[rid] = item
         return item
 
+    def touch(self, rid: str) -> None:
+        """Restart the clock: the file is kept for another TTL after it was last used."""
+        item = self._items.get(rid)
+        if item is not None:
+            item.at = self._clock()
+
     def get(self, rid: str, user_id: int) -> StoredInput | None:
         self.expire()
         item = self._items.get(rid)
@@ -453,3 +476,12 @@ def _make_store() -> InputStore:
 
 
 store = _make_store()
+
+
+async def embed_subtitles(video: Path, srts: list[tuple[str, Path]], workspace: Path, duration: float | None, cb,
+                          cancel_event: asyncio.Event | None) -> Path:
+    """The video with the subtitles as tracks (new mp4 in `workspace`)."""
+    dst = workspace / f"{video.stem} [subs].mp4"
+    await run_ffmpeg(embed_args(video, srts, dst), duration=duration, cb=cb, cancel_event=cancel_event,
+                     stage="Embedding subtitles")
+    return dst

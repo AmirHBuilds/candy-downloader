@@ -34,6 +34,7 @@ from telegram.error import TelegramError
 from config import OWNER_EMOJI
 from ui.steplog import step_line
 from downloader import tools as media_tools
+from ui import tools_menu
 from downloader import cookie_health
 from downloader.dispatcher import download as dispatch_download, NoToolSucceeded
 from downloader.errors import JobCancelled
@@ -575,7 +576,7 @@ class JobManager:
             if job.settings.get("tool"):
                 files = await media_tools.run(
                     job.settings, workspace,
-                    lambda percent, speed, eta, stage=None: progress_cb("tool", percent, speed, eta, stage),
+                    lambda *args: progress_cb("tool", *args),         # (percent, speed, eta, stage, label)
                     job.cancel_event)
             else:
                 files = await dispatch_download(job.url, workspace, job.settings, job.user_id, progress_cb,
@@ -601,7 +602,7 @@ class JobManager:
             await self._emit(job, "Uploading to Telegram...", markup=queued_menu(job.rid, job.url))
             await self._send_files(job, files)
             if job.settings.get("tool"):
-                media_tools.store.discard(job.rid)        # the uploaded original is no longer needed
+                media_tools.store.touch(job.rid)          # kept for another hour: more tools can be run on it
             # Things the downloader wants the person to know (e.g. subtitles couldn't be fetched).
             for note in job.settings.pop("delivery_notes", []):
                 try:
@@ -697,10 +698,25 @@ class JobManager:
                                              caption=f"◧ Subtitles{f' · {language}' if language else ''}",
                                              read_timeout=120, write_timeout=120, connect_timeout=60)
         if job.batch is None:                    # the shared message belongs to the batch
+            if tool_job and await self._restore_toolbox(job):
+                return
             try:
                 await self.bot.delete_message(job.chat_id, job.status_message_id)
             except TelegramError:
                 pass
+
+    async def _restore_toolbox(self, job: Job) -> bool:
+        """After a toolbox result, turn the progress message back into the toolbox (the uploaded file is still on the
+        server for an hour), so the next tool is one tap away. False = the file is gone: the caller cleans up."""
+        item = media_tools.store.get(job.rid, job.user_id)
+        if item is None:
+            return False
+        text, markup = tools_menu.toolbox_screen(item, job.rid)
+        try:
+            await self._safe_edit(job, text, markup)
+        except TelegramError:
+            return False
+        return True
 
     async def _safe_edit(self, job: Job, text: str, markup: InlineKeyboardMarkup | None = None) -> None:
         """Edit the job's status message - strictly in order, newest wins.

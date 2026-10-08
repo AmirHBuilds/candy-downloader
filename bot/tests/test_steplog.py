@@ -45,3 +45,13 @@ class StepSymbols(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ToolboxSteps(unittest.TestCase):
+    def test_the_toolboxs_steps_get_their_own_symbols(self):
+        from ui.steplog import symbol_for
+        for text, symbol in (("Extracting audio - 41% • x", "𝄞"), ("Trimming - 12%", "✄"), ("Cutting - 12%", "✄"),
+                             ("Burning subtitles - 50% • x", "✶"), ("Compressing - 3% • x", "✶"),
+                             ("Making the GIF - 80%", "✶"), ("Embedding subtitles - 9%", "✶"),
+                             ("Removing metadata - 99%", "✶")):
+            self.assertEqual(symbol_for(text), symbol, text)

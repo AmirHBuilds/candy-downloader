@@ -28,6 +28,8 @@ _RULES: list[tuple[re.Pattern, str]] = [
     (re.compile(r"^clip\b"), "✄"),
     (re.compile(r"^adding metadata|^metadata"), "⛃"),
     (re.compile(r"^moving|^movefiles"), "⇄"),
+    (re.compile(r"^(cutting|trimming)"), "✄"),                        # the toolbox's trim
+    (re.compile(r"^(burning|compressing|making the gif)"), "✶"),       # the toolbox's heavy re-encodes
     (re.compile(r"^merging"), "✶"),                                   # before the audio/video rules: "Merging video & audio" is both
     (re.compile(r"^audio\b|extracting audio|converting audio"), "𝄞"),   # Audio stream bars, audio extraction
     (re.compile(r"^video\b|converting video"), "✦"),                 # Video stream bars

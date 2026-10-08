@@ -15,7 +15,7 @@ Callback data "tl|<action>|...|<rid>" (rid last, like every other namespace):
 """
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-from downloader.tools import COMPRESS_TARGETS_MB, MAX_GIF_SECONDS, MediaInfo
+from downloader.tools import COMPRESS_TARGETS_MB, MAX_GIF_SECONDS, MediaInfo, burn_allowed
 from utils.text import esc
 
 
@@ -83,6 +83,12 @@ def toolbox_menu(info: MediaInfo, rid: str, burn_ok: bool = True) -> InlineKeybo
     rows.append([_btn("⌫ Remove metadata", f"tl|strip|{rid}")])
     rows.append([_btn("✕ Close", f"tl|x|{rid}")])
     return InlineKeyboardMarkup(rows)
+
+
+def toolbox_screen(item, rid: str, notice: str = ""):
+    """(text, keyboard) of the toolbox for a stored upload."""
+    return (toolbox_text(item.name, item.info, notice),
+            toolbox_menu(item.info, rid, burn_ok=burn_allowed(item.info.duration)))
 
 
 def audio_text(name: str, info: MediaInfo) -> str:

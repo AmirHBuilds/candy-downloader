@@ -6,6 +6,7 @@ import asyncio
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -18,6 +19,8 @@ from jobqueue import job_manager as jm  # noqa: E402
 from settings.user_settings import DEFAULTS  # noqa: E402
 from ui import tools_menu  # noqa: E402
 from tests.test_sections_flow import FakeBot, FakeContext, FakeQuery, FakeUpdate, FakeMessage, datas, labels  # noqa: E402
+
+_REAL_SUBTITLE_PASS = ytdlp_handler._subtitle_pass      # (the recovery tests replace it on the module)
 
 USER = 42
 RID = "tool000001"
@@ -264,8 +267,9 @@ class Running(unittest.IsolatedAsyncioTestCase):
 
     async def test_progress_is_reported_and_ends_at_100(self):
         await self.run_tool(tool="compress", target_mb=0.3)
-        self.assertEqual(self.events[-1][0], 100.0)
-        self.assertEqual(self.events[-1][3], "Compressing")
+        self.assertEqual(self.events[-1], (100.0, None, None, None, "Compressing"))
+        # Every tick is reported as a LABEL (5th argument), never as a stage: a stage starts a new line each time.
+        self.assertTrue(all(event[3] is None and event[4] == "Compressing" for event in self.events))
 
     async def test_cancelling_stops_ffmpeg_and_raises(self):
         event = asyncio.Event()
@@ -388,11 +392,191 @@ class BurnedInDownloads(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("No subtitles" in note for note in settings["delivery_notes"]))
 
 
+# ============================================================ subtitles that YouTube refused the first time
+class SubtitleRecovery(unittest.IsolatedAsyncioTestCase):
+    """HTTP 429 on the subtitle request: the video still arrives, and the subtitles get their own second chance."""
+
+    ERROR_429 = "ERROR: Unable to download video subtitles for 'en': HTTP Error 429: Too Many Requests"
+
+    def setUp(self):
+        self.workspace = Path(tempfile.mkdtemp(prefix="recover-"))
+        self.addCleanup(shutil.rmtree, self.workspace, ignore_errors=True)
+        self.passes: list[list[str]] = []
+        self.arrives: list[set] = []            # per attempt: which languages the "server" finally hands over
+        self.mains: list[dict] = []
+        self.main_error: Exception | None = RuntimeError(self.ERROR_429)
+
+        async def fake_main(url, workspace, settings, user_id, cb, cancel_event=None):
+            self.mains.append(dict(settings))
+            if settings.get("sub_langs") and self.main_error:
+                raise self.main_error
+            target = workspace / "Clip.mp4"
+            shutil.copy(VIDEO, target)
+            return [target]
+
+        async def fake_pass(url, workspace, settings, user_id, langs):
+            attempt = len(self.passes)
+            self.passes.append(list(langs))
+            for lang in (self.arrives[attempt] if attempt < len(self.arrives) else set()):
+                if lang in langs:
+                    (workspace / f"Clip.{lang}.srt").write_text(SRT.replace("Hello", lang), encoding="utf-8")
+
+        for name, value in (("_download_main", fake_main), ("_subtitle_pass", fake_pass),
+                            ("SUBTITLE_RETRY_DELAYS", (0, 0, 0))):
+            self.addCleanup(setattr, ytdlp_handler, name, getattr(ytdlp_handler, name))
+            setattr(ytdlp_handler, name, value)
+
+    async def download(self, langs, mode, **extra):
+        settings = {**DEFAULTS, "mode": "video", "quality": "best", "sub_langs": langs, "sub_mode": mode,
+                    "delivery_notes": [], **extra}
+        files = await ytdlp_handler._download_with_subtitles("https://youtu.be/x", self.workspace, settings, 1, lambda *a: None)
+        return files, settings
+
+    def names(self, files):
+        return sorted(f.name for f in files)
+
+    def subtitle_tracks(self, path):
+        return ffprobe(path, "stream=codec_type").count("subtitle")
+
+    async def test_the_video_is_fetched_without_subtitles_first_then_they_are_retried_on_their_own(self):
+        self.arrives = [set(), {"en"}]
+        files, settings = await self.download(["en"], "file")
+        self.assertEqual(self.names(files), ["Clip.en.srt", "Clip.mp4"])
+        self.assertNotIn("sub_langs", self.mains[1])                             # the video itself never carries them
+        self.assertEqual(self.passes, [["en"], ["en"]])
+        self.assertEqual(settings["delivery_notes"], [])                         # it worked: nothing to apologise for
+
+    async def test_only_the_missing_languages_are_asked_for_again(self):
+        self.arrives = [{"fa"}, {"en"}]
+        files, settings = await self.download(["fa", "en"], "file")
+        self.assertEqual(self.passes, [["fa", "en"], ["en"]])
+        self.assertEqual(self.names(files), ["Clip.en.srt", "Clip.fa.srt", "Clip.mp4"])
+        self.assertEqual(settings["delivery_notes"], [])
+
+    async def test_embedded_mode_puts_the_tracks_in_the_video_and_leaves_no_srt(self):
+        self.arrives = [{"fa", "en"}]
+        files, _ = await self.download(["fa", "en"], "embed")
+        self.assertEqual(self.names(files), ["Clip.mp4"])
+        self.assertEqual(self.subtitle_tracks(files[0]), 2)
+        self.assertTrue(probe_sync(files[0]).has_video)
+
+    async def test_embedded_plus_file_gives_both(self):
+        self.arrives = [{"fa"}]
+        files, _ = await self.download(["fa"], "both")
+        self.assertEqual(self.names(files), ["Clip.fa.srt", "Clip.mp4"])
+        mp4 = next(f for f in files if f.suffix == ".mp4")
+        self.assertEqual(self.subtitle_tracks(mp4), 1)
+
+    async def test_if_embedding_fails_the_subtitles_come_as_files_and_the_person_is_told(self):
+        async def broken(*a, **k):
+            raise tools.ToolError("ffmpeg said no")
+        self.addCleanup(setattr, tools, "embed_subtitles", tools.embed_subtitles)
+        tools.embed_subtitles = broken
+        self.arrives = [{"fa"}]
+        files, settings = await self.download(["fa"], "embed")
+        self.assertEqual(self.names(files), ["Clip.fa.srt", "Clip.mp4"])
+        self.assertTrue(any("Couldn't embed" in note for note in settings["delivery_notes"]))
+
+    async def test_burning_and_embedding_in_downloads_report_one_updating_line_too(self):
+        self.arrives = [{"fa"}]
+        seen = []
+        settings = {**DEFAULTS, "mode": "video", "quality": "best", "sub_langs": ["fa"], "sub_mode": "burn", "delivery_notes": []}
+        await ytdlp_handler._download_with_subtitles("https://youtu.be/x", self.workspace, settings, 1,
+                                                     lambda *a: seen.append(a))
+        ticks = [a for a in seen if a[0] is not None]
+        self.assertTrue(ticks)
+        self.assertTrue(all(a[3] is None and a[4] == "Burning subtitles" for a in ticks), ticks)
+
+    async def test_burned_in_draws_the_first_language_and_keeps_the_others_as_files(self):
+        self.arrives = [{"fa", "en"}]
+        files, settings = await self.download(["en", "fa"], "burn")
+        self.assertEqual(self.names(files), ["Clip.fa.srt", "Clip.mp4"])
+        mp4 = next(f for f in files if f.suffix == ".mp4")
+        self.assertEqual(self.subtitle_tracks(mp4), 0)                           # drawn into the picture, not a track
+        self.assertTrue(any("first language" in note for note in settings["delivery_notes"]))
+
+    async def test_burned_in_plus_file_keeps_every_language_as_a_file(self):
+        self.arrives = [{"fa", "en"}]
+        files, _ = await self.download(["en", "fa"], "burnfile")
+        self.assertEqual(self.names(files), ["Clip.en.srt", "Clip.fa.srt", "Clip.mp4"])
+
+    async def test_when_they_never_arrive_the_person_is_told_why_and_the_video_is_not_lost(self):
+        files, settings = await self.download(["en"], "embed")
+        self.assertEqual(self.names(files), ["Clip.mp4"])
+        self.assertEqual(self.passes, [["en"]] * 3)                              # three tries, then it gives up
+        [note] = settings["delivery_notes"]
+        self.assertIn("HTTP 429", note)
+        self.assertIn("Try again in a few minutes", note)
+
+    async def test_a_different_failure_gets_a_plain_note_not_a_429_claim(self):
+        self.main_error = RuntimeError("Postprocessing: ffmpeg could not embed")
+        _, settings = await self.download(["en"], "embed")
+        [note] = settings["delivery_notes"]
+        self.assertNotIn("429", note)
+        self.assertIn("couldn't be fetched", note)
+
+    async def test_a_partial_result_says_how_many_arrived(self):
+        self.arrives = [{"fa"}]
+        files, settings = await self.download(["fa", "en"], "file")
+        self.assertEqual(self.names(files), ["Clip.fa.srt", "Clip.mp4"])
+        [note] = settings["delivery_notes"]
+        self.assertIn("Only 1 of 2", note)
+        self.assertIn("429", note)
+
+    async def test_a_bot_check_is_still_not_blamed_on_subtitles(self):
+        self.main_error = RuntimeError("Sign in to confirm you're not a bot")
+        with self.assertRaises(RuntimeError):
+            await self.download(["en"], "embed")
+        self.assertEqual(self.passes, [])
+
+    async def test_cancelling_during_the_wait_between_tries_is_noticed(self):
+        ytdlp_handler.SUBTITLE_RETRY_DELAYS = (0, 30)
+        event = asyncio.Event()
+        settings = {**DEFAULTS, "mode": "video", "sub_langs": ["en"], "sub_mode": "embed", "delivery_notes": []}
+        task = asyncio.create_task(ytdlp_handler._download_with_subtitles(
+            "https://youtu.be/x", self.workspace, settings, 1, lambda *a: None, event))
+        await asyncio.sleep(0.3)
+        event.set()
+        with self.assertRaises(JobCancelled):
+            await asyncio.wait_for(task, timeout=5)
+
+    async def test_the_subtitle_pass_fetches_only_subtitles_and_ignores_the_archive(self):
+        """With "use_archive" on, the just-downloaded video is in the archive: the pass would skip it, subtitles included."""
+        captured = {}
+
+        class FakeYDL:
+            def __init__(self, opts):
+                captured.update(opts)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def download(self, urls):
+                captured["urls"] = urls
+                return 0
+
+        self.addCleanup(setattr, ytdlp_handler.yt_dlp, "YoutubeDL", getattr(ytdlp_handler.yt_dlp, "YoutubeDL", None))
+        ytdlp_handler.yt_dlp.YoutubeDL = FakeYDL
+        settings = {**DEFAULTS, "use_archive": True, "proxy": "socks5h://warp:1080", "sub_mode": "embed"}
+        await _REAL_SUBTITLE_PASS("https://youtu.be/x", self.workspace, settings, 1, ["fa", "en"])
+        self.assertNotIn("download_archive", captured)
+        self.assertTrue(captured["skip_download"] and captured["ignoreerrors"])
+        self.assertEqual((captured["subtitleslangs"], captured["writesubtitles"], captured["writeautomaticsub"]),
+                         (["fa", "en"], True, True))
+        self.assertEqual([pp["key"] for pp in captured["postprocessors"]], ["FFmpegSubtitlesConvertor"])   # no embedding here
+        self.assertEqual(captured["proxy"], "socks5h://warp:1080")                # the same route as the video
+        self.assertEqual(captured["urls"], ["https://youtu.be/x"])
+
+
 # ============================================================ handlers in main.py
 class Media:
     """A fake Telegram video/audio/document that 'downloads' a sample file."""
     def __init__(self, source=VIDEO, name="holiday.mp4", size=None, fail=False):
         self.source, self.file_name, self.mime_type, self.title = source, name, "video/mp4", None
+        self.file_path = None                       # where the local Bot API server keeps its copy
         self.file_size = size if size is not None else source.stat().st_size
         self.fail = fail
 
@@ -549,6 +733,67 @@ class Handlers(unittest.IsolatedAsyncioTestCase):
             await self.send(video=Media(VIDEO, "a.mp4"))
         self.assertEqual(len(tools.store.for_user(USER)), main.MAX_STORED_UPLOADS_PER_USER)
         self.assertEqual(len(list(self.root.iterdir())), main.MAX_STORED_UPLOADS_PER_USER)
+
+    # -- the local Bot API server's copy of what was sent
+    def server_copy(self, folder, name, source=VIDEO):
+        import config
+        root = Path(tempfile.mkdtemp(prefix="botapi-root-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        self.addCleanup(setattr, config, "BOT_API_DATA_DIR", config.BOT_API_DATA_DIR)
+        config.BOT_API_DATA_DIR = str(root)
+        path = root / "123:ABC" / folder / name
+        path.parent.mkdir(parents=True)
+        shutil.copy(source, path)
+        return path
+
+    async def test_the_servers_copy_of_an_upload_is_deleted_once_we_have_ours(self):
+        server = self.server_copy("videos", "file_1.mp4")
+        media = Media(VIDEO, "holiday.mp4")
+        media.file_path = str(server)
+        status = await self.send(video=media)
+        self.assertIn("Toolbox", status.text)
+        self.assertFalse(server.exists())
+        self.assertTrue(tools.store.get(next(iter(tools.store._items)), USER).path.is_file())
+
+    async def test_the_servers_copy_of_an_unreadable_upload_is_deleted_too_or_at_least_not_kept_by_us(self):
+        server = self.server_copy("videos", "file_2.mp4")
+        media = Media(VIDEO, "x.mp4")
+        media.file_path = str(server)
+        await self.send(video=media)
+        self.assertFalse(server.exists())
+
+    async def test_the_servers_copy_of_a_subtitle_file_is_deleted(self):
+        _, rid = await self.upload()
+        await self.tap(f"tl|burn|{rid}")
+        server = self.server_copy("documents", "file_3.srt", source=SUBS)
+        document = Media(SUBS, "subs.srt")
+        document.file_path = str(server)
+        update = FakeUpdate(self.bot)
+        update.message = Incoming(document=document)
+        await main.srt_handler(update, FakeContext(self.bot))
+        self.assertFalse(server.exists())
+        self.assertEqual(self.jobs.enqueued[-1]["settings"]["tool"], "burn")
+
+    async def test_the_servers_copy_of_a_cookies_file_is_deleted_it_is_a_secret(self):
+        import config
+        cookies_dir = Path(tempfile.mkdtemp(prefix="cookies-"))
+        self.addCleanup(shutil.rmtree, cookies_dir, ignore_errors=True)
+        self.addCleanup(setattr, config, "COOKIES_DIR", config.COOKIES_DIR)
+        config.COOKIES_DIR = str(cookies_dir)
+        self.addCleanup(setattr, main, "update_setting", main.update_setting)
+        self.addCleanup(setattr, main, "inspect_cookie_file", main.inspect_cookie_file)
+        main.update_setting = lambda *a, **k: None
+        main.inspect_cookie_file = lambda path: {"netscape": True, "youtube": False, "logged_in": False, "expired": False}
+        cookies = _TMP / "cookies.txt"
+        cookies.write_text("# Netscape HTTP Cookie File\n")
+        server = self.server_copy("documents", "file_4.txt", source=cookies)
+        document = Media(cookies, "cookies.txt")
+        document.file_path = str(server)
+        update = FakeUpdate(self.bot)
+        update.message = Incoming(document=document)
+        await main.cookies_file_handler(update, FakeContext(self.bot))
+        self.assertTrue((cookies_dir / f"{USER}.txt").is_file())
+        self.assertFalse(server.exists())
 
     # -- one-tap tools
     async def test_extract_audio_asks_for_a_format_then_queues_the_job(self):
@@ -772,6 +1017,7 @@ class TelegramBot(FakeBot):
         super().__init__()
         self.sent: list[dict] = []
         self.deleted: list = []
+        self.edited: list = []
 
     def _record(self, kind, kw, file):
         self.sent.append({"kind": kind, "markup": kw.get("reply_markup"), "caption": kw.get("caption", ""),
@@ -795,8 +1041,8 @@ class TelegramBot(FakeBot):
     async def delete_message(self, chat_id, message_id):
         self.deleted.append(message_id)
 
-    async def edit_message_text(self, *a, **kw):
-        pass
+    async def edit_message_text(self, text, **kw):
+        self.edited.append((text, kw.get("reply_markup"), kw.get("message_id")))
 
     async def send_message(self, *a, **kw):
         pass
@@ -808,6 +1054,7 @@ class Delivery(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.bot = TelegramBot()
         self.manager = jm.JobManager(self.bot, max_concurrent=1)
+        self.edits: list = []
         self.addCleanup(setattr, tools, "store", tools.store)
         tools.store = tools.InputStore(self.tmp / "uploads")
         self.addCleanup(setattr, jm, "job_workspace", jm.job_workspace)
@@ -838,8 +1085,12 @@ class Delivery(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent["kind"], "video")
         self.assertIsNone(sent["markup"])                                         # nothing to copy, nothing cached
         self.assertNotIn("compressed preview", sent["caption"])
-        self.assertEqual(self.bot.deleted, [55])                                  # the status message is cleaned up
-        self.assertIsNone(tools.store.get(RID, 1))                                # the original is discarded
+        self.assertEqual(self.bot.deleted, [])                                    # the first message is NOT removed ...
+        text, markup, message_id = self.bot.edited[-1]
+        self.assertEqual(message_id, 55)
+        self.assertIn("Toolbox", text)                                            # ... it turns back into the toolbox
+        self.assertIn("tl|strip|" + RID, datas(markup))
+        self.assertIsNotNone(tools.store.get(RID, 1))                             # and the original stays for more tools
 
     async def test_results_sent_as_documents_carry_no_buttons_either(self):
         mkv = self.tmp / "clip [clean].avi"
@@ -850,6 +1101,52 @@ class Delivery(unittest.IsolatedAsyncioTestCase):
         job.force_document = True
         await self.manager._send_files(job, [mkv])
         self.assertEqual((self.bot.sent[1]["kind"], self.bot.sent[1]["markup"]), ("document", None))
+
+    async def test_the_clock_restarts_after_each_result_so_the_file_lives_an_hour_from_last_use(self):
+        job = self.job("strip")
+        ten_minutes_ago = time.time() - 600
+        tools.store._items[RID].at = ten_minutes_ago
+        await self.manager._run_job(job)
+        self.assertGreater(tools.store._items[RID].at, ten_minutes_ago + 500)
+
+    async def test_several_tools_can_run_on_the_same_upload_one_after_another(self):
+        await self.manager._run_job(self.job("strip"))
+        again = jm.Job(rid=RID, user_id=1, chat_id=7, url="tool://audio",
+                       settings={**DEFAULTS, "tool": "audio", "audio_format": "mp3", "tool_input": str(tools.store.get(RID, 1).path),
+                                 "tool_name": "video.mp4", "tool_duration": 6, "tool_has_video": True, "tool_height": 180},
+                       status_message_id=56, header="Queued", title="video.mp4")
+        await self.manager._run_job(again)
+        self.assertEqual([s["kind"] for s in self.bot.sent], ["video", "audio"])
+
+    async def test_if_the_upload_is_gone_the_progress_message_is_removed_instead(self):
+        job = self.job("strip")
+        original = media_tools_run = jm.media_tools.run
+
+        async def run_then_forget(settings, workspace, cb, cancel_event):
+            files = await original(settings, workspace, cb, cancel_event)
+            tools.store.discard(RID)                        # e.g. the person pressed Close meanwhile
+            return files
+        self.addCleanup(setattr, jm.media_tools, "run", original)
+        jm.media_tools.run = run_then_forget
+        await self.manager._run_job(job)
+        self.assertEqual(self.bot.deleted, [55])
+
+    async def test_a_tool_jobs_bar_is_one_line_updated_in_place(self):
+        job = self.job("audio", audio_format="mp3")
+
+        async def ticking(settings, workspace, cb, cancel_event):
+            for percent in (5, 17, 29, 41, 53, 100):
+                cb(percent, "17.8x", None, None, "Extracting audio")
+                await asyncio.sleep(0)
+            out = workspace / "a.mp3"
+            out.write_bytes(b"x" * 10)
+            return [out]
+        self.addCleanup(setattr, jm.media_tools, "run", jm.media_tools.run)
+        jm.media_tools.run = ticking
+        await self.manager._run_job(job)
+        lines = [step for step in job.steps if "Extracting audio" in step]
+        self.assertEqual(len(lines), 1, job.steps)
+        self.assertIn("100%", lines[0])
 
     async def test_a_gif_is_sent_as_an_animation(self):
         await self.manager._run_job(self.job("gif", start=0, length=2))

@@ -1,3 +1,4 @@
+import re
 from html import escape as _esc
 
 from config import OWNER_NAME, OWNER_EMOJI
@@ -42,6 +43,14 @@ def preview_failed_note(error: str) -> str:
     if "timed out" in low:
         return "The preview took too long to load (slow connection?), but you can still try downloading it."
     return "Couldn't load a preview for this link, but you can still try downloading it."
+
+
+def preview_failed_reason(error: str) -> str:
+    """The site's own words for why the preview failed, short and escaped, as an extra line under the note - so
+    "needs a login" is not a guess (Instagram: "rate-limit reached or login required")."""
+    text = re.sub(r"^\s*(ERROR:\s*)?(\[[^\]]+\]\s*[\w\-]*:?\s*)?", "", error or "").strip()
+    first = (text.splitlines() or [""])[0].strip()[:140]
+    return f"\n<i>{_esc(first)}</i>" if first else ""
 
 
 def unsupported_link() -> str:
