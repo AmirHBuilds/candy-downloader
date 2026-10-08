@@ -75,22 +75,29 @@ services:
       BURN_MAX_SECONDS: ${BURN_MAX_SECONDS:-3600}
       PROXY_DOMAINS: ${PROXY_DOMAINS:-youtube.com,youtu.be,x.com,twitter.com,instagram.com,pinterest.com,pin.it,reddit.com,tiktok.com}
       PROCESS_NICE: ${PROCESS_NICE:-10}
+      BOT_API_CLEANUP: ${BOT_API_CLEANUP:-on}
+      BOT_API_FILE_MAX_AGE_MINUTES: ${BOT_API_FILE_MAX_AGE_MINUTES:-60}
+      HOUSEKEEPING_INTERVAL_SECONDS: ${HOUSEKEEPING_INTERVAL_SECONDS:-300}
     # Keeps a heavy ffmpeg job (converting, exact clip cuts) from taking over your PC. Raise or remove
     # these on a bigger machine; Docker Desktop also has its own CPU/RAM caps under Settings > Resources.
+    # The bot runs as PID 1 and starts ffmpeg/aria2c/gallery-dl; without a real init, any child that gets
+    # orphaned stays a zombie forever. `init: true` puts Docker's tiny init (tini) in front, which reaps them.
+    init: true
     cpus: ${BOT_CPUS:-2}
     mem_limit: ${BOT_MEM_LIMIT:-3g}
     volumes:
       - ./data:/app/data           # per-user settings, small persistent DB
       - ./tmp:/app/tmp             # scratch space for in-progress downloads (auto-cleaned)
       - ./cookies:/app/cookies     # optional per-user cookie files for logged-in sites
-      - bot_api_data:/var/lib/telegram-bot-api:ro
+      - bot_api_data:/var/lib/telegram-bot-api      # read-write on purpose: the bot deletes the server's copies of files it was sent
     # That last mount is NOT optional, unlike the comment used to say here:
     # with TELEGRAM_LOCAL=1 above, the bot-api server's HTTP file-serving
     # endpoint is switched off entirely, and any file the user sends TO the
     # bot (cookies.txt, and anything else in future) can only be read by
     # reaching directly into the bot-api server's own storage - which is
-    # exactly what this shared, read-only mount lets python-telegram-bot's
-    # download_to_drive() do automatically.
+    # exactly what this shared mount lets python-telegram-bot's
+    # download_to_drive() do automatically. It is read-WRITE so the bot can delete those copies again
+    # (utils/cleanup.py touches only the documents/videos/audios/... folders, never the server's database).
 
 volumes:
   bot_api_data:

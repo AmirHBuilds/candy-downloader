@@ -578,8 +578,9 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         edit = await self.tap(f"dl|sub|t|1|0|{RID}")
         self.assertIn("● Persian", labels(edit["markup"]))
         self.assertIn("Selected: Persian, English · embedded track", edit["text"])
-        edit = await self.tap(f"dl|sub|m|both|0|{RID}")
-        self.assertIn("● Both", labels(edit["markup"]))
+        edit = await self.tap(f"dl|sub|m|file|0|{RID}")                    # a switch: .srt on, Embedded stays on
+        self.assertIn("● .srt file", labels(edit["markup"]))
+        self.assertIn("● Embedded", labels(edit["markup"]))
         self.assertIn("embedded + .srt file", edit["text"])
         edit = await self.tap(f"dl|sub|t|0|0|{RID}")                      # tapping again removes
         self.assertIn("Selected: English", edit["text"])
@@ -621,13 +622,36 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_quality_button_downloads_with_the_subtitles(self):
         self.with_subs()
         await self.tap(f"dl|sub|t|0|0|{RID}")
-        await self.tap(f"dl|sub|m|file|0|{RID}")
+        await self.tap(f"dl|sub|m|file|0|{RID}")                           # embedded + file ...
+        await self.tap(f"dl|sub|m|embed|0|{RID}")                          # ... then embedded off: file only
         await self.tap(f"dl|video|720p|{RID}")
         settings = self.jobs.enqueued[0]["settings"]
         self.assertEqual((settings["sub_langs"], settings["sub_mode"]), (["fa"], "file"))
         self.assertEqual(settings["quality"], "720p")
         self.assertNotIn(RID, main.pending_subs)
         self.assertEqual(main.last_download[RID][2]["sub_langs"], ["fa"])  # Try again keeps them
+
+    async def test_turning_the_last_switch_off_is_refused_with_a_reason(self):
+        self.with_subs()
+        await self.tap(f"dl|sub|open|0|{RID}")
+        edit = await self.tap(f"dl|sub|m|embed|0|{RID}")
+        self.assertIn("at least one", edit["text"])
+        self.assertEqual(main.pending_subs[RID].mode, "embed")
+
+    async def test_burned_in_switches_embedded_off_and_back(self):
+        self.with_subs()
+        await self.tap(f"dl|sub|open|0|{RID}")
+        edit = await self.tap(f"dl|sub|m|burn|0|{RID}")
+        self.assertEqual([l for l in labels(edit["markup"]) if l[0] in "●○"][:3], ["○ Embedded", "○ .srt file", "● Burned in"])
+        self.assertEqual(main.pending_subs[RID].mode, "burn")
+        edit = await self.tap(f"dl|sub|m|embed|0|{RID}")
+        self.assertEqual(main.pending_subs[RID].mode, "embed")
+
+    async def test_the_option_buttons_are_one_row_of_three(self):
+        self.with_subs()
+        edit = await self.tap(f"dl|sub|open|0|{RID}")
+        first_row = [b.callback_data for b in edit["markup"].inline_keyboard[0]]
+        self.assertEqual(first_row, [f"dl|sub|m|embed|0|{RID}", f"dl|sub|m|file|0|{RID}", f"dl|sub|m|burn|0|{RID}"])
 
     async def test_audio_downloads_ignore_subtitles(self):
         self.with_subs()

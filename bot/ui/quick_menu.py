@@ -116,8 +116,11 @@ def extended_video_menu(probe: ProbeResult, rid: str, section_count: int = 0,
     rows.append([InlineKeyboardButton(_sized("↓ Smallest size", size_labels, "worst"),
                                        callback_data=f"dl|video|worst|{rid}")])
     rows.extend(_split_row(probe, rid, section_count, size_labels))
-    rows.extend(_subtitles_row(probe, rid, section_count, subtitle_count))
-    rows.extend(_clip_row(probe, rid, section_count))
+    # Subtitles and Add section share a row when both are offered (each is one short button).
+    side_by_side = [button for row in (*_subtitles_row(probe, rid, section_count, subtitle_count),
+                                       *_clip_row(probe, rid, section_count)) for button in row]
+    if side_by_side:
+        rows.append(side_by_side)
     rows.append([InlineKeyboardButton("← Back", callback_data=f"dl|backq|{rid}")])
     return InlineKeyboardMarkup(rows)
 

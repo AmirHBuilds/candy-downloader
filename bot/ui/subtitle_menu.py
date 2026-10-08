@@ -5,17 +5,17 @@ how to deliver them. Languages are paged, Persian and English first.
 Callback data "dl|sub|<action>|...|<rid>" (rid last, like every dl| button):
   dl|sub|open|<page>|<rid>          show the screen at a page
   dl|sub|t|<index>|<page>|<rid>     toggle one language (index into the track list)
-  dl|sub|m|<mode>|<page>|<rid>      embed | file | both
+  dl|sub|m|<option>|<page>|<rid>    switch one of: embed | file | burn (embed and burn exclude each other)
   dl|sub|clr|<rid>                  clear the choice
 "Back" is dl|moreq, which returns to More options (where the entry button lives).
 """
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-from downloader.subtitles import MAX_LANGS, MODE_NAMES, TRACKS_PER_PAGE, SubChoice, clamp_page, page_count
+from downloader.subtitles import (
+    MAX_LANGS, MODE_NAMES, OPTION_LABELS, OPTIONS, TRACKS_PER_PAGE, SubChoice, burn_split, clamp_page, page_count,
+)
 from utils.text import esc
 
-_MODE_LABELS = {"embed": "Embedded", "file": ".srt file", "both": "Both", "burn": "Burned in"}
-_ORDER = ("embed", "file", "both", "burn")
 
 
 def _btn(text: str, data: str) -> InlineKeyboardButton:
@@ -31,13 +31,20 @@ def subtitles_text(choice: SubChoice, tracks: list, page: int, title: str = "", 
     names = {t.code: t.name for t in tracks}
     chosen = ", ".join(names.get(code, code) for code in choice.langs) or "none"
     lines.append(f"Selected: {esc(chosen)} · {MODE_NAMES[choice.mode]}")
+    burned, others = burn_split(choice, tracks)
+    if burned:
+        lines.append(f"🔥 Burning in: <b>{esc(burned)}</b> (the first one you tapped)")
+        if choice.has("file"):
+            lines.append("All selected languages also come as .srt files.")
+        elif others:
+            lines.append(f"Sent as .srt files: {esc(', '.join(others))}")
     if pages > 1:
         lines.append(f"Page {clamp_page(tracks, page) + 1} of {pages}")
     lines.append(f"<i>Up to {MAX_LANGS} languages. Telegram's own player may not show an embedded track; "
                  f"the .srt file works in any player.</i>")
-    if choice.mode == "burn":
+    if choice.has("burn"):
         lines.append("<i>Burned in is drawn into the picture, so every player shows it. It uses the first language "
-                     "(the others come as .srt files) and re-encodes the video, which takes longer.</i>")
+                     "(the others come as .srt files unless you switch .srt file on) and re-encodes the video, which takes longer.</i>")
     if notice:
         lines += ["", f"⚠ {esc(notice)}"]
     return "\n".join(lines)
@@ -45,9 +52,9 @@ def subtitles_text(choice: SubChoice, tracks: list, page: int, title: str = "", 
 
 def subtitles_menu(choice: SubChoice, tracks: list, page: int, rid: str) -> InlineKeyboardMarkup:
     page = clamp_page(tracks, page)
-    buttons = [_btn(("● " if choice.mode == mode else "○ ") + _MODE_LABELS[mode], f"dl|sub|m|{mode}|{page}|{rid}")
-               for mode in _ORDER]
-    rows = [buttons[:2], buttons[2:]]
+    # Three independent switches (Embedded and Burned in switch each other off).
+    rows = [[_btn(("● " if choice.has(option) else "○ ") + OPTION_LABELS[option], f"dl|sub|m|{option}|{page}|{rid}")
+             for option in OPTIONS]]
 
     first = page * TRACKS_PER_PAGE
     for index in range(first, min(first + TRACKS_PER_PAGE, len(tracks))):

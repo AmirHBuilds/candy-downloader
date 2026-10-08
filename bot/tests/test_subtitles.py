@@ -80,6 +80,29 @@ class Choice(unittest.TestCase):
         self.assertTrue(choice.toggle("tr"))
         self.assertEqual(choice.settings(), {"sub_langs": ["fa", "en", "ar", "tr"], "sub_mode": "embed"})
 
+    def test_the_three_switches_combine_freely_except_embedded_with_burned_in(self):
+        choice = SubChoice()
+        self.assertEqual((choice.has("embed"), choice.has("file"), choice.has("burn")), (True, False, False))
+        self.assertTrue(choice.toggle_option("file"))
+        self.assertEqual(choice.mode, "both")                                    # embedded AND .srt: the old "Both"
+        self.assertTrue(choice.toggle_option("burn"))
+        self.assertEqual((choice.mode, choice.has("embed")), ("burnfile", False))  # burning switched embedding off
+        self.assertFalse(choice.toggle_option("file"))
+        self.assertEqual(choice.mode, "burn")
+        self.assertTrue(choice.toggle_option("embed"))
+        self.assertEqual((choice.mode, choice.has("burn")), ("embed", False))      # and the other way round
+
+    def test_the_last_switch_cannot_be_turned_off_and_unknown_ones_are_refused(self):
+        choice = SubChoice()
+        with self.assertRaisesRegex(SubtitleError, "at least one"):
+            choice.toggle_option("embed")
+        self.assertEqual(choice.mode, "embed")
+        with self.assertRaises(SubtitleError):
+            choice.toggle_option("both")
+        choice.toggle_option("file")
+        choice.toggle_option("embed")
+        self.assertEqual(choice.mode, "file")
+
     def test_modes(self):
         choice = SubChoice()
         for mode in ("file", "both", "burn", "embed"):
@@ -87,6 +110,7 @@ class Choice(unittest.TestCase):
             self.assertEqual(choice.mode, mode)
         with self.assertRaises(SubtitleError):
             choice.set_mode("bogus")
+        self.assertEqual(SubChoice(["fa"], "burnfile").settings()["sub_mode"], "burnfile")
 
     def test_summary(self):
         tracks = [SubTrack("fa", "Persian"), SubTrack("en", "English")]
@@ -113,7 +137,8 @@ class Screen(unittest.TestCase):
 
     def test_mode_row_marks_the_current_choice(self):
         menu = subtitle_menu.subtitles_menu(SubChoice(mode="file"), many_tracks(3), 0, RID)
-        self.assertEqual(labels(menu)[:3], ["○ Embedded", "● .srt file", "○ Both"])
+        self.assertEqual(labels(menu)[:3], ["○ Embedded", "● .srt file", "○ Burned in"])
+        self.assertEqual(len(menu.inline_keyboard[0]) if hasattr(menu, "inline_keyboard") else 3, 3)        # one row
 
     def test_paging(self):
         tracks = many_tracks(20)
@@ -198,6 +223,15 @@ class SafetyNet(unittest.IsolatedAsyncioTestCase):
         self.workspace = Path(tempfile.mkdtemp(prefix="subs-"))
         self.addCleanup(shutil.rmtree, self.workspace, ignore_errors=True)
         yt_dlp.reset([])
+        # The second chance fetches subtitles in a separate pass: here it finds nothing, and doesn't wait.
+        self.passes: list[list[str]] = []
+
+        async def nothing_found(url, workspace, settings, user_id, langs):
+            self.passes.append(list(langs))
+        self.addCleanup(setattr, ytdlp_handler, "_subtitle_pass", ytdlp_handler._subtitle_pass)
+        ytdlp_handler._subtitle_pass = nothing_found
+        self.addCleanup(setattr, ytdlp_handler, "SUBTITLE_RETRY_DELAYS", ytdlp_handler.SUBTITLE_RETRY_DELAYS)
+        ytdlp_handler.SUBTITLE_RETRY_DELAYS = (0, 0, 0)
 
     async def run_download(self, **settings):
         full = dict(DEFAULTS, mode="video", quality="best", **settings)
@@ -212,7 +246,8 @@ class SafetyNet(unittest.IsolatedAsyncioTestCase):
         self.assertIn("writesubtitles", yt_dlp.CALLS[0])
         self.assertNotIn("writesubtitles", yt_dlp.CALLS[1])                       # the retry has no subtitle options
         self.assertEqual(len(settings["delivery_notes"]), 1)
-        self.assertIn("without them", settings["delivery_notes"][0])
+        self.assertIn("sent without subtitles", settings["delivery_notes"][0])
+        self.assertEqual(len(self.passes), 3)                                    # the subtitles got their own second chances
 
     async def test_leftovers_of_the_failed_attempt_are_cleared(self):
         (self.workspace / "half.f251.webm.part").write_bytes(b"x")
@@ -418,3 +453,84 @@ class Delivery(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BurnScreen(unittest.TestCase):
+    """The Subtitles screen says WHICH language will be burned in (the first one tapped) and what happens to the rest."""
+
+    def setUp(self):
+        from downloader.subtitles import burn_split  # noqa: F401
+        self.tracks = [SubTrack("fa", "Persian"), SubTrack("en", "English"), SubTrack("de", "German")]
+
+    def test_the_first_tapped_language_is_burned_and_the_rest_become_srt(self):
+        from downloader.subtitles import burn_split
+        self.assertEqual(burn_split(SubChoice(["en", "fa"], "burn"), self.tracks), ("English", ["Persian"]))
+        self.assertEqual(burn_split(SubChoice(["fa"], "burn"), self.tracks), ("Persian", []))
+
+    def test_other_modes_and_empty_choices_burn_nothing(self):
+        from downloader.subtitles import burn_split
+        self.assertEqual(burn_split(SubChoice(["fa", "en"], "both"), self.tracks), (None, []))
+        self.assertEqual(burn_split(SubChoice([], "burn"), self.tracks), (None, []))
+
+    def test_the_screen_shows_it(self):
+        from ui.subtitle_menu import subtitles_text
+        text = subtitles_text(SubChoice(["en", "fa"], "burn"), self.tracks, 0)
+        self.assertIn("Burning in: <b>English</b>", text)
+        self.assertIn("Sent as .srt files: Persian", text)
+        single = subtitles_text(SubChoice(["fa"], "burn"), self.tracks, 0)
+        self.assertIn("Burning in: <b>Persian</b>", single)
+        self.assertNotIn("Sent as .srt files", single)
+        self.assertNotIn("Burning in", subtitles_text(SubChoice(["fa"], "both"), self.tracks, 0))
+        self.assertNotIn("Burning in", subtitles_text(SubChoice([], "burn"), self.tracks, 0))
+
+    def test_an_unknown_language_code_is_shown_as_is_and_escaped(self):
+        from ui.subtitle_menu import subtitles_text
+        text = subtitles_text(SubChoice(["x<y"], "burn"), self.tracks, 0)
+        self.assertIn("x&lt;y", text)
+
+
+    def test_with_burned_in_and_srt_both_on_every_language_also_comes_as_a_file(self):
+        from ui.subtitle_menu import subtitles_text
+        text = subtitles_text(SubChoice(["en", "fa"], "burnfile"), self.tracks, 0)
+        self.assertIn("Burning in: <b>English</b>", text)
+        self.assertIn("All selected languages also come as .srt files", text)
+        self.assertNotIn("Sent as .srt files: Persian", text)
+        self.assertEqual(subs.burn_split(SubChoice(["en", "fa"], "burnfile"), self.tracks), ("English", ["Persian"]))
+
+
+class MoreOptionsRow(unittest.TestCase):
+    """Subtitles and Add section sit side by side on the More options screen."""
+
+    def probe(self, subtitles=True, duration=600):
+        from downloader.probe import ProbeResult
+        return ProbeResult(ok=True, title="t", heights=[1080, 720], has_audio=True, duration=duration,
+                           subtitles=[SubTrack("fa", "Persian")] if subtitles else [])
+
+    def rows(self, **kwargs):
+        from ui import quick_menu
+        probe = kwargs.pop("probe", None) or self.probe()
+        menu = quick_menu.extended_video_menu(probe, RID, **kwargs)
+        return [[b.text for b in row] for row in menu.inline_keyboard]
+
+    def test_both_buttons_share_one_row(self):
+        rows = self.rows()
+        self.assertIn(["◧ Subtitles", "✄ Add section"], rows)
+        self.assertEqual(sum(1 for row in rows for text in row if "Subtitles" in text or "section" in text), 2)
+
+    def test_only_the_one_that_applies_is_shown_alone(self):
+        self.assertIn(["◧ Subtitles"], self.rows(probe=self.probe(duration=0)))
+        self.assertIn(["✄ Add section"], self.rows(probe=self.probe(subtitles=False)))
+
+    def test_with_sections_chosen_the_subtitles_button_goes_away_and_sections_stays(self):
+        rows = self.rows(section_count=2)
+        self.assertIn(["✄ Sections (2) ✓"], rows)
+        self.assertFalse([row for row in rows if any("Subtitles" in text for text in row)])
+
+    def test_chosen_counts_show_in_the_shared_row(self):
+        self.assertIn(["◧ Subtitles (2) ✓", "✄ Add section"], self.rows(subtitle_count=2))
+
+    def test_the_callbacks_are_unchanged(self):
+        from ui import quick_menu
+        menu = quick_menu.extended_video_menu(self.probe(), RID)
+        row = next(r for r in menu.inline_keyboard if len(r) == 2 and "Subtitles" in r[0].text)
+        self.assertEqual([b.callback_data for b in row], [f"dl|sub|open|0|{RID}", f"dl|sec|open|{RID}"])

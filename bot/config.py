@@ -64,3 +64,11 @@ PROCESS_NICE = int(os.getenv("PROCESS_NICE", "10"))
 # Burned-in subtitles re-encode the whole video (slow, heavy on a small machine): longer videos are
 # sent with the subtitles as a separate .srt instead. 0 = no limit.
 BURN_MAX_SECONDS = int(os.getenv("BURN_MAX_SECONDS", str(60 * 60))) or 10 ** 9
+
+# --- Housekeeping (see utils/housekeeping.py) ----------------------------------------------------
+HOUSEKEEPING_INTERVAL_SECONDS = int(os.getenv("HOUSEKEEPING_INTERVAL_SECONDS", "300"))
+# The local Bot API server keeps a copy of every file anyone sends the bot (videos, cookies.txt, ...). The bot
+# deletes its copy as soon as it has its own, and sweeps anything older than this as a safety net.
+BOT_API_DATA_DIR = os.getenv("BOT_API_DATA_DIR", "/var/lib/telegram-bot-api").rstrip("/")
+BOT_API_FILE_MAX_AGE_MINUTES = int(os.getenv("BOT_API_FILE_MAX_AGE_MINUTES", "60"))
+BOT_API_CLEANUP = os.getenv("BOT_API_CLEANUP", "on").strip().lower() != "off"

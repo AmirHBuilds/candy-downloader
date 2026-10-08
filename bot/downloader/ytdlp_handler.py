@@ -360,11 +360,16 @@ async def _download_resilient(url: str, workspace: Path, settings: dict, user_id
         _CAPTURE.reset(token)
 
 
+# YouTube rate-limits subtitle requests (HTTP 429) far more than video requests, and a shared address (WARP)
+# makes it likelier. So a failed subtitle fetch is retried on its own, a little later, without touching the video.
+SUBTITLE_RETRY_DELAYS = (0, 8, 25)
+
+
 async def _download_with_subtitles(url: str, workspace: Path, settings: dict, user_id: int,
                                    progress_cb: ProgressCB, cancel_event: asyncio.Event | None = None) -> list[Path]:
-    """Subtitles are the one thing that can break an otherwise fine download
-    (a postprocessor yt-dlp doesn't like, a subtitle host that refuses), so when they were asked
-    for, a failure is retried once WITHOUT them - the video matters more - and the person is told."""
+    """Subtitles are the one thing that can break an otherwise fine download (YouTube answers 429 to the subtitle
+    request, a postprocessor refuses). The video matters more: on any such failure it is downloaded again WITHOUT
+    subtitles, and the subtitles get their own second chance (_recover_subtitles) before the person is told."""
     if not settings.get("sub_langs") or settings.get("sections"):    # (clips never carry subtitles)
         return await _download_main(url, workspace, settings, user_id, progress_cb, cancel_event)
     try:
@@ -374,16 +379,134 @@ async def _download_with_subtitles(url: str, workspace: Path, settings: dict, us
     except Exception as exc:  # noqa: BLE001
         if _looks_like_bot_check(exc):
             raise                                    # not a subtitle problem
-        log.warning("Download with subtitles failed (%s); retrying without them", exc)
-        _add_note(settings, "◧ Subtitles couldn't be added this time, so the video was sent without them.")
-        for leftover in workspace.iterdir():
-            shutil.rmtree(leftover, ignore_errors=True) if leftover.is_dir() else leftover.unlink(missing_ok=True)
+        log.warning("Download with subtitles failed (%s); fetching the video without them first", exc)
+        _clear(workspace)
         plain = {k: v for k, v in settings.items() if k not in ("sub_langs", "sub_mode")}
-        return await _download_main(url, workspace, plain, user_id, progress_cb, cancel_event)
+        files = await _download_main(url, workspace, plain, user_id, progress_cb, cancel_event)
+        return await _recover_subtitles(files, url, workspace, settings, user_id, progress_cb, cancel_event, str(exc))
     files = await _verify_subtitles(files, settings)
-    if settings.get("sub_mode") == "burn":
+    if settings.get("sub_mode") in ("burn", "burnfile"):
         files = await _burn_subtitles(files, workspace, settings, progress_cb, cancel_event)
     return files
+
+
+def _subtitle_failure_note(reason: str, partial: str = "") -> str:
+    if "429" in reason or "too many requests" in reason.lower():
+        why = "YouTube is limiting subtitle requests from this server right now (HTTP 429)"
+    else:
+        why = "the subtitles couldn't be fetched"
+    return f"◧ {partial or 'The video was sent without subtitles'}: {why}. Try again in a few minutes."
+
+
+async def _sleep(seconds: float, cancel_event: asyncio.Event | None) -> None:
+    """Wait, but notice a cancel within half a second."""
+    end = time.monotonic() + seconds
+    while (left := end - time.monotonic()) > 0:
+        _raise_if_cancelled(cancel_event)
+        await asyncio.sleep(min(0.5, left))
+    _raise_if_cancelled(cancel_event)
+
+
+async def _subtitle_pass(url: str, workspace: Path, settings: dict, user_id: int, langs: list[str]) -> None:
+    """One yt-dlp run that fetches ONLY the subtitles (no video). Errors for single languages are not raised:
+    the caller looks at which files arrived."""
+    opts = _build_opts(url, workspace, {**settings, "mode": "video", "sub_langs": list(langs)}, user_id,
+                       lambda d: None, lambda d: None)
+    opts.update(skip_download=True, ignoreerrors=True, ignore_no_formats_error=True, writesubtitles=True,
+                writeautomaticsub=True, subtitleslangs=list(langs), subtitlesformat="srt/vtt/best",
+                sleep_interval_subtitles=1, progress_hooks=[], postprocessor_hooks=[],
+                postprocessors=[{"key": "FFmpegSubtitlesConvertor", "format": "srt", "when": "before_dl"}])
+    opts.pop("download_archive", None)       # the video was just archived: it would be skipped, subtitles and all
+
+    def run() -> None:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
+
+    await asyncio.wait_for(asyncio.get_running_loop().run_in_executor(None, run), timeout=120)
+
+
+def _find_subtitle(workspace: Path, lang: str) -> Path | None:
+    return next(iter(sorted(p for p in workspace.glob(f"*.{lang}.srt") if p.is_file())), None)
+
+
+async def _fetch_subtitles(url: str, workspace: Path, settings: dict, user_id: int,
+                           cancel_event: asyncio.Event | None) -> dict[str, Path]:
+    """The subtitles, with retries on their own schedule (SUBTITLE_RETRY_DELAYS); only the missing languages are
+    asked for again. Returns {language: .srt path} for what arrived - possibly nothing."""
+    wanted = list(settings["sub_langs"])
+    got: dict[str, Path] = {}
+    for delay in SUBTITLE_RETRY_DELAYS:
+        missing = [lang for lang in wanted if lang not in got]
+        if not missing:
+            break
+        await _sleep(delay, cancel_event)
+        try:
+            await _subtitle_pass(url, workspace, settings, user_id, missing)
+        except JobCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.info("Subtitle fetch attempt failed: %s", exc)
+        for lang in missing:
+            path = _find_subtitle(workspace, lang)
+            if path:
+                got[lang] = path
+    return got
+
+
+async def _recover_subtitles(files: list[Path], url: str, workspace: Path, settings: dict, user_id: int,
+                             progress_cb: ProgressCB, cancel_event: asyncio.Event | None, reason: str) -> list[Path]:
+    """The video is already downloaded (without subtitles). Fetch the subtitles separately and apply what the
+    person chose; if they still can't be had, say why."""
+    progress_cb(None, None, None, "Fetching subtitles")
+    fetched = await _fetch_subtitles(url, workspace, settings, user_id, cancel_event)
+    if not fetched:
+        _add_note(settings, _subtitle_failure_note(reason))
+        return files
+    files = await _apply_subtitles(files, fetched, workspace, settings, progress_cb, cancel_event)
+    wanted = list(settings["sub_langs"])
+    if len(fetched) < len(wanted):
+        _add_note(settings, _subtitle_failure_note(
+            reason, partial=f"Only {len(fetched)} of {len(wanted)} subtitle languages could be fetched"))
+    return files
+
+
+async def _apply_subtitles(files: list[Path], fetched: dict[str, Path], workspace: Path, settings: dict,
+                           progress_cb: ProgressCB, cancel_event: asyncio.Event | None) -> list[Path]:
+    """Deliver separately fetched subtitles the way the person chose: embedded track, .srt files, burned in."""
+    mode = settings.get("sub_mode", "embed")
+    video = next((f for f in files if f.suffix.lower() in (".mp4", ".mkv", ".webm", ".mov")), None)
+    others = [f for f in files if f is not video]
+    stem = video.stem if video else "subtitles"
+    srts: list[tuple[str, Path]] = []
+    for lang in settings["sub_langs"]:                     # in the order the person picked them
+        path = fetched.get(lang)
+        if path is None:
+            continue
+        dest = workspace / f"{stem}.{lang}.srt"
+        if path != dest:
+            path.replace(dest)
+        srts.append((lang, dest))
+    srt_files = [path for _, path in srts]
+    if video is None:
+        return others + srt_files
+
+    if mode in ("embed", "both"):
+        try:
+            embedded = await tools.embed_subtitles(video, srts, workspace, await _media_seconds(video), progress_cb,
+                                                   cancel_event)
+        except JobCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Embedding the fetched subtitles failed: %s", exc)
+            _add_note(settings, "◧ Couldn't embed the subtitles, so they were sent as separate .srt files.")
+            return [video] + others + srt_files
+        final = video.with_suffix(".mp4")
+        video.unlink(missing_ok=True)
+        embedded.replace(final)
+        return [final] + others + (srt_files if mode == "both" else [])
+    if mode in ("burn", "burnfile"):
+        return await _burn_subtitles([video] + others + srt_files, workspace, settings, progress_cb, cancel_event)
+    return [video] + others + srt_files                      # "file"
 
 
 def _srt_language(path: Path) -> str:
@@ -418,10 +541,12 @@ async def _burn_subtitles(files: list[Path], workspace: Path, settings: dict, pr
     final = video.with_suffix(".mp4")
     video.unlink(missing_ok=True)
     burned.replace(final)
-    chosen.unlink(missing_ok=True)
+    keep_chosen = settings.get("sub_mode") == "burnfile"        # ".srt file" is also on: every language comes as a file
+    if not keep_chosen:
+        chosen.unlink(missing_ok=True)
     if len(srts) > 1:
         _add_note(settings, "◧ Only the first language is burned in; the others are attached as .srt files.")
-    return [final] + [f for f in files if f is not video and f is not chosen]
+    return [final] + [f for f in files if f is not video and (keep_chosen or f is not chosen)]
 
 
 async def _subtitle_streams(path: Path) -> int:
@@ -444,7 +569,8 @@ async def _verify_subtitles(files: list[Path], settings: dict) -> list[Path]:
     srt_count = sum(1 for f in files if f.suffix.lower() == ".srt")
     embedded = await _subtitle_streams(video) if video and mode in ("embed", "both") else None
 
-    got = {"embed": embedded, "file": srt_count, "both": max(embedded or 0, srt_count), "burn": srt_count}[mode]
+    got = {"embed": embedded, "file": srt_count, "both": max(embedded or 0, srt_count), "burn": srt_count,
+           "burnfile": srt_count}[mode]
     if got == -1:
         return files
     if got == 0:
