@@ -37,6 +37,8 @@ from ui.history_menu import (
     history_text, history_menu, confirm_clear_menu, PAGE_SIZE, ORIGIN_HOME, ORIGIN_SETTINGS,
 )
 from ui.start_menu import start_menu
+from ui import tools_menu
+from downloader import tools
 from downloader import cookie_health
 from downloader.probe import probe, ProbeResult
 from downloader.sections import SectionDraft, SectionError, parse_timestamp, start_time_from_url
@@ -47,7 +49,7 @@ from downloader.cookies import inspect_cookie_file
 from downloader.playlist import (
     Entry, ListingError, MAX_LISTED, list_playlist, looks_like_playlist, quick_titles, short_label,
 )
-from downloader.site_map import tool_order_for
+from downloader.site_map import is_image_site, tool_order_for
 from downloader.dispatcher import FRIENDLY_TOOL
 from downloader.spotify_handler import get_track_info
 from updater.auto_update import daily_update_loop, run_update_once
@@ -82,6 +84,9 @@ pending_section_input: dict[int, dict] = {}
 # bid -> a playlist / several-links picker, then the running batch (the id is also a "rid" for _touch_rid / sweeping)
 pending_batches: dict[str, Batch] = {}
 pending_subs: dict[str, SubChoice] = {}                  # rid -> the subtitle languages picked for that link
+# user_id -> what the toolbox is waiting for: {rid, kind: "trim" | "gif" | "srt", chat_id, message_id, at}
+pending_tool_input: dict[int, dict] = {}
+tool_drafts: dict[str, dict] = {}                        # rid -> {"start", "end"} typed for a trim, awaiting Fast / Exact
 SECTION_INPUT_TTL_SECONDS = 10 * 60
 
 # None of the rid-keyed dicts above ever had anything removing an entry
@@ -121,11 +126,15 @@ def _sweep_stale_state_once() -> int:
         pending_sections.pop(rid, None)
         pending_subs.pop(rid, None)
         pending_batches.pop(rid, None)
+        tool_drafts.pop(rid, None)
         cancelled_pre_job_rids.discard(rid)
         _rid_last_touch.pop(rid, None)
         pruned += 1
     for uid in [u for u, st in pending_section_input.items() if now - st["at"] > SECTION_INPUT_TTL_SECONDS]:
         pending_section_input.pop(uid, None)
+    for uid in [u for u, st in pending_tool_input.items() if now - st["at"] > SECTION_INPUT_TTL_SECONDS]:
+        pending_tool_input.pop(uid, None)
+    tools.store.expire()                                  # uploaded files nobody picked a tool for
     return pruned
 
 
@@ -244,6 +253,14 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(messages.WELCOME, parse_mode=ParseMode.HTML, reply_markup=start_menu())
 
 
+async def tools_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await gate(update, context):
+        return
+    await _delete_quietly(update.message)
+    await update.message.reply_text(tools_menu.TOOLS_INTRO, parse_mode=ParseMode.HTML,
+                                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← Back", callback_data="nav|home")]]))
+
+
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await gate(update, context):
         return
@@ -255,6 +272,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/adhd_on — skip the picker, always grab best quality, no questions",
         "/adhd_off — turn that back off",
         "/settings — your saved defaults (cookies help is in there too)",
+        "/tools — trim, compress, extract audio… (or just send me a video/audio file)",
         "/queue — what's running",
         "/history — what you've downloaded",
         "/cancel — stop your current download",
@@ -430,6 +448,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         screen = data.split("|", 1)[1]
         pending_setting_input.pop(user_id, None)
         pending_section_input.pop(user_id, None)
+        pending_tool_input.pop(user_id, None)
 
         if screen == "cookies":
             await query.edit_message_text(COOKIES_HELP, parse_mode=ParseMode.HTML, reply_markup=back_to_main())
@@ -618,6 +637,9 @@ async def misc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         text = job_manager.active_summary(update.effective_user.id)
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("← Back", callback_data="nav|home")]])
         await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    elif action == "tools":
+        await query.edit_message_text(tools_menu.TOOLS_INTRO, parse_mode=ParseMode.HTML,
+                                       reply_markup=tools_menu.tools_intro_menu())
     elif action in ("history", "history_home"):
         # Same screen, but "← Back" must return to wherever it was opened from.
         origin = ORIGIN_HOME if action == "history_home" else ORIGIN_SETTINGS
@@ -980,6 +1002,259 @@ async def handle_section_text_input(update: Update, user_id: int, text: str) -> 
     await show(editor_text(draft, duration, probe_result.title), _editor_markup(rid, draft, probe_result))
 
 
+
+# ---------- the toolbox: a video / audio file sent to the bot ----------
+
+MAX_STORED_UPLOADS_PER_USER = 3
+
+
+def _incoming_media(message):
+    """(telegram file object, a name for it) when the message carries something the toolbox can work on."""
+    if message.video:
+        return message.video, message.video.file_name or "video.mp4"
+    if message.animation:
+        return message.animation, message.animation.file_name or "animation.mp4"
+    if message.video_note:
+        return message.video_note, "video_note.mp4"
+    if message.audio:
+        audio = message.audio
+        return audio, audio.file_name or f"{audio.title or 'audio'}.mp3"
+    if message.voice:
+        return message.voice, "voice.ogg"
+    document = message.document
+    if document and tools.looks_like_media(document.file_name or "", document.mime_type):
+        return document, document.file_name or "file"
+    return None
+
+
+async def media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await gate(update, context):
+        return
+    found = _incoming_media(update.message)
+    if found is None:
+        return
+    media, name = found
+    user_id = update.effective_user.id
+    if media.file_size and media.file_size > config.MAX_FILE_SIZE_BYTES:
+        await update.message.reply_text("That file is bigger than the 2 GB I can handle.")
+        return
+
+    # A person can keep a few uploads waiting; the oldest ones make room (and free their disk space).
+    waiting = tools.store.for_user(user_id)
+    for old in waiting[:max(0, len(waiting) - (MAX_STORED_UPLOADS_PER_USER - 1))]:
+        tools.store.discard(old)
+
+    rid = new_rid()
+    _touch_rid(rid)
+    status = await update.message.reply_text("🧰 Receiving the file…")
+    suffix = Path(name).suffix.lower()[:8] or ".bin"
+    path = tools.store.folder(rid) / f"original{suffix}"
+    try:
+        telegram_file = await media.get_file()
+        await telegram_file.download_to_drive(custom_path=path, read_timeout=600)
+        info = await tools.probe(path)
+    except tools.ToolError as exc:
+        tools.store.discard(rid)
+        await status.edit_text(f"⚠ {esc(str(exc))}", parse_mode=ParseMode.HTML)
+        return
+    except Exception:  # noqa: BLE001
+        log.warning("Could not receive an uploaded file", exc_info=True)
+        tools.store.discard(rid)
+        await status.edit_text("⚠ I couldn't download that file from Telegram. Try sending it again.")
+        return
+    tools.store.add(rid, user_id, path, name, info)
+    await status.edit_text(tools_menu.toolbox_text(name, info), parse_mode=ParseMode.HTML,
+                           reply_markup=tools_menu.toolbox_menu(info, rid, burn_ok=tools.burn_allowed(info.duration)))
+
+
+def _toolbox_screen(item, rid: str, notice: str = ""):
+    return (tools_menu.toolbox_text(item.name, item.info, notice),
+            tools_menu.toolbox_menu(item.info, rid, burn_ok=tools.burn_allowed(item.info.duration)))
+
+
+async def _edit(bot, chat_id: int, message_id: int, text: str, markup=None) -> None:
+    try:
+        await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, parse_mode=ParseMode.HTML,
+                                    reply_markup=markup)
+    except BadRequest as exc:
+        if "not modified" not in str(exc).lower():
+            raise
+
+
+async def _start_tool(bot, user_id: int, chat_id: int, message_id: int, rid: str, item, tool: str, **params) -> bool:
+    """Queue a toolbox job for the stored file. False = already working on it."""
+    if job_manager.is_active(rid):
+        return False
+    settings = dict(get_settings(user_id))
+    settings.update(tool=tool, tool_input=str(item.path), tool_name=item.name, tool_duration=item.info.duration,
+                    tool_has_video=item.info.has_video, tool_height=item.info.height, adhd_mode=False, **params)
+    if item.srt is not None:
+        settings["tool_srt"] = str(item.srt)
+    url = f"tool://{tool}"
+    last_download[rid] = (user_id, url, settings)
+    _touch_rid(rid)
+    await _edit(bot, chat_id, message_id, messages.QUEUED, queued_menu(rid, url))
+    await job_manager.enqueue(rid, user_id, chat_id, url, settings, message_id, title=item.name)
+    return True
+
+
+async def tools_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not await gate_callback(update, context):
+        return
+    user_id = update.effective_user.id
+    parts = (query.data or "").split("|")
+    action = parts[1] if len(parts) > 1 else ""
+    rid = parts[-1] if len(parts) > 2 else ""
+    chat_id, message_id = query.message.chat_id, query.message.message_id
+    pending_tool_input.pop(user_id, None)           # any button abandons a half-typed answer (trim/gif/srt re-arm it)
+
+    if action == "x":
+        tools.store.discard(rid)
+        tool_drafts.pop(rid, None)
+        await _delete_quietly(query.message)
+        return
+
+    item = tools.store.get(rid, user_id)
+    if item is None:
+        await query.edit_message_text("This file expired — send it again.")
+        return
+    info = item.info
+    _touch_rid(rid)
+
+    async def show(text: str, markup) -> None:
+        await _edit(context.bot, chat_id, message_id, text, markup)
+
+    async def go(tool: str, **params) -> None:
+        if not await _start_tool(context.bot, user_id, chat_id, message_id, rid, item, tool, **params):
+            text, markup = _toolbox_screen(item, rid, "Already working on this file — wait for it to finish.")
+            await show(text, markup)
+
+    if action == "home":
+        text, markup = _toolbox_screen(item, rid)
+        await show(text, markup)
+    elif action == "trim":
+        pending_tool_input[user_id] = {"rid": rid, "kind": "trim", "chat_id": chat_id, "message_id": message_id,
+                                       "at": time.time()}
+        await show(tools_menu.trim_prompt(info), tools_menu.prompt_menu(rid))
+    elif action == "trimgo" and len(parts) > 3:
+        draft = tool_drafts.get(rid)
+        if not draft:
+            await show(tools_menu.trim_prompt(info, "Send the times again."), tools_menu.prompt_menu(rid))
+            pending_tool_input[user_id] = {"rid": rid, "kind": "trim", "chat_id": chat_id, "message_id": message_id,
+                                           "at": time.time()}
+            return
+        await go("trim", start=draft["start"], end=draft["end"], exact=parts[2] == "exact")
+    elif action == "aud" and len(parts) > 3:
+        if parts[2] == "menu":
+            await show(tools_menu.audio_text(item.name, info), tools_menu.audio_menu(rid))
+        elif parts[2] in tools.AUDIO_FORMATS:
+            await go("audio", audio_format=parts[2])
+    elif action == "cmpm":
+        await show(tools_menu.compress_text(item.name, info), tools_menu.compress_menu(info, rid))
+    elif action == "cmp" and len(parts) > 3:
+        try:
+            target = int(parts[2])
+            if target not in tools.COMPRESS_TARGETS_MB:
+                raise ValueError
+            tools.plan_compress(info.duration, target, info.height)       # refuse a hopeless size BEFORE queueing
+        except tools.ToolError as exc:
+            await show(tools_menu.compress_text(item.name, info, str(exc)), tools_menu.compress_menu(info, rid))
+            return
+        except ValueError:
+            return
+        await go("compress", target_mb=target)
+    elif action == "gif":
+        pending_tool_input[user_id] = {"rid": rid, "kind": "gif", "chat_id": chat_id, "message_id": message_id,
+                                       "at": time.time()}
+        await show(tools_menu.gif_prompt(info), tools_menu.prompt_menu(rid))
+    elif action == "strip":
+        await go("strip")
+    elif action == "burn":
+        if not tools.burn_allowed(info.duration):
+            text, markup = _toolbox_screen(item, rid, "That video is too long to burn subtitles into.")
+            await show(text, markup)
+            return
+        pending_tool_input[user_id] = {"rid": rid, "kind": "srt", "chat_id": chat_id, "message_id": message_id,
+                                       "at": time.time()}
+        await show(tools_menu.burn_prompt(info), tools_menu.prompt_menu(rid))
+
+
+async def handle_tool_text_input(update: Update, user_id: int, text: str) -> None:
+    """The person typed the times a trim or a GIF asked for."""
+    state = pending_tool_input[user_id]
+    rid, kind = state["rid"], state["kind"]
+    chat_id, message_id = state["chat_id"], state["message_id"]
+    bot = update.get_bot()
+    await _delete_quietly(update.message)            # the toolbox message is the UI
+    item = tools.store.get(rid, user_id)
+    if item is None:
+        pending_tool_input.pop(user_id, None)
+        await _edit(bot, chat_id, message_id, "This file expired — send it again.")
+        return
+    info = item.info
+    try:
+        if kind == "trim":
+            start, end = tools.parse_range(text, info.duration)
+            tool_drafts[rid] = {"start": start, "end": end}
+            pending_tool_input.pop(user_id, None)
+            await _edit(bot, chat_id, message_id,
+                        tools_menu.trim_mode_text(tools_menu.clock(start), tools_menu.clock(end), info.has_video),
+                        tools_menu.trim_mode_menu(rid, info.has_video))
+        else:
+            start, length = tools.parse_gif(text, info.duration)
+            pending_tool_input.pop(user_id, None)
+            if not await _start_tool(bot, user_id, chat_id, message_id, rid, item, "gif", start=start, length=length):
+                text_, markup_ = _toolbox_screen(item, rid, "Already working on this file — wait for it to finish.")
+                await _edit(bot, chat_id, message_id, text_, markup_)
+    except tools.ToolError as exc:
+        prompt = tools_menu.trim_prompt if kind == "trim" else tools_menu.gif_prompt
+        await _edit(bot, chat_id, message_id, prompt(info, str(exc)), tools_menu.prompt_menu(rid))   # keep waiting
+
+
+async def srt_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A .srt file: it is the answer to "Burn subtitles", otherwise a hint about how to use one."""
+    if not await gate(update, context):
+        return
+    user_id = update.effective_user.id
+    state = pending_tool_input.get(user_id)
+    if not state or state["kind"] != "srt" or time.time() - state["at"] > SECTION_INPUT_TTL_SECONDS:
+        pending_tool_input.pop(user_id, None)
+        await update.message.reply_text("To burn subtitles into a video, send the video first and pick "
+                                        "“Burn subtitles”. For a download, use More options → Subtitles.")
+        return
+    rid, chat_id, message_id = state["rid"], state["chat_id"], state["message_id"]
+    item = tools.store.get(rid, user_id)
+    bot = context.bot
+    await _delete_quietly(update.message)
+    if item is None:
+        pending_tool_input.pop(user_id, None)
+        await _edit(bot, chat_id, message_id, "This file expired — send it again.")
+        return
+    document = update.message.document
+    if document.file_size and document.file_size > 5_000_000:
+        await _edit(bot, chat_id, message_id, tools_menu.burn_prompt(item.info, "That subtitle file is too big."),
+                    tools_menu.prompt_menu(rid))
+        return
+    srt_path = tools.store.folder(rid) / "subs.srt"
+    try:
+        telegram_file = await document.get_file()
+        await telegram_file.download_to_drive(custom_path=srt_path)
+        tools.normalize_srt(srt_path)
+    except tools.ToolError as exc:
+        await _edit(bot, chat_id, message_id, tools_menu.burn_prompt(item.info, str(exc)), tools_menu.prompt_menu(rid))
+        return
+    except Exception:  # noqa: BLE001
+        log.warning("Could not receive a subtitle file", exc_info=True)
+        await _edit(bot, chat_id, message_id, tools_menu.burn_prompt(item.info, "I couldn't download that file."),
+                    tools_menu.prompt_menu(rid))
+        return
+    pending_tool_input.pop(user_id, None)
+    item.srt = srt_path
+    await _start_tool(bot, user_id, chat_id, message_id, rid, item, "burn")
+
+
 # ---------- batches: a playlist, or several links in one message ----------
 
 _URL_TRAILING_PUNCTUATION = ".,;:!?)]}>\"'"
@@ -1220,6 +1495,14 @@ async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await handle_setting_text_input(update, user_id, raw_text)
         return
 
+    tool_state = pending_tool_input.get(user_id)
+    if tool_state and tool_state["kind"] in ("trim", "gif"):
+        if time.time() - tool_state["at"] > SECTION_INPUT_TTL_SECONDS or URL_RE.search(raw_text):
+            pending_tool_input.pop(user_id, None)      # stale, or they pasted a link: move on
+        else:
+            await handle_tool_text_input(update, user_id, raw_text)
+            return
+
     section_state = pending_section_input.get(user_id)
     if section_state:
         if time.time() - section_state["at"] > SECTION_INPUT_TTL_SECONDS or URL_RE.search(raw_text):
@@ -1332,7 +1615,7 @@ async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if gdl_info and (gdl_info.get("title") or gdl_info.get("thumbnail")):
         caption = messages.with_link(esc(gdl_info["title"]) if gdl_info.get("title") else messages.PICK_OPTION, url)
-        markup = simple_menu(rid) if order[0] != "ytdlp" else fallback_menu(rid)
+        markup = simple_menu(rid) if (order[0] != "ytdlp" or is_image_site(url)) else fallback_menu(rid)
         if gdl_info.get("thumbnail"):
             try:
                 await context.bot.send_photo(
@@ -1351,7 +1634,8 @@ async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                                         reply_markup=markup)
         return
 
-    if order[0] != "ytdlp":
+    if order[0] != "ytdlp" or is_image_site(url):
+        # Not a video the preview could read (or a site where posts are often just images): the plain menu.
         caption = messages.with_link(messages.PICK_OPTION, url)
         await status_msg.edit_text(caption, parse_mode=ParseMode.HTML, reply_markup=simple_menu(rid))
     else:
@@ -1532,6 +1816,8 @@ async def link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             job_settings.update(sub_choice.settings())     # sub_langs + sub_mode (never on a clip: wrong timing)
         if had_preview and tool_order_for(url)[0] != "ytdlp":
             job_settings["prefer_ytdlp"] = True            # what was chosen only means something to yt-dlp
+        elif action == "simple" and is_image_site(url):
+            job_settings["prefer_gallerydl"] = True        # no video preview: most likely an image post
 
         last_download[rid] = (user_id, url, job_settings)
         _touch_rid(rid)
@@ -1656,6 +1942,7 @@ def main() -> None:
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("settings", settings_cmd))
     app.add_handler(CommandHandler("history", history_cmd))
+    app.add_handler(CommandHandler("tools", tools_cmd))
     app.add_handler(CommandHandler("adhd_on", adhd_on_cmd))
     app.add_handler(CommandHandler("adhd_off", adhd_off_cmd))
     app.add_handler(CommandHandler("queue", queue_cmd))
@@ -1665,11 +1952,17 @@ def main() -> None:
     app.add_handler(CommandHandler("cookies", cookies_cmd))
     app.add_handler(CommandHandler(config.OWNER_ADMIN_COMMAND, owner_admin_cmd))
     app.add_handler(MessageHandler(filters.Document.FileExtension("txt"), cookies_file_handler))
+    app.add_handler(MessageHandler(filters.Document.FileExtension("srt"), srt_handler))
+    app.add_handler(MessageHandler(
+        filters.VIDEO | filters.AUDIO | filters.VOICE | filters.VIDEO_NOTE | filters.ANIMATION
+        | (filters.Document.ALL & ~filters.Document.FileExtension("txt") & ~filters.Document.FileExtension("srt")),
+        media_handler))
     app.add_handler(CallbackQueryHandler(admin_panel_callback, pattern=r"^adm\|"))
     app.add_handler(CallbackQueryHandler(force_join_callback, pattern=r"^fj\|"))
     app.add_handler(CallbackQueryHandler(misc_callback, pattern=r"^misc\|"))
     app.add_handler(CallbackQueryHandler(link_callback, pattern=r"^dl\|"))
     app.add_handler(CallbackQueryHandler(batch_callback, pattern=r"^bt\|"))
+    app.add_handler(CallbackQueryHandler(tools_callback, pattern=r"^tl\|"))
     app.add_handler(CallbackQueryHandler(settings_callback, pattern=r"^(s\||nav\|)"))
     app.add_handler(CallbackQueryHandler(history_callback, pattern=r"^hist\|"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, link_handler))

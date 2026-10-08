@@ -165,22 +165,26 @@ def link_row(url: str) -> list[InlineKeyboardButton]:
     # Telegram limits a copy-text payload to 256 characters - fall back to
     # a plain (non-copy) link-styled button rather than crashing if some
     # unusually long URL ever exceeds that.
+    if not url.startswith(("http://", "https://")):
+        return []                       # a toolbox job has no source link (its "url" is tool://<name>)
     if len(url) > 256:
         return [InlineKeyboardButton("🔗 Video link", url=url)]
     return [InlineKeyboardButton("🔗 Video link", copy_text=CopyTextButton(text=url))]
 
 
+def _markup(*rows) -> InlineKeyboardMarkup:
+    """Rows without any buttons (a toolbox job has no link row) would be sent to Telegram as empty rows."""
+    return InlineKeyboardMarkup([row for row in rows if row])
+
+
 def send_as_file_menu(rid: str, url: str, label: str = "▤ Send as file instead") -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(label, callback_data=f"dl|asfile|{rid}")],
-        link_row(url),
-    ])
+    return _markup([InlineKeyboardButton(label, callback_data=f"dl|asfile|{rid}")], link_row(url))
 
 
 def sent_menu(url: str) -> InlineKeyboardMarkup:
     """Attached to audio/document sends, which have no "send as file"
     choice of their own - just keeps the source link copyable."""
-    return InlineKeyboardMarkup([link_row(url)])
+    return _markup(link_row(url))
 
 
 def redo_menu(rid: str, url: str) -> InlineKeyboardMarkup:
@@ -198,11 +202,8 @@ def retry_menu(rid: str, url: str) -> InlineKeyboardMarkup:
     sometimes. Also the only place the source link survives on a
     cancelled/failed download, now that it's no longer inlined into the
     message text."""
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("↻ Try again", callback_data=f"dl|retry|{rid}"),
-         InlineKeyboardButton("✕ Delete", callback_data=f"dl|dismiss|{rid}")],
-        link_row(url),
-    ])
+    return _markup([InlineKeyboardButton("↻ Try again", callback_data=f"dl|retry|{rid}"),
+                    InlineKeyboardButton("✕ Delete", callback_data=f"dl|dismiss|{rid}")], link_row(url))
 
 
 # Same shape, kept as a separate name where the call site is specifically

@@ -82,11 +82,11 @@ class Choice(unittest.TestCase):
 
     def test_modes(self):
         choice = SubChoice()
-        for mode in ("file", "both", "embed"):
+        for mode in ("file", "both", "burn", "embed"):
             choice.set_mode(mode)
             self.assertEqual(choice.mode, mode)
         with self.assertRaises(SubtitleError):
-            choice.set_mode("burn")                                              # burned-in is not offered (yet)
+            choice.set_mode("bogus")
 
     def test_summary(self):
         tracks = [SubTrack("fa", "Persian"), SubTrack("en", "English")]

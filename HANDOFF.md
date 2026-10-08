@@ -25,12 +25,14 @@ volume, yt-dlp as a library so auto-update restarts the process) still hold.
 | Soft subtitles (embed / .srt / both), Persian+English first, paged | `downloader/subtitles.py`, `ui/subtitle_menu.py`, `dl\|sub\|` callbacks |
 | Cookie-expiry warning (per person, failure-based) | `downloader/cookie_health.py` |
 | Safe logs (token redaction, httpx quiet) | `utils/safe_logging.py` |
-| YouTube routing via WARP when the server's IP is blocked | `downloader/proxy.py`, `warp` service in compose |
+| Per-site routing via WARP when a site blocks the server's IP (YouTube, X, Instagram, Pinterest, Reddit, TikTok; `PROXY_DOMAINS`). yt-dlp + gallery-dl only (aria2c can't do SOCKS) | `downloader/proxy.py`, `dispatcher._routed`, `warp` service in compose |
 | Stray-process reaping (ffmpeg/aria2c) per job workspace | `utils/procs.py`, `utils/cleanup.job_workspace` |
+| **Toolbox**: send a video/audio file (or Tools on /start, `/tools`) -> trim (fast/exact), extract audio (MP3/M4A), compress to 10/25/50/100 MB, GIF, remove metadata, burn an .srt. Runs as a normal job (`url=tool://<name>`, `settings["tool"]`), input kept in `tools.store` (TMP_DIR/tools, 1 h TTL, max 3 per person) | `downloader/tools.py`, `ui/tools_menu.py`, `main.media_handler` / `tools_callback` / `srt_handler`, `jobqueue/job_manager._run_job` |
+| Subtitles mode **Burned in** (first language drawn into the picture, others as .srt; videos over `BURN_MAX_SECONDS` get an .srt instead) | `ytdlp_handler._burn_subtitles`, `tools.burn_into`, `ui/subtitle_menu` |
 | History with linked titles; History on /start | `ui/history_menu.py` |
 | Settings: ADHD toggle, **Appearance** (sizes + bar style), Advanced, Cookies, Reset | `ui/settings_menu.py` |
 | Post-processing fallbacks (retry without cover art; Opus -> MP3); ffmpeg's real error captured to logs | `ytdlp_handler.download` |
-| X/Pinterest videos previewed with yt-dlp (full menu), job told `prefer_ytdlp` | `main.link_handler`, `dispatcher.download` |
+| X/Pinterest: yt-dlp first (full menu for video); plain Download on an image post sets `prefer_gallerydl` so gallery-dl goes first | `site_map` (`IMAGE_SITES`), `main.link_handler`, `dispatcher.download` |
 
 ## Conventions worth keeping
 - Callback data `ns|action|...|<id>` (id last, < 64 bytes): `dl|sec`, `dl|sub`, `bt`, `hist`, `misc`, `s`, `nav`.
@@ -38,13 +40,19 @@ volume, yt-dlp as a library so auto-update restarts the process) still hold.
 - Errors shown inside menus as a `⚠` line (a second `query.answer()` is ignored by Telegram).
 - Anything user/site-controlled is HTML-escaped where it enters a template.
 - Symbols, not emoji, for log/UI glyphs where possible (`ui/steplog.py` maps step text -> symbol: ✦ video, 𝄞 audio, ✄ clip ...).
+- Callback namespace `tl|action|...|<rid>` = toolbox. Tool jobs are not logged to /history and have no link / send-as-file buttons (`quick_menu._markup` drops empty rows).
 - Sections and subtitles are mutually exclusive (subtitles are for the whole video: wrong timing on a clip).
 - ADHD Mode is unchanged: no menus, first link only, no picker.
 
 ## Decisions (developer's)
-- No shared/global cookie. No inline mode. Soft subtitles only: **burned-in is deferred to the VPS** (re-encode is too heavy locally; needs a Persian-capable font in the image).
+- No shared/global cookie. No inline mode. Subtitles: soft (embedded / .srt) AND burned-in. Burned-in re-encodes (x264 veryfast, audio copied), so it is capped by `BURN_MAX_SECONDS`; the image now has `fonts-noto-core` (Persian/Arabic, no CJK).
 - The upload/share-link center is **not built here**: it lives in the developer's other project (candyflix, github.com/AmirHBuilds/candyflix); this bot will only be an **API client** (needs: endpoints, key header, upload method, limits, link shape).
 - VPS blocking: developer will test provider/IP/WARP themselves; the bot already routes via WARP automatically when blocked.
+
+## Changelog
+- rev1 (2026-10-07): WARP routing generalised from YouTube-only to a per-site list with per-site block tracking; gallery-dl now routed too; PySocks added to requirements (gallery-dl needs it for SOCKS); X/Pinterest order is yt-dlp first. Tests: 400. Patch zips contain only changed files, in project structure; copy over the project.
+
+- rev2 (2026-10-07): Toolbox, burned-in subtitles, Tools on /start. Needs a rebuild (new fonts in the image).
 
 ## Unverified in real use (check first after a rebuild)
 1. `warp` container actually starts on the developer's setup (`docker compose logs warp`); the bot works direct if not.
@@ -53,8 +61,10 @@ volume, yt-dlp as a library so auto-update restarts the process) still hold.
 4. Opus "Conversion failed": cause unknown; the log now carries ffmpeg's real complaint, and the bot falls back (no cover art, then MP3).
 5. Instagram: previews usually fail without cookies, which drops to the plain menu (no sizes/sections).
 6. Telegram's built-in player probably doesn't show embedded subtitle tracks (the .srt option exists for that).
-7. Many-file sends may hit Telegram flood limits (batches are capped at 50).
+7. rev1: gallery-dl through `socks5h://warp:1080` (needs the rebuild for PySocks); Instagram/X blocks being recognised by the 403/429 wording; ADHD Mode on an X *image* post now shows one failed yt-dlp step before gallery-dl succeeds.
+8. Many-file sends may hit Telegram flood limits (batches are capped at 50).
 
 ## Next
-- candyflix API client + "Get a link" in a future Tools menu (and the Tools/media-toolbox idea: trim, compress-to-fit, extract audio, GIF, metadata strip...).
-- Burned-in subtitles on the VPS. Per-link prompts for any removed global settings. VPS deployment.
+- candyflix API client + "Get a link" as one more button in the toolbox / start menu.
+- Toolbox ideas not built: images (strip EXIF, convert), merge files, change speed, resize, cover art for audio. Per-link prompts for any removed global settings. VPS deployment.
+9. rev2: a real Persian video with burned-in subtitles (font/shaping in the Docker image: `docker compose exec bot fc-list | grep -i arab`); an upload of ~1 GB through the local Bot API (`download_to_drive` in local mode); the toolbox on a very large file (disk: tools.store keeps up to 3 originals per person for 1 h).

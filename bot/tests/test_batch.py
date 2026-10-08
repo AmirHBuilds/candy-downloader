@@ -548,11 +548,17 @@ class PreferYtDlp(unittest.IsolatedAsyncioTestCase):
             await dispatcher.download(url, Path("/tmp"), settings, 1, lambda *a, **k: None)
         return order
 
-    async def test_x_normally_tries_gallery_dl_first(self):
-        self.assertEqual((await self.order_for("https://x.com/u/status/1"))[:2], ["gallerydl", "ytdlp"])
+    async def test_x_and_pinterest_try_yt_dlp_first_so_video_keeps_its_full_menu(self):
+        for url in ("https://x.com/u/status/1", "https://twitter.com/u/status/1", "https://www.pinterest.com/pin/1/",
+                    "https://pin.it/abc"):
+            with self.subTest(url=url):
+                self.assertEqual((await self.order_for(url))[:2], ["ytdlp", "gallerydl"])
 
-    async def test_a_choice_made_from_the_video_preview_tries_yt_dlp_first(self):
-        self.assertEqual((await self.order_for("https://x.com/u/status/1", prefer_ytdlp=True))[:2], ["ytdlp", "gallerydl"])
+    async def test_an_image_post_chosen_with_the_plain_button_tries_gallery_dl_first(self):
+        self.assertEqual((await self.order_for("https://x.com/u/status/1", prefer_gallerydl=True))[:2], ["gallerydl", "ytdlp"])
+
+    async def test_the_gallery_preference_cannot_invent_a_tool_a_site_does_not_have(self):
+        self.assertEqual(await self.order_for("https://vimeo.com/1", prefer_gallerydl=True), ["ytdlp"])
 
     async def test_the_preference_cannot_invent_a_tool_a_site_does_not_have(self):
         self.assertEqual(await self.order_for("https://www.pixiv.net/en/artworks/1", prefer_ytdlp=True), ["gallerydl"])

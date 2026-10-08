@@ -14,8 +14,9 @@ from dataclasses import dataclass, field
 PRIORITY = ("fa", "en")
 MAX_LANGS = 4
 TRACKS_PER_PAGE = 8
-MODES = ("embed", "file", "both")
-MODE_NAMES = {"embed": "embedded track", "file": "separate .srt file", "both": "embedded + .srt file"}
+MODES = ("embed", "file", "both", "burn")
+MODE_NAMES = {"embed": "embedded track", "file": "separate .srt file", "both": "embedded + .srt file",
+              "burn": "burned into the picture"}
 
 _NAMES = {
     "fa": "Persian", "en": "English", "ar": "Arabic", "tr": "Turkish", "ru": "Russian", "es": "Spanish",
@@ -111,7 +112,7 @@ class SubChoice:
 
 
 def summary(choice: SubChoice, tracks: list[SubTrack]) -> str:
-    """'Persian, English · embedded track'"""
+    """'Persian, English · embedded track'. Burned in: only the first language is drawn; the rest come as .srt files."""
     names = {t.code: t.name for t in tracks}
     shown = ", ".join(names.get(code, code) for code in choice.langs)
     return f"{shown} · {MODE_NAMES[choice.mode]}"

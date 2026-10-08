@@ -14,8 +14,8 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from downloader.subtitles import MAX_LANGS, MODE_NAMES, TRACKS_PER_PAGE, SubChoice, clamp_page, page_count
 from utils.text import esc
 
-_MODE_LABELS = {"embed": "Embedded", "file": ".srt file", "both": "Both"}
-_ORDER = ("embed", "file", "both")
+_MODE_LABELS = {"embed": "Embedded", "file": ".srt file", "both": "Both", "burn": "Burned in"}
+_ORDER = ("embed", "file", "both", "burn")
 
 
 def _btn(text: str, data: str) -> InlineKeyboardButton:
@@ -35,6 +35,9 @@ def subtitles_text(choice: SubChoice, tracks: list, page: int, title: str = "", 
         lines.append(f"Page {clamp_page(tracks, page) + 1} of {pages}")
     lines.append(f"<i>Up to {MAX_LANGS} languages. Telegram's own player may not show an embedded track; "
                  f"the .srt file works in any player.</i>")
+    if choice.mode == "burn":
+        lines.append("<i>Burned in is drawn into the picture, so every player shows it. It uses the first language "
+                     "(the others come as .srt files) and re-encodes the video, which takes longer.</i>")
     if notice:
         lines += ["", f"⚠ {esc(notice)}"]
     return "\n".join(lines)
@@ -42,8 +45,9 @@ def subtitles_text(choice: SubChoice, tracks: list, page: int, title: str = "", 
 
 def subtitles_menu(choice: SubChoice, tracks: list, page: int, rid: str) -> InlineKeyboardMarkup:
     page = clamp_page(tracks, page)
-    rows = [[_btn(("● " if choice.mode == mode else "○ ") + _MODE_LABELS[mode], f"dl|sub|m|{mode}|{page}|{rid}")
-             for mode in _ORDER]]
+    buttons = [_btn(("● " if choice.mode == mode else "○ ") + _MODE_LABELS[mode], f"dl|sub|m|{mode}|{page}|{rid}")
+               for mode in _ORDER]
+    rows = [buttons[:2], buttons[2:]]
 
     first = page * TRACKS_PER_PAGE
     for index in range(first, min(first + TRACKS_PER_PAGE, len(tracks))):

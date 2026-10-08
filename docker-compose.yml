@@ -30,8 +30,9 @@ services:
     # internal-only, no need to expose to the host
 
   # Cloudflare WARP as a local SOCKS5 proxy (port 1080, reachable only from the other containers).
-  # YouTube blocks most datacenter/VPS addresses; the bot goes DIRECT first and only routes YouTube
-  # through this when YouTube blocks the server's address (see bot/downloader/proxy.py). The bot does NOT
+  # Sites such as YouTube, X and Instagram block many datacenter/VPS addresses; the bot goes DIRECT first and only
+  # routes a site through this when THAT site blocks the server's address (PROXY_DOMAINS lists which sites may;
+  # see bot/downloader/proxy.py). The bot does NOT
   # depend on this container: if it is down or fails to start, everything simply goes direct.
   #   - A fresh IP:   docker compose up -d --force-recreate warp     (it registers anew, usually a new address)
   #   - Check it:     docker compose logs warp
@@ -71,6 +72,8 @@ services:
       MAX_CONCURRENT_DOWNLOADS: ${MAX_CONCURRENT_DOWNLOADS:-2}
       YT_PROXIES: ${YT_PROXIES:-socks5h://warp:1080}
       YT_PROXY_MODE: ${YT_PROXY_MODE:-auto}
+      BURN_MAX_SECONDS: ${BURN_MAX_SECONDS:-3600}
+      PROXY_DOMAINS: ${PROXY_DOMAINS:-youtube.com,youtu.be,x.com,twitter.com,instagram.com,pinterest.com,pin.it,reddit.com,tiktok.com}
       PROCESS_NICE: ${PROCESS_NICE:-10}
     # Keeps a heavy ffmpeg job (converting, exact clip cuts) from taking over your PC. Raise or remove
     # these on a bigger machine; Docker Desktop also has its own CPU/RAM caps under Settings > Resources.

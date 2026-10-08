@@ -567,7 +567,7 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_opening_it_lists_persian_and_english_first_and_nothing_is_chosen(self):
         self.with_subs()
         edit = await self.tap(f"dl|sub|open|0|{RID}")
-        names = [l for l in labels(edit["markup"]) if l[0] in "●○" and "Embedded" not in l and ".srt" not in l and "Both" not in l]
+        names = [l for l in labels(edit["markup"]) if l[0] in "●○" and "Embedded" not in l and ".srt" not in l and "Both" not in l and "Burned" not in l]
         self.assertEqual(names, ["○ Persian", "○ English", "○ German", "○ Arabic · auto"])
         self.assertIn("Selected: none", edit["text"])
 
@@ -594,7 +594,7 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("up to 4 languages", edit["text"])
         edit = await self.tap(f"dl|sub|t|99|0|{RID}")
         self.assertIn("no longer listed", edit["text"])
-        edit = await self.tap(f"dl|sub|m|burn|0|{RID}")                    # burned-in isn't offered: refused
+        edit = await self.tap(f"dl|sub|m|bogus|0|{RID}")                   # not a mode: refused
         self.assertIn("Unknown option", edit["text"])
         self.assertEqual(main.pending_subs[RID].mode, "embed")
 
@@ -678,22 +678,39 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("&lt;b&gt;Odd&lt;/b&gt;", edit["text"])
 
     # ------------------------------------------------------------ sites where gallery-dl comes first
-    async def test_a_video_chosen_on_x_or_pinterest_is_downloaded_with_yt_dlp_first(self):
+    async def test_a_video_chosen_on_x_or_pinterest_needs_no_special_flag_because_yt_dlp_is_first_anyway(self):
+        from downloader.site_map import tool_order_for
         for url in ("https://x.com/u/status/1", "https://www.pinterest.com/pin/1/"):
             with self.subTest(url=url):
+                self.assertEqual(tool_order_for(url)[0], "ytdlp")
                 self.jobs.enqueued.clear()
                 main.pending_links[RID] = (USER, url)
                 main.pending_probes[RID] = ProbeResult(ok=True, heights=[720], has_audio=True, duration=60)
                 await self.tap(f"dl|video|best|{RID}")
-                self.assertTrue(self.jobs.enqueued[0]["settings"]["prefer_ytdlp"])
+                settings = self.jobs.enqueued[0]["settings"]
+                self.assertNotIn("prefer_ytdlp", settings)
+                self.assertNotIn("prefer_gallerydl", settings)
 
-    async def test_sections_on_x_prefer_yt_dlp_as_well(self):
+    async def test_sections_on_x_are_kept(self):
         main.pending_links[RID] = (USER, "https://x.com/u/status/1")
         await self.add_section(end="0:30")
         await self.tap(f"dl|video|best|{RID}")
-        settings = self.jobs.enqueued[0]["settings"]
-        self.assertTrue(settings["prefer_ytdlp"])
-        self.assertEqual(settings["sections"], [(0.0, 30.0)])
+        self.assertEqual(self.jobs.enqueued[0]["settings"]["sections"], [(0.0, 30.0)])
+
+    async def test_the_plain_download_button_on_an_image_site_tries_gallery_dl_first(self):
+        for url in ("https://x.com/u/status/1", "https://pin.it/abc"):
+            with self.subTest(url=url):
+                self.jobs.enqueued.clear()
+                main.pending_links[RID] = (USER, url)
+                main.pending_probes.pop(RID, None)                    # no video preview existed
+                await self.tap(f"dl|simple|download|{RID}")
+                self.assertTrue(self.jobs.enqueued[0]["settings"]["prefer_gallerydl"])
+
+    async def test_the_plain_download_button_elsewhere_gets_no_gallery_preference(self):
+        main.pending_links[RID] = (USER, "https://www.pixiv.net/en/artworks/1")
+        main.pending_probes.pop(RID, None)
+        await self.tap(f"dl|simple|download|{RID}")
+        self.assertNotIn("prefer_gallerydl", self.jobs.enqueued[0]["settings"])
 
     async def test_sites_that_already_try_yt_dlp_first_are_left_alone(self):
         await self.tap(f"dl|video|best|{RID}")                    # the default test link is YouTube

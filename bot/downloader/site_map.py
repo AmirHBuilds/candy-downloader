@@ -18,20 +18,26 @@ OVERRIDES: dict[str, list[str]] = {
     "danbooru.donmai.us": ["gallerydl"],
     "gelbooru.com": ["gallerydl"],
     "deviantart.com": ["gallerydl"],
-    "twitter.com": ["gallerydl", "ytdlp"],
-    "x.com": ["gallerydl", "ytdlp"],
+    # X and Pinterest posts can be video OR images. yt-dlp goes first because only it gives a quality
+    # menu, sizes and time ranges for video; image posts make it fail fast ("No video formats") and
+    # gallery-dl takes over. Where the person's choice already says "this is an image post" (the plain
+    # Download button), the dispatcher puts gallery-dl first again - see IMAGE_SITES.
+    "twitter.com": ["ytdlp", "gallerydl"],
+    "x.com": ["ytdlp", "gallerydl"],
     "reddit.com": ["ytdlp", "gallerydl"],
-    # Pinterest pins are usually images, not video - gallery-dl handles
-    # that correctly and gives an honest "just download it" menu; yt-dlp
-    # errors on image pins ("No video formats found") even though the
-    # content itself is perfectly downloadable via gallery-dl.
-    "pinterest.com": ["gallerydl", "ytdlp"],
-    "pin.it": ["gallerydl", "ytdlp"],
+    # Pinterest pins are often images; yt-dlp errors on those ("No video formats found") and the
+    # content is then fetched by gallery-dl, which stays in the list as the fallback.
+    "pinterest.com": ["ytdlp", "gallerydl"],
+    "pin.it": ["ytdlp", "gallerydl"],
     # Spotify streams are DRM-protected - handled entirely differently
     # (search + download matching audio elsewhere), see spotify_handler.py.
     "open.spotify.com": ["spotify"],
     "spotify.com": ["spotify"],
 }
+
+# Sites whose posts may be images rather than video. If the video preview fails there, the person gets the
+# plain "Download" menu (not video-quality buttons) and gallery-dl is tried first for that download.
+IMAGE_SITES = ["x.com", "twitter.com", "pinterest.com", "pin.it"]
 
 # Domains yt-dlp is known to handle well on its own - no generic fallback,
 # a failure here should be reported, not papered over with a page-scrape.
@@ -81,3 +87,8 @@ def tool_order_for(url: str) -> list[str]:
     # about (it supports 1800+ sites, more than we can enumerate), a
     # gallery, or a plain direct file link - try all three in order.
     return ["ytdlp", "gallerydl", "generic"]
+
+
+def is_image_site(url: str) -> bool:
+    host = _hostname(url)
+    return any(_matches(host, domain) for domain in IMAGE_SITES)

@@ -8,10 +8,13 @@ from tests import _env  # noqa: F401  (must come first)
 
 import yt_dlp  # noqa: E402  (the stub)
 from downloader import playlist as playlist_module, probe as probe_module, proxy as proxy_module, ytdlp_handler  # noqa: E402
-from downloader.proxy import ProxyPolicy, is_ip_block, is_youtube  # noqa: E402
+from downloader import dispatcher  # noqa: E402
+from downloader.proxy import ProxyPolicy, is_ip_block, is_youtube, site_for, site_label  # noqa: E402
 from settings.user_settings import DEFAULTS  # noqa: E402
 
 YT = "https://www.youtube.com/watch?v=abc"
+X = "https://x.com/u/status/1"
+IG = "https://www.instagram.com/p/abc/"
 WARP = "socks5h://warp:1080"
 WARP2 = "socks5h://warp2:1080"
 BLOCK = "ERROR: [youtube] abc: Sign in to confirm you’re not a bot"
@@ -119,6 +122,143 @@ class Policy(unittest.TestCase):
 
     def test_logs_never_show_proxy_credentials(self):
         self.assertEqual(proxy_module._hide("socks5h://user:secret@warp:1080"), "socks5h://warp:1080")
+
+
+class OtherSites(unittest.TestCase):
+    """The same block-then-WARP logic applies to every site in PROXY_DOMAINS, each tracked on its own."""
+
+    def test_the_default_list_covers_the_sites_that_block_servers(self):
+        for url in (YT, X, "https://twitter.com/u/status/1", IG, "https://www.pinterest.com/pin/1/", "https://pin.it/a",
+                    "https://www.reddit.com/r/a/", "https://www.tiktok.com/@a/video/1"):
+            self.assertIsNotNone(site_for(url), url)
+        for url in ("https://vimeo.com/1", "https://dropbox.com/a", "https://notx.com/a", "https://example.com/x.mp4"):
+            self.assertIsNone(site_for(url), url)
+
+    def test_hostnames_of_one_site_share_a_record(self):
+        self.assertEqual(site_for("https://twitter.com/a"), site_for(X))
+        self.assertEqual(site_for("https://youtu.be/a"), site_for(YT))
+        self.assertEqual(site_for("https://pin.it/a"), site_for("https://www.pinterest.com/pin/1/"))
+
+    def test_a_block_on_one_site_does_not_send_the_others_through_the_proxy(self):
+        policy, _ = make()
+        self.assertTrue(policy.report_failure(IG, None, "HTTP Error 429: Too Many Requests"))
+        self.assertEqual(policy.route(IG), WARP)
+        self.assertIsNone(policy.route(YT))
+        self.assertIsNone(policy.route(X))
+
+    def test_a_direct_success_on_one_site_does_not_end_anothers_block_window(self):
+        policy, _ = make()
+        policy.report_failure(IG, None, BLOCK)
+        policy.report_failure(X, None, "HTTP Error 403: Forbidden")
+        policy.report_success(IG, None)
+        self.assertIsNone(policy.route(IG))
+        self.assertEqual(policy.route(X), WARP)
+
+    def test_a_proxy_blocked_by_one_site_is_still_used_for_another(self):
+        policy, _ = make(mode="always")
+        policy.report_failure(IG, WARP, BLOCK)
+        self.assertIsNone(policy.route(IG))                                     # set aside for Instagram only
+        self.assertEqual(policy.route(X), WARP)
+
+    def test_the_site_list_is_configurable_and_star_means_everything(self):
+        only_x = ProxyPolicy([WARP], "always", alive=lambda p: True, domains=["x.com"])
+        self.assertEqual(only_x.route(X), WARP)
+        self.assertIsNone(only_x.route(YT))
+        everything = ProxyPolicy([WARP], "always", alive=lambda p: True, domains=["*"])
+        self.assertEqual(everything.route("https://vimeo.com/1"), WARP)
+
+    def test_gallery_dl_and_instagram_wordings_count_as_blocks(self):
+        for text in ("HttpError: '403 Forbidden' for 'https://x.com/i/api'", "HttpError: '429 Too Many Requests'",
+                     "ERROR: [instagram] abc: Instagram API is not granting access: rate-limit reached or login required"):
+            self.assertTrue(is_ip_block(text), text)
+        self.assertFalse(is_ip_block("NotFoundError: post not found"))
+
+    def test_messages_name_the_site(self):
+        self.assertEqual((site_label(YT), site_label(X), site_label("https://m.youtube.com/a")), ("YouTube", "X", "YouTube"))
+        self.assertEqual(site_label("https://www.vimeo.com/1"), "vimeo.com")
+
+
+class GalleryDlRouting(unittest.IsolatedAsyncioTestCase):
+    """gallery-dl has no routing of its own: the dispatcher gives it the same direct-then-proxy behaviour."""
+
+    def setUp(self):
+        self.workspace = Path(tempfile.mkdtemp(prefix="gdlroute-"))
+        self.addCleanup(shutil.rmtree, self.workspace, ignore_errors=True)
+        self.proxies_seen: list = []
+        self.stages: list[str] = []
+        self.addCleanup(setattr, dispatcher, "policy", dispatcher.policy)
+        dispatcher.policy, _ = make()
+        original = dict(dispatcher.HANDLERS)
+        self.addCleanup(dispatcher.HANDLERS.update, original)
+
+    def install(self, outcomes):
+        outcomes = list(outcomes)
+
+        async def gallerydl(url, workspace, settings, user_id, cb, cancel_event=None):
+            self.proxies_seen.append(settings.get("proxy") or None)
+            (workspace / "leftover.part").write_text("x")
+            outcome = outcomes.pop(0)
+            if outcome != "ok":
+                raise RuntimeError(outcome)
+            return [workspace / "leftover.part"]
+        dispatcher.HANDLERS["gallerydl"] = gallerydl
+
+        async def ytdlp_fails(*a, **k):
+            raise RuntimeError("No video formats found")
+        dispatcher.HANDLERS["ytdlp"] = ytdlp_fails
+
+    async def run_download(self, url, **settings):
+        def cb(*args):
+            if len(args) > 4 and args[4]:
+                self.stages.append(args[4])
+        return await dispatcher.download(url, self.workspace, {**DEFAULTS, "prefer_gallerydl": True, **settings}, 1, cb)
+
+    async def test_a_blocked_gallery_dl_download_is_retried_through_the_proxy(self):
+        self.install(["HttpError: '403 Forbidden'", "ok"])
+        files = await self.run_download(X)
+        self.assertEqual(len(files), 1)
+        self.assertEqual(self.proxies_seen, [None, WARP])
+        self.assertTrue(any("Switching route - X blocked this address" in stage for stage in self.stages), self.stages)
+
+    async def test_the_next_one_goes_straight_to_the_proxy(self):
+        self.install(["HttpError: '403 Forbidden'", "ok", "ok"])
+        await self.run_download(X)
+        self.proxies_seen.clear()
+        await self.run_download(X)
+        self.assertEqual(self.proxies_seen, [WARP])
+
+    async def test_a_site_that_is_not_blocked_stays_direct(self):
+        self.install(["ok"])
+        await self.run_download(X)
+        self.assertEqual(self.proxies_seen, [None])
+
+    async def test_other_errors_are_not_retried(self):
+        self.install(["NotFoundError: post not found"])
+        with self.assertRaises(dispatcher.NoToolSucceeded):
+            await self.run_download(X)
+        self.assertEqual(self.proxies_seen, [None])
+
+    async def test_someones_own_proxy_is_left_alone(self):
+        self.install(["HttpError: '403 Forbidden'"])
+        with self.assertRaises(dispatcher.NoToolSucceeded):
+            await self.run_download(X, proxy="http://mine:3128")
+        self.assertEqual(self.proxies_seen, ["http://mine:3128"])
+
+    async def test_direct_file_downloads_are_never_routed_because_aria2c_cannot_use_socks(self):
+        dispatcher.policy, _ = make(mode="always")
+        seen = []
+
+        async def generic(url, workspace, settings, user_id, cb, cancel_event=None):
+            seen.append(settings.get("proxy") or None)
+            return [workspace / "a.bin"]
+        dispatcher.HANDLERS["generic"] = generic
+
+        async def nope(*a, **k):
+            raise RuntimeError("no")
+        dispatcher.HANDLERS["ytdlp"] = nope
+        dispatcher.HANDLERS["gallerydl"] = nope
+        await dispatcher.download("https://example.com/a.bin", self.workspace, {**DEFAULTS}, 1, lambda *a, **k: None)
+        self.assertEqual(seen, [None])
 
 
 # ============================================================ integration with the real call sites

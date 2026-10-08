@@ -1,9 +1,11 @@
 import logging
+import shutil
 from pathlib import Path
 from typing import Callable
 
 from downloader import ytdlp_handler, gallerydl_handler, generic_handler, spotify_handler
 from downloader.errors import JobCancelled  # noqa: F401 - re-exported for callers
+from downloader.proxy import policy, site_label
 from downloader.site_map import tool_order_for
 
 log = logging.getLogger("candy.dispatcher")
@@ -39,6 +41,35 @@ class NoToolSucceeded(Exception):
         return first_line[:200]
 
 
+def _clear(workspace: Path) -> None:
+    for leftover in workspace.iterdir():
+        shutil.rmtree(leftover, ignore_errors=True) if leftover.is_dir() else leftover.unlink(missing_ok=True)
+
+
+async def _routed(handler, url: str, workspace: Path, settings: dict, user_id: int, cb, cancel_event):
+    """Run a tool that has no routing of its own (gallery-dl) through the same block-aware proxy logic
+    yt-dlp uses: direct first; if the site refuses this server's address, once more through the proxy.
+    Someone's own proxy setting bypasses it. (aria2c is never routed here: it cannot speak SOCKS.)"""
+    if settings.get("proxy"):
+        return await handler(url, workspace, settings, user_id, cb, cancel_event=cancel_event)
+    proxy = policy.route(url)
+    for attempt in (1, 2):
+        trial = {**settings, "proxy": proxy} if proxy else settings
+        try:
+            files = await handler(url, workspace, trial, user_id, cb, cancel_event=cancel_event)
+        except JobCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            if attempt == 1 and policy.report_failure(url, proxy, str(exc)):
+                cb(None, None, None, f"Switching route - {site_label(url)} blocked this address")
+                _clear(workspace)
+                proxy = policy.route(url)
+                continue
+            raise
+        policy.report_success(url, proxy)
+        return files
+
+
 async def download(url: str, workspace: Path, settings: dict, user_id: int,
                     progress_cb: Callable[[str, float | None, str | None, str | None, str | None], None],
                     cancel_event=None,
@@ -57,6 +88,9 @@ async def download(url: str, workspace: Path, settings: dict, user_id: int,
         # The person chose a quality / time range / subtitles from a yt-dlp preview (on a site that
         # normally tries gallery-dl first, like X): honour that by trying yt-dlp first.
         order = ["ytdlp"] + [tool for tool in order if tool != "ytdlp"]
+    if settings.get("prefer_gallerydl") and "gallerydl" in order:
+        # The person pressed the plain "Download" button of an image post (no video preview existed).
+        order = ["gallerydl"] + [tool for tool in order if tool != "gallerydl"]
     attempts: dict[str, str] = {}
 
     if settings.get("sections"):
@@ -77,7 +111,10 @@ async def download(url: str, workspace: Path, settings: dict, user_id: int,
             def cb(percent, speed, eta, stage=None, label=None, size=None, _tool=tool_name):
                 progress_cb(_tool, percent, speed, eta, stage, label, size)
 
-            files = await handler(url, workspace, settings, user_id, cb, cancel_event=cancel_event)
+            if tool_name == "gallerydl":
+                files = await _routed(handler, url, workspace, settings, user_id, cb, cancel_event)
+            else:
+                files = await handler(url, workspace, settings, user_id, cb, cancel_event=cancel_event)
             if files:
                 return files
             attempts[tool_name] = "produced no files"

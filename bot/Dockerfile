@@ -14,11 +14,15 @@ COPY --from=deno /deno /usr/local/bin/deno
 # - aria2c: fast multi-connection downloader (used as external downloader + generic fallback)
 # - wget: last-resort generic downloader for plain direct links
 # - git: some gallery-dl/yt-dlp extractor updates benefit from it
+# - fontconfig + fonts-noto-core: burned-in subtitles are drawn by ffmpeg (libass), which needs a font that has
+#   Persian/Arabic (and Latin, Cyrillic, Hebrew, Thai, Devanagari...). CJK is not in this package.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     aria2 \
     wget \
     git \
+    fontconfig \
+    fonts-noto-core \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 

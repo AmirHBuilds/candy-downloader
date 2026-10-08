@@ -33,6 +33,7 @@ from telegram.error import TelegramError
 
 from config import OWNER_EMOJI
 from ui.steplog import step_line
+from downloader import tools as media_tools
 from downloader import cookie_health
 from downloader.dispatcher import download as dispatch_download, NoToolSucceeded
 from downloader.errors import JobCancelled
@@ -160,6 +161,11 @@ class JobManager:
                  rid, force_document, settings.get("quality"), settings.get("mode"))
         return job
 
+    def is_active(self, rid: str) -> bool:
+        """A job with this id is queued or running (the toolbox must not start a second one on the same file)."""
+        job = self._jobs_by_rid.get(rid)
+        return bool(job and not job.terminal)
+
     def cancel(self, rid: str, user_id: int) -> bool:
         job = self._jobs_by_rid.get(rid)
         if not job or job.cancelled or job.user_id != user_id:
@@ -224,11 +230,13 @@ class JobManager:
 
     def _log_history(self, job: Job, status: str) -> None:
         job.outcome = status
+        if job.settings.get("tool"):
+            return                      # toolbox work on a file the person sent: not a download, nothing to link to
         ac.log_download(job.user_id, job.url, status, job.settings.get("mode", ""),
                         self._history_quality(job.settings), job.title)
 
     # One place to change the icons on the info line.
-    _TYPE_ICONS = {"Audio": "🎵", "Video": "🎬", "File": "📄"}
+    _TYPE_ICONS = {"Audio": "🎵", "Video": "🎬", "File": "📄", "Tool": "🧰"}
 
     def _info_line(self, job: Job) -> str:
         """'• 🎵 Audio | 📦 230 MB | 🔗 Youtube' - parts appear as they become known."""
@@ -405,7 +413,7 @@ class JobManager:
             try:
                 await self._run_job(job)
                 self._log_history(job, "success")
-                if cookie_health.cookies_in_use(job.user_id, job.settings, job.url):
+                if not job.settings.get("tool") and cookie_health.cookies_in_use(job.user_id, job.settings, job.url):
                     cookie_health.watch.record_success(job.user_id)
             except (asyncio.CancelledError, JobCancelled):
                 job.terminal = True
@@ -465,16 +473,19 @@ class JobManager:
             log.warning("Could not send the cookie warning to %s: %s", job.user_id, exc)
 
     async def _run_job(self, job: Job) -> None:
-        job.header = "Downloading"
+        job.header = "Working" if job.settings.get("tool") else "Downloading"
         adhd = job.settings.get("adhd_mode", False)
         bar_style = resolve_style(job.settings.get("bar_style"), adhd)
         if adhd:
             await self._emit(job, "Fetching…", markup=queued_menu(job.rid, job.url))
         else:
-            job.info = {
-                "type": "Audio" if job.settings.get("mode") == "audio" else "Video",
-                "site": site_label(job.url),
-            }
+            if job.settings.get("tool"):
+                job.info = {"type": "Tool"}
+            else:
+                job.info = {
+                    "type": "Audio" if job.settings.get("mode") == "audio" else "Video",
+                    "site": site_label(job.url),
+                }
             await self._emit(job, "Starting…", markup=queued_menu(job.rid, job.url))
 
         last_edit_time = 0.0
@@ -561,8 +572,14 @@ class JobManager:
             asyncio.create_task(self._emit_progress(job, line, push, queued_menu(job.rid, job.url)))
 
         with job_workspace() as workspace:
-            files = await dispatch_download(job.url, workspace, job.settings, job.user_id, progress_cb,
-                                             cancel_event=job.cancel_event)
+            if job.settings.get("tool"):
+                files = await media_tools.run(
+                    job.settings, workspace,
+                    lambda percent, speed, eta, stage=None: progress_cb("tool", percent, speed, eta, stage),
+                    job.cancel_event)
+            else:
+                files = await dispatch_download(job.url, workspace, job.settings, job.user_id, progress_cb,
+                                                 cancel_event=job.cancel_event)
 
             # Name for /history: the first real file's name (a gallery/playlist
             # just gets its first item). Keep the preview title if there's none.
@@ -574,7 +591,7 @@ class JobManager:
                     # "Title [01-30-00–01-32-00]" -> "Title": the range isn't a title
                     job.title = re.sub(r"\s*\[[^\]]*\]$", "", job.title) or job.title
 
-            if job.settings.get("mode") in ("video", "audio") and job.batch is None:
+            if job.settings.get("mode") in ("video", "audio") and job.batch is None and not job.settings.get("tool"):
                 self._drop_cached(job.rid)
                 for f in files:
                     if f.suffix.lower() not in _NON_MEDIA_EXTS:
@@ -583,6 +600,8 @@ class JobManager:
             job.header = "Sending"
             await self._emit(job, "Uploading to Telegram...", markup=queued_menu(job.rid, job.url))
             await self._send_files(job, files)
+            if job.settings.get("tool"):
+                media_tools.store.discard(job.rid)        # the uploaded original is no longer needed
             # Things the downloader wants the person to know (e.g. subtitles couldn't be fetched).
             for note in job.settings.pop("delivery_notes", []):
                 try:
@@ -599,6 +618,9 @@ class JobManager:
         subtitle_files = [f for f in files if f.suffix.lower() in _SUBTITLE_EXTS]
         files = [f for f in files if f.suffix.lower() not in _SUBTITLE_EXTS]
         multi = len(files) > 1
+        tool_job = bool(job.settings.get("tool"))
+        # A toolbox result has no source link to copy and no cached original to "send as file" from.
+        link_menu = None if tool_job else sent_menu(job.url)
         for index, f in enumerate(files):
             is_last = index == len(files) - 1
             suffix = f.suffix.lower()
@@ -613,7 +635,7 @@ class JobManager:
                     input_file = InputFile(fh, filename=f.name)
                     await self.bot.send_document(
                         job.chat_id, input_file, caption=caption, parse_mode=ParseMode.HTML,
-                        reply_markup=sent_menu(job.url) if (is_last or not multi) else None,
+                        reply_markup=link_menu if (is_last or not multi) else None,
                         read_timeout=180, write_timeout=180, connect_timeout=60,
                     )
                 continue
@@ -629,12 +651,19 @@ class JobManager:
                 audio_note = "\n\nWant it sent as a plain file instead?"
             if multi and not is_last:
                 video_note = audio_note = ""
+            if tool_job:
+                send_menu, video_note, audio_note = None, "", ""
             if job.batch is not None:
                 # "Send as file instead" re-runs ONE job from its own message and cache -
                 # neither exists for a batch item, so don't offer a dead-end button.
                 send_menu, video_note, audio_note = sent_menu(job.url), "", ""
 
-            if suffix in _STREAMABLE_VIDEO_EXTS:
+            if tool_job and suffix == ".gif":
+                with open(f, "rb") as fh:
+                    await self.bot.send_animation(job.chat_id, InputFile(fh, filename=f.name), caption=caption,
+                                                   parse_mode=ParseMode.HTML,
+                                                   read_timeout=120, write_timeout=120, connect_timeout=60)
+            elif suffix in _STREAMABLE_VIDEO_EXTS:
                 await self._emit(job, f"Sending {size_mb:.1f} MB...", markup=None)
                 with open(f, "rb") as fh:
                     input_file = InputFile(fh, filename=f.name)
@@ -653,12 +682,12 @@ class JobManager:
                 with open(f, "rb") as fh:
                     input_file = InputFile(fh, filename=f.name)
                     await self.bot.send_photo(job.chat_id, input_file, caption=caption,
-                                               parse_mode=ParseMode.HTML, reply_markup=sent_menu(job.url))
+                                               parse_mode=ParseMode.HTML, reply_markup=link_menu)
             else:
                 with open(f, "rb") as fh:
                     input_file = InputFile(fh, filename=f.name)
                     await self.bot.send_document(job.chat_id, input_file, caption=caption,
-                                                  parse_mode=ParseMode.HTML, reply_markup=sent_menu(job.url),
+                                                  parse_mode=ParseMode.HTML, reply_markup=link_menu,
                                                   read_timeout=120, write_timeout=120, connect_timeout=60)
         for f in subtitle_files:
             parts = f.suffixes

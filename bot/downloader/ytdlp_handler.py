@@ -11,10 +11,12 @@ from typing import Callable
 
 import yt_dlp
 
+import config
 from config import DATA_DIR, BGUTIL_POT_URL
+from downloader import tools
 from downloader.cookies import apply_cookies, cookie_file_for
 from downloader.errors import JobCancelled
-from downloader.proxy import policy
+from downloader.proxy import policy, site_label
 from downloader.music import MAX_TRACKS, clean_title, music_tags, polish_mp3, split_by_chapters, valid_chapters
 from utils.procs import kill_processes_under
 from downloader.sections import SectionError, filename_tag, format_section, validate_sections
@@ -290,7 +292,7 @@ def _clear(workspace: Path) -> None:
 
 async def download(url: str, workspace: Path, settings: dict, user_id: int,
                    progress_cb: ProgressCB, cancel_event: asyncio.Event | None = None) -> list[Path]:
-    """The real entry point: picks the route (direct, or via the proxy when YouTube is blocking this
+    """The real entry point: picks the route (direct, or via the proxy when the site is blocking this
     server's address - see downloader/proxy.py) and retries once on a different route if the first
     one is refused. Someone's own proxy setting bypasses all of it."""
     if settings.get("proxy"):
@@ -304,7 +306,7 @@ async def download(url: str, workspace: Path, settings: dict, user_id: int,
             raise
         except Exception as exc:  # noqa: BLE001
             if attempt == 1 and policy.report_failure(url, proxy, str(exc)):
-                progress_cb(None, None, None, "Switching route - YouTube blocked this address")
+                progress_cb(None, None, None, f"Switching route - {site_label(url)} blocked this address")
                 _clear(workspace)
                 proxy = policy.route(url)
                 continue
@@ -378,7 +380,48 @@ async def _download_with_subtitles(url: str, workspace: Path, settings: dict, us
             shutil.rmtree(leftover, ignore_errors=True) if leftover.is_dir() else leftover.unlink(missing_ok=True)
         plain = {k: v for k, v in settings.items() if k not in ("sub_langs", "sub_mode")}
         return await _download_main(url, workspace, plain, user_id, progress_cb, cancel_event)
-    return await _verify_subtitles(files, settings)
+    files = await _verify_subtitles(files, settings)
+    if settings.get("sub_mode") == "burn":
+        files = await _burn_subtitles(files, workspace, settings, progress_cb, cancel_event)
+    return files
+
+
+def _srt_language(path: Path) -> str:
+    parts = path.suffixes
+    return parts[-2].lstrip(".") if len(parts) >= 2 else ""
+
+
+async def _burn_subtitles(files: list[Path], workspace: Path, settings: dict, progress_cb: ProgressCB,
+                          cancel_event: asyncio.Event | None) -> list[Path]:
+    """"Burned in": draw the FIRST chosen language into the picture (re-encodes the video). The other languages
+    stay as .srt files. If it can't be done (too long, ffmpeg refuses) the video goes out unchanged with its
+    .srt files and the person is told - the download itself is never lost."""
+    video = next((f for f in files if f.suffix.lower() in (".mp4", ".mkv", ".webm", ".mov")), None)
+    srts = [f for f in files if f.suffix.lower() == ".srt"]
+    if video is None or not srts:
+        return files                                      # nothing to burn; _verify_subtitles already said why
+    by_language = {_srt_language(f): f for f in srts}
+    chosen = next((by_language[lang] for lang in settings.get("sub_langs") or [] if lang in by_language), srts[0])
+    duration = await _media_seconds(video)
+    if duration and duration > config.BURN_MAX_SECONDS:
+        _add_note(settings, f"◧ This video is too long to burn subtitles into ({int(duration // 60)} min), so they "
+                            f"were sent as a separate .srt file instead.")
+        return files
+    try:
+        burned = await tools.burn_into(video, chosen, workspace, duration, progress_cb, cancel_event, stem=video.stem)
+    except JobCancelled:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Burning subtitles failed: %s", exc)
+        _add_note(settings, "◧ Couldn't burn the subtitles into the video, so they were sent as a separate .srt file.")
+        return files
+    final = video.with_suffix(".mp4")
+    video.unlink(missing_ok=True)
+    burned.replace(final)
+    chosen.unlink(missing_ok=True)
+    if len(srts) > 1:
+        _add_note(settings, "◧ Only the first language is burned in; the others are attached as .srt files.")
+    return [final] + [f for f in files if f is not video and f is not chosen]
 
 
 async def _subtitle_streams(path: Path) -> int:
@@ -401,7 +444,7 @@ async def _verify_subtitles(files: list[Path], settings: dict) -> list[Path]:
     srt_count = sum(1 for f in files if f.suffix.lower() == ".srt")
     embedded = await _subtitle_streams(video) if video and mode in ("embed", "both") else None
 
-    got = {"embed": embedded, "file": srt_count, "both": max(embedded or 0, srt_count)}[mode]
+    got = {"embed": embedded, "file": srt_count, "both": max(embedded or 0, srt_count), "burn": srt_count}[mode]
     if got == -1:
         return files
     if got == 0:

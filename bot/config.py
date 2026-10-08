@@ -44,14 +44,23 @@ DB_PATH = os.path.join(DATA_DIR, "candy.db")
 MAX_FILE_SIZE_BYTES = 2 * 1024 * 1024 * 1024  # 2GB
 
 
-# --- YouTube routing (see downloader/proxy.py) -------------------------------------------------
-# Comma-separated proxy URLs used ONLY for YouTube, e.g. socks5h://warp:1080 (the bundled WARP container).
+# --- Site routing (see downloader/proxy.py) ---------------------------------------------------
+# Comma-separated proxy URLs used ONLY for the sites in PROXY_DOMAINS, e.g. socks5h://warp:1080 (the bundled WARP container).
 # Empty = never use a proxy. socks5h makes the proxy do the DNS lookup too.
 YT_PROXIES = [p.strip() for p in os.getenv("YT_PROXIES", "").split(",") if p.strip()]
-# auto   = go direct; if YouTube blocks this server's address, switch to the proxy for a while
+# auto   = go direct; if a site blocks this server's address, switch to the proxy for that site for a while
 # always = always use the proxy when it is reachable
 # off    = never
 YT_PROXY_MODE = os.getenv("YT_PROXY_MODE", "auto").strip().lower()
+# Which sites may be routed through the proxy (a site is also matched by its subdomains). "*" = every site.
+# Each site is tracked on its own: YouTube blocking this server does not send Instagram through the proxy.
+_DEFAULT_PROXY_DOMAINS = ("youtube.com,youtu.be,x.com,twitter.com,instagram.com,pinterest.com,pin.it,"
+                          "reddit.com,tiktok.com")
+PROXY_DOMAINS = [d.strip().lower() for d in os.getenv("PROXY_DOMAINS", _DEFAULT_PROXY_DOMAINS).split(",") if d.strip()]
 # Politeness for the host machine: child processes (ffmpeg!) inherit this, so a conversion can't starve
 # your PC. 0 = off; 10 is "low priority".
 PROCESS_NICE = int(os.getenv("PROCESS_NICE", "10"))
+
+# Burned-in subtitles re-encode the whole video (slow, heavy on a small machine): longer videos are
+# sent with the subtitles as a separate .srt instead. 0 = no limit.
+BURN_MAX_SECONDS = int(os.getenv("BURN_MAX_SECONDS", str(60 * 60))) or 10 ** 9

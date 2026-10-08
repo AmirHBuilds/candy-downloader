@@ -2,7 +2,7 @@ from html import escape as _esc
 
 from config import OWNER_NAME, OWNER_EMOJI
 
-WELCOME = f"{OWNER_EMOJI} <b>{OWNER_NAME}'s Downloader</b>\n\n→ Send me a link to get started."
+WELCOME = f"{OWNER_EMOJI} <b>{OWNER_NAME}'s Downloader</b>\n\n→ Send me a link to get started.\n→ Or send a video or audio file to trim, compress or convert it."
 
 PICK_OPTION = "What do you want?"
 QUEUED = f"{OWNER_EMOJI} Queued"
