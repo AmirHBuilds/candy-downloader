@@ -392,6 +392,92 @@ class BurnedInDownloads(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("No subtitles" in note for note in settings["delivery_notes"]))
 
 
+# ============================================================ Persian burned-in subtitles
+PERSIAN_SRT = ("1\n00:00:00,500 --> 00:00:03,000\nسلام دنیا، این یک آزمایش است\nپ چ ژ گ ک ی — Hello\n\n")
+EMPTY_FONTCONFIG = '<?xml version="1.0"?><!DOCTYPE fontconfig SYSTEM "fonts.dtd"><fontconfig></fontconfig>'
+
+
+class PersianBurnIn(unittest.IsolatedAsyncioTestCase):
+    """Burned-in Persian showed empty boxes: the container had no font libass could use. The font now ships with
+    the bot, and these tests run ffmpeg with NO system fonts at all (an empty fontconfig) to prove it."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp(prefix="fa-"))
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        (self.dir / "empty.conf").write_text(EMPTY_FONTCONFIG)
+        self.srt = self.dir / "fa.srt"
+        self.srt.write_text(PERSIAN_SRT, encoding="utf-8")
+        import os
+        from unittest import mock
+        patcher = mock.patch.dict(os.environ, {"FONTCONFIG_FILE": str(self.dir / "empty.conf")})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def flat_video(self):
+        """A plain one-colour video: after burning, only subtitle ink can differ from the background."""
+        path = self.dir / "flat.mp4"
+        _ffmpeg("-f", "lavfi", "-i", "color=c=0x335577:s=320x180:r=25:d=6", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(path))
+        return path
+
+    def ink(self, path, at):
+        """How many pixels of the frame at `at` seconds differ clearly from the flat background."""
+        raw = subprocess.run(["ffmpeg", "-loglevel", "error", "-ss", str(at), "-i", str(path), "-frames:v", "1",
+                              "-f", "rawvideo", "-pix_fmt", "gray", "-"], capture_output=True).stdout
+        background = max(set(raw), key=raw.count)
+        return sum(1 for pixel in raw if abs(pixel - background) > 40)
+
+    def libass_log(self, args):
+        """What libass says about fonts while burning (ffmpeg -v verbose)."""
+        return subprocess.run(["ffmpeg", "-v", "verbose", "-y", "-nostdin", *args], capture_output=True, text=True,
+                              cwd=self.dir).stderr
+
+    def test_the_font_ships_with_the_bot(self):
+        for name in ("DejaVuSans.ttf", "DejaVuSans-Bold.ttf", "LICENSE-DejaVu.txt"):
+            self.assertTrue((tools.FONTS_DIR / name).is_file(), name)
+        self.assertGreater((tools.FONTS_DIR / "DejaVuSans.ttf").stat().st_size, 100_000)
+
+    def test_the_filter_points_at_the_bundled_fonts_and_names_the_font(self):
+        args = tools.burn_args(Path("in.mp4"), "burn_subs.srt", Path("out.mp4"))
+        vf = args[args.index("-vf") + 1]
+        self.assertIn(f"fontsdir={tools.FONTS_DIR}", vf)
+        self.assertIn("FontName=DejaVu Sans", vf)
+        self.assertTrue(vf.startswith("subtitles=burn_subs.srt:"))
+
+    def test_the_font_directory_is_escaped_for_the_filter(self):
+        self.assertEqual(tools._filter_escape("/a b/c:d,e'f"), "/a b/c\\:d\\,e\\'f")
+
+    def test_without_the_bundled_font_a_bare_container_draws_nothing(self):
+        """The bug, reproduced: this is what the old setup did on an image without a usable font."""
+        shutil.copy(VIDEO, self.dir / "in.mp4")
+        shutil.copy(self.srt, self.dir / "burn_subs.srt")
+        log = self.libass_log(["-i", "in.mp4", "-vf", "subtitles=burn_subs.srt:force_style='FontName=Noto Sans,Fontsize=22'",
+                               "-t", "3", "-f", "null", "-"])
+        self.assertIn("failed to find any fallback", log)
+
+    def test_persian_is_found_in_the_bundled_font_with_no_fallback_needed(self):
+        shutil.copy(VIDEO, self.dir / "in.mp4")
+        shutil.copy(self.srt, self.dir / "burn_subs.srt")
+        args = tools.burn_args(Path("in.mp4"), "burn_subs.srt", self.dir / "out.mp4")
+        log = self.libass_log([*args[:args.index("-c:v")], "-t", "3", "-f", "null", "-"])
+        self.assertIn("-> DejaVuSans", log)
+        self.assertNotIn("failed to find any fallback", log)          # no glyph (= no empty box) was left unfound
+
+    async def test_the_burned_video_really_shows_persian_text_with_no_system_fonts(self):
+        flat = self.flat_video()
+        out = await tools.burn_into(flat, self.srt, self.dir, 6, lambda *a: None, None, stem="fa")
+        self.assertGreater(self.ink(out, 2), 300, "no subtitle ink on the frame")        # the text is drawn ...
+        self.assertLess(self.ink(out, 5), 20)                                            # ... and gone after its end time
+        self.assertEqual(self.ink(flat, 2), 0)                                           # (the source itself is flat)
+
+    async def test_the_same_video_without_the_bundled_font_stays_blank_which_is_the_bug(self):
+        flat = self.flat_video()
+        original_dir = tools.FONTS_DIR
+        self.addCleanup(setattr, tools, "FONTS_DIR", original_dir)
+        tools.FONTS_DIR = self.dir / "no-such-folder"
+        out = await tools.burn_into(flat, self.srt, self.dir, 6, lambda *a: None, None, stem="bare")
+        self.assertLess(self.ink(out, 2), 20)
+
+
 # ============================================================ subtitles that YouTube refused the first time
 class SubtitleRecovery(unittest.IsolatedAsyncioTestCase):
     """HTTP 429 on the subtitle request: the video still arrives, and the subtitles get their own second chance."""

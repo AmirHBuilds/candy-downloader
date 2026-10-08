@@ -34,8 +34,14 @@ MIN_VIDEO_KBPS = 150
 AUDIO_KBPS = 96
 SIZE_SAFETY = 0.92          # container overhead + bitrate overshoot: aim a little under the target
 
-# Subtitle look: big enough for a phone, outlined so it reads on any picture, a font that has Arabic/Persian.
-BURN_STYLE = "FontName=Noto Sans,Fontsize=22,Outline=2,Shadow=0,MarginV=28,Alignment=2"
+# Subtitle look: big enough for a phone, outlined so it reads on any picture. The font is BUNDLED with the bot
+# (assets/fonts) and handed to ffmpeg with fontsdir=, so Persian/Arabic render the same on any machine and image:
+# relying on whatever fonts the OS has gave empty boxes (libass cannot use Debian's variable Noto files well, and
+# a slim image may have no font at all). DejaVu Sans is a static font that covers Persian, Arabic, Latin, Cyrillic,
+# Greek and Hebrew; scripts it lacks (Thai, CJK...) still fall back to any system font that is installed.
+FONTS_DIR = Path(__file__).resolve().parents[1] / "assets" / "fonts"
+BURN_FONT = "DejaVu Sans"
+BURN_STYLE = f"FontName={BURN_FONT},Fontsize=22,Outline=2,Shadow=0,MarginV=28,Alignment=2"
 
 _VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".ts", ".3gp", ".flv"}
 _AUDIO_EXTS = {".mp3", ".m4a", ".opus", ".ogg", ".oga", ".flac", ".wav", ".aac", ".wma"}
@@ -239,10 +245,18 @@ def strip_args(src: Path, dst: Path) -> list[str]:
             "-fflags", "+bitexact", "-flags:v", "+bitexact", "-flags:a", "+bitexact", "-c", "copy", str(dst)]
 
 
+def _filter_escape(value: str) -> str:
+    """Escape a value inside an ffmpeg filter option (\\, :, ', and the filtergraph separators)."""
+    for char in ("\\", ":", "'", ",", "[", "]", ";"):
+        value = value.replace(char, "\\" + char)
+    return value
+
+
 def burn_args(src: Path, srt_name: str, dst: Path) -> list[str]:
     """`srt_name` is a bare file name that sits in the working directory ffmpeg is started in: file names
     inside a filter need awkward escaping (colons, quotes, commas), so the runner avoids paths entirely."""
-    return ["-i", str(src), "-map", "0:v:0", "-map", "0:a?", "-vf", f"subtitles={srt_name}:force_style='{BURN_STYLE}'",
+    fonts = f":fontsdir={_filter_escape(str(FONTS_DIR))}" if FONTS_DIR.is_dir() else ""
+    return ["-i", str(src), "-map", "0:v:0", "-map", "0:a?", "-vf", f"subtitles={srt_name}{fonts}:force_style='{BURN_STYLE}'",
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p", "-c:a", "copy",
             "-movflags", "+faststart", str(dst)]
 
