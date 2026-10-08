@@ -785,7 +785,7 @@ class Handlers(unittest.IsolatedAsyncioTestCase):
         main.update_setting = lambda *a, **k: None
         main.inspect_cookie_file = lambda path: {"netscape": True, "youtube": False, "logged_in": False, "expired": False}
         cookies = _TMP / "cookies.txt"
-        cookies.write_text("# Netscape HTTP Cookie File\n")
+        cookies.write_text("# Netscape HTTP Cookie File\n.instagram.com\tTRUE\t/\tTRUE\t4102444800\tsessionid\tabc\n")
         server = self.server_copy("documents", "file_4.txt", source=cookies)
         document = Media(cookies, "cookies.txt")
         document.file_path = str(server)

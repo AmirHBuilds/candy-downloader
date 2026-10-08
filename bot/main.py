@@ -45,7 +45,10 @@ from downloader.sections import SectionDraft, SectionError, parse_timestamp, sta
 from downloader.sizes import size_labels
 from downloader.subtitles import SubChoice, SubtitleError, clamp_page as sub_clamp_page, summary as subtitle_summary
 from downloader import gallerydl_probe
-from downloader.cookies import inspect_cookie_file
+from downloader.cookies import (
+    inspect_cookie_file, list_sites, merge_upload, remove_site, site_label,
+)
+from ui import cookies_menu
 from downloader.playlist import (
     Entry, ListingError, MAX_LISTED, list_playlist, looks_like_playlist, quick_titles, short_label,
 )
@@ -340,6 +343,8 @@ COOKIES_HELP = (
     "there. Close the window right after. (YouTube rotates cookies from "
     "normal tabs, which silently breaks the exported file.)\n"
     "3. Send me the exported <code>.txt</code> file right here\n\n"
+    "4. Another site later? Send its file too: only that site's cookies are "
+    "replaced, the rest are kept.\n\n"
     "• This is private to you — every person using this bot has their "
     "own cookies file, and no one else can see or use yours.\n\n"
     "• Using your main account's cookies for automated downloads can "
@@ -351,23 +356,33 @@ async def cookies_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not await gate(update, context):
         return
     await _delete_quietly(update.message)
-    await update.message.reply_text(COOKIES_HELP, parse_mode=ParseMode.HTML)
+    sites = list_sites(_cookie_path(update.effective_user.id))
+    await update.message.reply_text(COOKIES_HELP + "\n\n" + cookies_menu.cookies_list_text(sites), parse_mode=ParseMode.HTML,
+                                    reply_markup=cookies_menu.cookies_menu(sites, back="nav|home"))
+
+
+def _cookie_path(user_id: int) -> Path:
+    return Path(config.COOKIES_DIR) / f"{user_id}.txt"
 
 
 async def cookies_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A cookies.txt upload is MERGED into the person's file: it replaces the cookies of the sites it contains
+    and keeps the others (sending Instagram's cookies must not wipe YouTube's)."""
     if not await gate(update, context):
         return
     doc = update.message.document
     user_id = update.effective_user.id
     Path(config.COOKIES_DIR).mkdir(parents=True, exist_ok=True)
-    dest = Path(config.COOKIES_DIR) / f"{user_id}.txt"
+    dest = _cookie_path(user_id)
+    upload = dest.with_suffix(".upload")
 
     try:
         tg_file = await doc.get_file()
-        await tg_file.download_to_drive(custom_path=str(dest))
+        await tg_file.download_to_drive(custom_path=str(upload))
         drop_server_copy(getattr(tg_file, "file_path", None))      # cookies are secrets: don't leave a copy behind
     except Exception:  # noqa: BLE001
         log.exception("Couldn't fetch the uploaded cookies file")
+        upload.unlink(missing_ok=True)
         hint = ""
         if config.LOCAL_BOT_API_URL:
             hint = (
@@ -381,15 +396,22 @@ async def cookies_file_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
+    try:
+        check = inspect_cookie_file(upload)
+        merged = merge_upload(dest, upload)
+    finally:
+        upload.unlink(missing_ok=True)
+    if merged is None:
+        await update.message.reply_text(
+            "✕ That doesn't look like a cookies.txt export (Netscape format), so nothing was changed. "
+            "Use a \"cookies.txt\" browser extension and send the file again. /cookies has the steps.")
+        return
+
     update_setting(user_id, "cookies_enabled", True)
-    check = inspect_cookie_file(dest)
-    if not check["netscape"] and not check["youtube"]:
-        note = (
-            "✕ Saved, but this doesn't look like a cookies.txt export "
-            "(Netscape format). Use a \"cookies.txt\" browser extension and "
-            "send the file again. /cookies has the steps."
-        )
-    elif check["youtube"] and not check["logged_in"]:
+    touched = merged.added + merged.replaced
+    names = ", ".join(site_label(site) for site in touched)
+    kept = ", ".join(site_label(site) for site in merged.kept)
+    if check["youtube"] and not check["logged_in"]:
         note = (
             "Saved — but there's no YouTube login in this file, so it "
             "won't help with YouTube. Log in first, then export again "
@@ -401,9 +423,20 @@ async def cookies_file_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             "won't work. Log in again, export from a private window, and "
             "send the file again. /cookies has the steps."
         )
+    elif merged.no_login:
+        note = (f"Saved — but there's no {', '.join(site_label(site) for site in merged.no_login)} login in this file "
+                f"(you were probably logged out when exporting), so it may not help. Log in, export again, and send it.")
     else:
-        note = "Cookies saved and turned on — just for you."
+        note = f"Cookies saved for {names} — just for you."
+    if kept:
+        note += f"\nYour other cookies ({kept}) were kept."
     await update.message.reply_text(note)
+
+
+async def _show_cookies_screen(query, user_id: int) -> None:
+    sites = list_sites(_cookie_path(user_id))
+    await query.edit_message_text(COOKIES_HELP + "\n\n" + cookies_menu.cookies_list_text(sites), parse_mode=ParseMode.HTML,
+                                  reply_markup=cookies_menu.cookies_menu(sites))
 
 
 # ---------- settings menu ----------
@@ -453,7 +486,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         pending_tool_input.pop(user_id, None)
 
         if screen == "cookies":
-            await query.edit_message_text(COOKIES_HELP, parse_mode=ParseMode.HTML, reply_markup=back_to_main())
+            await _show_cookies_screen(query, user_id)
             return
 
         if screen == "home":
@@ -479,6 +512,13 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             builder, title = screens[screen]
             markup = builder() if builder is confirm_reset_menu else builder(s)
             await query.edit_message_text(title, parse_mode=ParseMode.HTML, reply_markup=markup)
+        return
+
+    if data.startswith("ck|"):
+        parts = data.split("|", 2)
+        if len(parts) == 3 and parts[1] == "rm":
+            remove_site(_cookie_path(user_id), parts[2])
+        await _show_cookies_screen(query, user_id)
         return
 
     if data.startswith("s|"):
@@ -1617,7 +1657,13 @@ async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         gdl_info = await gallerydl_probe.probe(url)
 
     if gdl_info and (gdl_info.get("title") or gdl_info.get("thumbnail")):
-        caption = messages.with_link(esc(gdl_info["title"]) if gdl_info.get("title") else messages.PICK_OPTION, url)
+        caption_text = esc(gdl_info["title"]) if gdl_info.get("title") else messages.PICK_OPTION
+        if order[0] == "ytdlp" and not is_image_site(url):
+            # yt-dlp is this site's first tool and it failed; gallery-dl only found a title/picture. Say so -
+            # otherwise the missing quality/size/section buttons look like a bug.
+            error = probe_result.error if probe_result else ""
+            caption_text += "\n\n" + messages.preview_failed_note(error) + messages.preview_failed_reason(error)
+        caption = messages.with_link(caption_text, url)
         markup = simple_menu(rid) if (order[0] != "ytdlp" or is_image_site(url)) else fallback_menu(rid)
         if gdl_info.get("thumbnail"):
             try:
@@ -1968,7 +2014,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(link_callback, pattern=r"^dl\|"))
     app.add_handler(CallbackQueryHandler(batch_callback, pattern=r"^bt\|"))
     app.add_handler(CallbackQueryHandler(tools_callback, pattern=r"^tl\|"))
-    app.add_handler(CallbackQueryHandler(settings_callback, pattern=r"^(s\||nav\|)"))
+    app.add_handler(CallbackQueryHandler(settings_callback, pattern=r"^(s\||nav\||ck\|)"))
     app.add_handler(CallbackQueryHandler(history_callback, pattern=r"^hist\|"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, link_handler))
 

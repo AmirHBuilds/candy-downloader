@@ -531,6 +531,33 @@ class PreviewWherever(BatchFlowBase):
         self.assertNotIn("DABC123:", text)                                                   # no "[instagram] id:" noise
         self.assertTrue([d for d in datas(self.last_markup()) if d.startswith("dl|")])       # and it can still try downloading
 
+    async def test_when_gallery_dl_finds_a_title_the_person_is_still_told_yt_dlp_failed(self):
+        self.set_probe(ProbeResult(ok=False, error="ERROR: [instagram] X: rate-limit reached or login required"))
+
+        async def gallery_info(url):
+            return {"title": "A reel", "thumbnail": ""}
+        from downloader import gallerydl_probe
+        self.addCleanup(setattr, gallerydl_probe, "probe", gallerydl_probe.probe)
+        gallerydl_probe.probe = gallery_info
+        await self.send_text("https://www.instagram.com/reel/ABC/")
+        text = next(t for _, t, m in reversed(self.bot.edits) if m is not None)
+        self.assertIn("A reel", text)
+        self.assertIn("needs a login", text)
+        self.assertIn("rate-limit reached or login required", text)
+
+    async def test_an_x_image_post_found_by_gallery_dl_gets_no_failure_note(self):
+        self.set_probe(ProbeResult(ok=False, error="No video could be found in this tweet"))
+
+        async def gallery_info(url):
+            return {"title": "A picture", "thumbnail": ""}
+        from downloader import gallerydl_probe
+        self.addCleanup(setattr, gallerydl_probe, "probe", gallerydl_probe.probe)
+        gallerydl_probe.probe = gallery_info
+        await self.send_text("https://x.com/someone/status/789")
+        text = next(t for _, t, m in reversed(self.bot.edits) if m is not None)
+        self.assertIn("A picture", text)
+        self.assertNotIn("preview", text)                          # an image post is not a failure
+
     async def test_a_gallery_only_site_is_never_previewed_with_yt_dlp(self):
         calls = self.set_probe(ProbeResult(ok=True, heights=[720], has_audio=True, duration=30))
 
