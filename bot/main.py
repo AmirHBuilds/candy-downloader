@@ -38,7 +38,8 @@ from ui.history_menu import (
 )
 from ui.start_menu import start_menu
 from ui import tools_menu
-from downloader import tools
+from downloader import tools, warp_control
+from downloader.proxy import tcp_alive
 from downloader import cookie_health
 from downloader.probe import probe, ProbeResult
 from downloader.sections import SectionDraft, SectionError, parse_timestamp, start_time_from_url
@@ -619,11 +620,42 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         body = "\n".join(f"• <code>{uid}</code> (since {at[:10]})" for uid, at in rows) or "No one yet."
         text = f"{admin_menu.panel_title()}\n\nAll known users ({len(rows)} shown)\n{body}"
         await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=admin_menu.back_only())
+    elif action in ("warp", "warp_ip", "warp_go"):
+        await _admin_warp(query, action)
     elif action == "close":
         try:
             await query.message.delete()
         except Exception:  # noqa: BLE001
             pass
+
+
+async def _admin_warp(query, action: str) -> None:
+    """The WARP screen: status + "Change address" (with a warning when downloads are running)."""
+    running = job_manager.active_count()
+
+    async def show(notice: str = "") -> None:
+        proxy = warp_control.proxy_url()
+        reachable = bool(proxy) and await asyncio.to_thread(tcp_alive, proxy)
+        ip = await warp_control.current_ip(proxy) if reachable else None
+        await query.edit_message_text(
+            admin_menu.warp_text(bool(proxy), reachable, ip, warp_control.configured(), running, notice),
+            parse_mode=ParseMode.HTML, reply_markup=admin_menu.warp_panel(warp_control.configured()))
+
+    if action == "warp":
+        await show()
+        return
+    if action == "warp_ip" and running:
+        await query.edit_message_text(admin_menu.warp_confirm_text(running), parse_mode=ParseMode.HTML,
+                                      reply_markup=admin_menu.warp_confirm_panel())
+        return
+    await query.edit_message_text(f"{admin_menu.panel_title()}\n\n🔄 Changing the WARP address… (up to a minute)",
+                                  parse_mode=ParseMode.HTML)
+    result = await warp_control.rotate()
+    if result.ok and result.new_ip:
+        notice = f"✓ {esc(result.message)}\n<code>{esc(result.old_ip or '?')}</code> → <code>{esc(result.new_ip)}</code>"
+    else:
+        notice = f"✕ {esc(result.message)}"
+    await show(notice)
 
 
 async def handle_admin_text_input(update: Update, user_id: int, text: str) -> None:

@@ -52,6 +52,22 @@ services:
       WARP_SLEEP: 2
     # no published ports and no volume on purpose: no registration is kept between re-creations
 
+  # Lets the bot's admin panel ("WARP > Change address") get a fresh WARP address WITHOUT giving the bot the Docker
+  # socket: only this tiny service has it, and it can only re-register and restart the WARP container. It publishes no
+  # port. Set WARP_CONTROL_TOKEN in .env (any long random string); leave it empty to switch the button off.
+  warp-control:
+    image: python:3.12-alpine
+    container_name: candy_warp_control
+    restart: unless-stopped
+    profiles: ["warp-control"]           # off unless you run: docker compose --profile warp-control up -d
+    environment:
+      WARP_CONTROL_TOKEN: ${WARP_CONTROL_TOKEN:-}
+      WARP_CONTAINER: candy_warp
+    volumes:
+      - ./warp_control/control.py:/control.py:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: ["python", "-u", "/control.py"]
+
   # CandyDownloader bot itself.
   bot:
     build: ./bot
@@ -75,6 +91,9 @@ services:
       BURN_MAX_SECONDS: ${BURN_MAX_SECONDS:-3600}
       PROXY_DOMAINS: ${PROXY_DOMAINS:-youtube.com,youtu.be,x.com,twitter.com,instagram.com,pinterest.com,pin.it,reddit.com,tiktok.com}
       PROCESS_NICE: ${PROCESS_NICE:-10}
+      WARP_CONTROL_URL: ${WARP_CONTROL_URL:-}
+      WARP_CONTROL_TOKEN: ${WARP_CONTROL_TOKEN:-}
+      WARP_ROTATE_COOLDOWN_SECONDS: ${WARP_ROTATE_COOLDOWN_SECONDS:-120}
       BOT_API_CLEANUP: ${BOT_API_CLEANUP:-on}
       BOT_API_FILE_MAX_AGE_MINUTES: ${BOT_API_FILE_MAX_AGE_MINUTES:-60}
       HOUSEKEEPING_INTERVAL_SECONDS: ${HOUSEKEEPING_INTERVAL_SECONDS:-300}

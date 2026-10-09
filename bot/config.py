@@ -72,3 +72,10 @@ HOUSEKEEPING_INTERVAL_SECONDS = int(os.getenv("HOUSEKEEPING_INTERVAL_SECONDS", "
 BOT_API_DATA_DIR = os.getenv("BOT_API_DATA_DIR", "/var/lib/telegram-bot-api").rstrip("/")
 BOT_API_FILE_MAX_AGE_MINUTES = int(os.getenv("BOT_API_FILE_MAX_AGE_MINUTES", "60"))
 BOT_API_CLEANUP = os.getenv("BOT_API_CLEANUP", "on").strip().lower() != "off"
+
+# --- Changing the WARP address from the admin panel (see downloader/warp_control.py) -----------------------------
+# The control service (warp_control/ in the repo, the `warp-control` compose service) re-registers and restarts the
+# WARP container. Empty URL = the button explains how to do it by hand instead.
+WARP_CONTROL_URL = os.getenv("WARP_CONTROL_URL", "").strip().rstrip("/")
+WARP_CONTROL_TOKEN = os.getenv("WARP_CONTROL_TOKEN", "").strip()
+WARP_ROTATE_COOLDOWN_SECONDS = int(os.getenv("WARP_ROTATE_COOLDOWN_SECONDS", "120"))

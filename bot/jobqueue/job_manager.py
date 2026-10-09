@@ -162,6 +162,10 @@ class JobManager:
                  rid, force_document, settings.get("quality"), settings.get("mode"))
         return job
 
+    def active_count(self) -> int:
+        """Jobs that are queued or running right now."""
+        return sum(1 for job in self._jobs_by_rid.values() if not job.terminal)
+
     def is_active(self, rid: str) -> bool:
         """A job with this id is queued or running (the toolbox must not start a second one on the same file)."""
         job = self._jobs_by_rid.get(rid)

@@ -171,6 +171,14 @@ class ProxyPolicy:
                      site, self._proxy_block // 60)
         return self.route(url) != proxy
 
+    def reset_proxy(self, proxy: str | None = None) -> None:
+        """The proxy's address was just changed: forget that any site blocked it, and re-check it is reachable."""
+        for key in [k for k in self._blocked_until if proxy is None or k[1] == proxy]:
+            del self._blocked_until[key]
+        for site in [s for s, p in self._last_good.items() if proxy is None or p == proxy]:
+            del self._last_good[site]
+        self._alive_cache.clear()
+
     def report_success(self, url: str, proxy: str | None) -> None:
         site = self._site(url)
         if site is None:
