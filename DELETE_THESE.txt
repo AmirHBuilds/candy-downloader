@@ -1,0 +1,5 @@
+Delete these files from your project (the built-in links replaced them):
+  bot/web/uploader.py
+  bot/web/secrets_store.py
+  bot/tests/test_web_uploader.py
+Optional: remove WEB_SECRET_KEY from your .env (no longer used) and the data/web_secret file.

@@ -97,6 +97,20 @@ services:
       BOT_API_CLEANUP: ${BOT_API_CLEANUP:-on}
       BOT_API_FILE_MAX_AGE_MINUTES: ${BOT_API_FILE_MAX_AGE_MINUTES:-60}
       HOUSEKEEPING_INTERVAL_SECONDS: ${HOUSEKEEPING_INTERVAL_SECONDS:-300}
+      # --- web app (see the caddy service below and .env.example) ---
+      WEB_ENABLED: ${WEB_ENABLED:-off}
+      WEB_PUBLIC_URL: ${WEB_PUBLIC_URL:-}
+      WEB_ADMIN_USER: ${WEB_ADMIN_USER:-}
+      WEB_ADMIN_PASSWORD: ${WEB_ADMIN_PASSWORD:-}
+      WEB_COOKIE_SECURE: ${WEB_COOKIE_SECURE:-on}
+      WEB_TRUST_PROXY: ${WEB_TRUST_PROXY:-on}
+      WEB_FILE_TTL_MINUTES: ${WEB_FILE_TTL_MINUTES:-120}
+      WEB_QUOTA_MB: ${WEB_QUOTA_MB:-4096}
+      WEB_MAX_ACTIVE_JOBS: ${WEB_MAX_ACTIVE_JOBS:-3}
+    # The web app listens on 8080 INSIDE the Docker network only (no `ports:` on purpose): the only way in from the
+    # internet is the caddy service, which adds HTTPS. Nothing else about this container is exposed.
+    expose:
+      - "8080"
     # Keeps a heavy ffmpeg job (converting, exact clip cuts) from taking over your PC. Raise or remove
     # these on a bigger machine; Docker Desktop also has its own CPU/RAM caps under Settings > Resources.
     # The bot runs as PID 1 and starts ffmpeg/aria2c/gallery-dl; without a real init, any child that gets
@@ -118,5 +132,29 @@ services:
     # download_to_drive() do automatically. It is read-WRITE so the bot can delete those copies again
     # (utils/cleanup.py touches only the documents/videos/audios/... folders, never the server's database).
 
+  # HTTPS front door for the web app: gets and renews a free certificate for WEB_DOMAIN by itself and is the ONLY
+  # container with ports open to the internet. Off unless you run: docker compose --profile web up -d
+  # Needs: a domain whose DNS points at this machine, and ports 80 and 443 reachable. No domain / ports? Skip this
+  # service and use a Cloudflare Tunnel pointing at http://bot:8080 instead (see HANDOFF.md, rev9).
+  caddy:
+    image: caddy:2-alpine
+    container_name: candy_caddy
+    restart: unless-stopped
+    profiles: ["web"]
+    depends_on:
+      - bot
+    environment:
+      WEB_DOMAIN: ${WEB_DOMAIN:-localhost}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data              # the certificates: keep this volume or you will be asked for new ones
+      - caddy_config:/config
+
 volumes:
   bot_api_data:
+  caddy_data:
+  caddy_config:

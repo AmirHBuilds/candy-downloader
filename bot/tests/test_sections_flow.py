@@ -122,6 +122,8 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         main.pending_links[RID] = (USER, URL)
         main.pending_probes[RID] = ProbeResult(ok=True, title="My long video", heights=[1080, 720, 480],
                                                has_audio=True, duration=DURATION)
+        for name in ("job_manager", "get_settings", "gate", "gate_callback"):
+            self.addCleanup(setattr, main, name, getattr(main, name))      # don't leak fakes into other test modules
         main.job_manager = self.jobs
         main.get_settings = lambda uid: dict(DEFAULTS)
 
@@ -799,6 +801,7 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_pasting_a_new_link_while_waiting_moves_on(self):
         async def deny(*a, **k):
             return False                                              # stop link_handler right after the check
+        self.addCleanup(setattr, main, "gate", main.gate)
         main.gate = deny
         await self.tap(f"dl|sec|start|0|{RID}")
         await self.type_text("https://youtu.be/other")

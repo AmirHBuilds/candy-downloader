@@ -31,7 +31,7 @@ from telegram import Bot, InputFile, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
 
-from config import OWNER_EMOJI
+from config import OWNER_EMOJI, TMP_DIR
 from ui.steplog import step_line
 from downloader import tools as media_tools
 from ui import tools_menu
@@ -43,6 +43,8 @@ from ui import messages
 from ui.progress import render_progress, resolve_style
 from ui.quick_menu import queued_menu, send_as_file_menu, sent_menu, retry_menu, cancelled_menu
 from utils.cleanup import job_workspace, new_cache_path
+from web import shares
+from utils.webchat import deliveries as web_deliveries, is_web_chat, remember_job
 from utils.text import esc, sanitize_step as _sanitize_step, site_label
 
 log = logging.getLogger("candy.jobs")
@@ -132,6 +134,9 @@ class JobManager:
         # rid -> every file of that job, in delivery order (a playlist or a
         # multi-clip job has several; "Send as file instead" re-sends all of them)
         self._recent_files: dict[str, list[dict]] = {}
+        # Called with each Job when it reaches its final state (the web app keeps the outcome after the job is gone).
+        self.finish_listeners: list = []
+        self._owners: dict[str, int] = {}          # rid -> user id, so cached files are only handed to their owner
 
     def start(self) -> None:
         for i in range(self._max_concurrent):
@@ -155,6 +160,9 @@ class JobManager:
             batch=batch,
         )
         self._jobs_by_rid[rid] = job
+        self._owners[rid] = user_id
+        if is_web_chat(chat_id):
+            remember_job(chat_id, rid)
         await self._queue.put(job)
         if batch is None:      # a batch has its own shared message; "waiting" is a count there
             asyncio.create_task(self._queued_heartbeat(job))
@@ -342,6 +350,7 @@ class JobManager:
             self._recent_files[rid] = remaining
         else:
             self._recent_files.pop(rid, None)
+            self._owners.pop(rid, None)
         path.unlink(missing_ok=True)
 
     def has_cached_video(self, rid: str, url: str) -> bool:
@@ -411,6 +420,7 @@ class JobManager:
                 await self._emit(job, "Cancelled before it started", markup=cancelled_menu(job.rid, job.url))
                 self._jobs_by_rid.pop(job.rid, None)
                 self._queue.task_done()
+                self._notify_finished(job)
                 await self._tell_batch(job)
                 continue
 
@@ -452,7 +462,24 @@ class JobManager:
                 job.terminal = True
                 self._jobs_by_rid.pop(job.rid, None)
                 self._queue.task_done()
+                self._notify_finished(job)
                 await self._tell_batch(job)
+
+    def _notify_finished(self, job: Job) -> None:
+        for listener in self.finish_listeners:
+            try:
+                listener(job)
+            except Exception:  # noqa: BLE001 - a listener must never stop the worker loop
+                log.exception("Finish listener failed for job %s", job.rid)
+
+    def cached_files(self, rid: str, user_id: int) -> list[dict]:
+        """The delivered files still cached for this job (for "Get a link"); only the job's owner gets them."""
+        job_entries = self._recent_files.get(rid, [])
+        return [e for e in job_entries if e["path"].is_file()] if self._owners.get(rid) == user_id else []
+
+    def job_snapshot(self, rid: str) -> Job | None:
+        """The live job (queued or running), or None. Read-only use: the web app shows its progress."""
+        return self._jobs_by_rid.get(rid)
 
     async def _tell_batch(self, job: Job) -> None:
         """A job that belongs to a batch reports its outcome there. Never lets a
@@ -603,18 +630,41 @@ class JobManager:
                         await self._cache_video_file(job.rid, job.url, f)
 
             job.header = "Sending"
-            await self._emit(job, "Uploading to Telegram...", markup=queued_menu(job.rid, job.url))
+            await self._emit(job, "Preparing your file..." if is_web_chat(job.chat_id) else "Uploading to Telegram...",
+                             markup=queued_menu(job.rid, job.url))
             await self._send_files(job, files)
             if job.settings.get("tool"):
                 media_tools.store.touch(job.rid)          # kept for another hour: more tools can be run on it
             # Things the downloader wants the person to know (e.g. subtitles couldn't be fetched).
             for note in job.settings.pop("delivery_notes", []):
+                if is_web_chat(job.chat_id):
+                    web_deliveries.add_note(job.rid, note)
+                    continue
                 try:
                     await self.bot.send_message(job.chat_id, note)
                 except TelegramError as exc:
                     log.warning("Could not send a delivery note for job %s: %s", job.rid, exc)
 
+    async def _adopt_for_web(self, job: Job, files: list[Path]) -> None:
+        """A web job has no chat to upload to: its files move (out of the soon-deleted job folder) into the web
+        store, where the person downloads them in the browser."""
+        for old in web_deliveries.drop(job.rid):         # a retry under the same id replaces the earlier result
+            old.unlink(missing_ok=True)
+        target = Path(TMP_DIR) / "web" / job.rid
+        target.mkdir(parents=True, exist_ok=True)
+        loop = asyncio.get_running_loop()
+        for f in files:
+            name, n = f.name, 1
+            while (target / name).exists():
+                n += 1
+                name = f"{f.stem} ({n}){f.suffix}"
+            await loop.run_in_executor(None, shutil.move, str(f), str(target / name))
+            web_deliveries.add_file(job.rid, target / name, name)
+
     async def _send_files(self, job: Job, files: list[Path]) -> None:
+        if is_web_chat(job.chat_id):
+            await self._adopt_for_web(job, files)
+            return
         # With several videos/audios (multi-clip job, playlist) the "send as
         # file" button goes on the LAST one only, labelled "all": it re-sends
         # the whole batch, so repeating it under every clip would be misleading.
@@ -625,9 +675,11 @@ class JobManager:
         multi = len(files) > 1
         tool_job = bool(job.settings.get("tool"))
         # A toolbox result has no source link to copy and no cached original to "send as file" from.
-        link_menu = None if tool_job else sent_menu(job.url)
+        want_link = (not tool_job and job.batch is None and job.settings.get("mode") in ("video", "audio")
+                     and shares.available())        # "Get a link" (only on the last file)
         for index, f in enumerate(files):
             is_last = index == len(files) - 1
+            link_menu = None if tool_job else sent_menu(job.url, job.rid if (want_link and is_last) else None)
             suffix = f.suffix.lower()
             size_mb = f.stat().st_size / 1_000_000
             log.info("Sending rid=%s file=%s suffix=%s force_document=%s",
@@ -647,11 +699,11 @@ class JobManager:
 
             caption = messages.all_done_caption(f.stem[:100])
             if multi:
-                send_menu = send_as_file_menu(job.rid, job.url, "▤ Send all as files") if is_last else None
+                send_menu = send_as_file_menu(job.rid, job.url, "▤ Send all as files", get_link=want_link) if is_last else None
                 video_note = "\n\nWant the original files instead of these compressed previews?"
                 audio_note = "\n\nWant them sent as plain files instead?"
             else:
-                send_menu = send_as_file_menu(job.rid, job.url)
+                send_menu = send_as_file_menu(job.rid, job.url, get_link=want_link)
                 video_note = "\n\nWant the original file instead of this compressed preview?"
                 audio_note = "\n\nWant it sent as a plain file instead?"
             if multi and not is_last:

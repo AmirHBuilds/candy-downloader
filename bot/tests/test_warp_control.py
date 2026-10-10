@@ -227,6 +227,7 @@ class Service(unittest.TestCase):
     def setUp(self):
         self.ctl = load_control()
         self.calls = []
+        self.addCleanup(setattr, self.ctl.time, "sleep", self.ctl.time.sleep)     # ctl.time IS the stdlib module: restore it
         self.ctl.time.sleep = lambda s: None
         self.status_outputs = ["Disconnected", "Status update: Connected"]
         self.restart_status = 204
@@ -264,6 +265,7 @@ class Service(unittest.TestCase):
         self.status_outputs = ["Disconnected"]
         self.ctl.READY_TIMEOUT = 60
         clock = iter(range(0, 1000, 4))
+        self.addCleanup(setattr, self.ctl.time, "time", self.ctl.time.time)
         self.ctl.time.time = lambda: next(clock)
         result = self.ctl.rotate()
         self.assertFalse(result["ok"])

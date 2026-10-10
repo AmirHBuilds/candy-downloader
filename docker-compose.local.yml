@@ -1,0 +1,18 @@
+# LOCAL DEBUGGING of the web app, on your own computer (no domain, no HTTPS, no Caddy):
+#
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build
+#   then open  http://localhost:8080   (change the port with WEB_LOCAL_PORT in .env)
+#
+# Needs WEB_ADMIN_USER / WEB_ADMIN_PASSWORD in .env for the first admin. The port is published on 127.0.0.1 ONLY,
+# so other machines on your network can't reach it. Don't use this file on the VPS: there, use the `web` profile
+# (Caddy gives you HTTPS) as described in .env.example.
+# No Telegram token or Docker at all? Run just the web app with:  cd bot && python web_dev.py
+services:
+  bot:
+    ports:
+      - "127.0.0.1:${WEB_LOCAL_PORT:-8080}:8080"
+    environment:
+      WEB_ENABLED: "on"
+      WEB_COOKIE_SECURE: "off"            # plain http on localhost
+      WEB_TRUST_PROXY: "off"              # nothing in front of the app: never believe X-Forwarded-For
+      WEB_PUBLIC_URL: http://localhost:${WEB_LOCAL_PORT:-8080}

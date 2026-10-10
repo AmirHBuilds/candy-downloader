@@ -61,6 +61,8 @@ from utils.cleanup import drop_server_copy, sweep_orphaned_workspaces
 from utils import housekeeping
 from utils.safe_logging import install_safe_logging
 from utils.text import esc
+from utils.webchat import RoutingBot
+from web import accounts as web_accounts, botcmds as web_botcmds, shares as web_shares
 from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -432,6 +434,158 @@ async def cookies_file_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     if kept:
         note += f"\nYour other cookies ({kept}) were kept."
     await update.message.reply_text(note)
+
+
+# ---------- web accounts and "Get a link" ----------
+
+async def _delete_later(bot, chat_id: int, message_id: int, seconds: int) -> None:
+    await asyncio.sleep(seconds)
+    try:
+        await bot.delete_message(chat_id, message_id)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def weblogin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Gives the person a web login (or a fresh password) - tied to their Telegram account."""
+    if not await gate(update, context):
+        return
+    if not config.WEB_ENABLED:
+        await update.message.reply_text("The web app isn't switched on here.")
+        return
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("Ask me this in a private chat - it contains a password.")
+        return
+    user = update.effective_user
+    role = "admin" if is_owner_or_admin(user.id) else "user"
+    account, password, created = await asyncio.to_thread(web_accounts.issue_for_telegram, user.id, user.username, role)
+    sent = await update.message.reply_text(web_botcmds.credentials_text(account, password, created, config.WEB_PUBLIC_URL),
+                                           parse_mode=ParseMode.HTML)
+    asyncio.create_task(_delete_later(context.bot, sent.chat_id, sent.message_id, 120))
+
+
+async def webaccount_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admins: add / reset / block / delete web accounts from the chat."""
+    if not is_owner_or_admin(update.effective_user.id):
+        return
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("Use this in a private chat - it shows passwords.")
+        return
+    reply = await asyncio.to_thread(web_botcmds.admin_command, list(context.args or []), config.WEB_PUBLIC_URL)
+    sent = await update.message.reply_text(reply, parse_mode=ParseMode.HTML)
+    if "Password:" in reply:
+        asyncio.create_task(_delete_later(context.bot, sent.chat_id, sent.message_id, 120))
+        await _delete_quietly(update.message)
+
+
+def _left_text(expires: float) -> str:
+    left = max(0, int(expires - time.time()))
+    return f"{left // 86400}d" if left >= 172800 else f"{max(1, left // 3600)}h" if left >= 3600 else f"{max(1, left // 60)}m"
+
+
+async def uploader_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """🔗 Get a link: keep the delivered file(s) on this server and send back a download link (web/shares.py)."""
+    query = update.callback_query
+    if not await gate_callback(update, context):
+        return                                   # gate_callback already answered the button
+    user_id = update.effective_user.id
+    parts = (query.data or "").split("|")
+    rid = parts[-1] if len(parts) > 2 else ""
+    files = job_manager.cached_files(rid, user_id)
+    if not files:
+        await query.answer("That file isn't kept any more - download it again.", show_alert=True)
+        return
+    if not web_shares.available():
+        await query.answer("Links are switched off.", show_alert=True)
+        return
+    if user_id in _uploading:
+        await query.answer("Already working on it - one moment.")
+        return
+    await query.answer("Making your link…")
+    _uploading.add(user_id)
+    lines, rows = [], []
+    try:
+        for entry in files[:5]:
+            try:
+                share = await asyncio.to_thread(web_shares.create, user_id, entry["path"], entry["name"])
+                n = len(rows) + 1
+                rows.append([InlineKeyboardButton(f"{n} · 🔒 Sign-in only", callback_data=f"ua|{share.id}|login"),
+                             InlineKeyboardButton("1️⃣ Once", callback_data=f"ua|{share.id}|once"),
+                             InlineKeyboardButton("🗑", callback_data=f"ul|{share.id}")])
+                lines.append(f"🔗 {esc(entry['name'][:60])}\n{esc(web_shares.absolute(share))}\n"
+                             f"<i>works for {_left_text(share.expires)} · /links to manage</i>")
+            except web_shares.ShareError as exc:
+                lines.append(f"✕ {esc(entry['name'][:60])}: {esc(str(exc))}")
+    finally:
+        _uploading.discard(user_id)
+    await context.bot.send_message(query.message.chat_id, "\n\n".join(lines), parse_mode=ParseMode.HTML,
+                                   disable_web_page_preview=True, reply_markup=InlineKeyboardMarkup(rows) if rows else None)
+
+
+async def link_options_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """The buttons under a new link: make it sign-in only, or one download only (owner-checked)."""
+    query = update.callback_query
+    if not await gate_callback(update, context):
+        return
+    try:
+        _, raw_id, action = (query.data or "").split("|")
+        share_id = int(raw_id)
+    except ValueError:
+        await query.answer()
+        return
+    change = {"login": {"access": web_shares.LOGIN}, "once": {"max_downloads": 1}}.get(action)
+    share = await asyncio.to_thread(web_shares.update, share_id, update.effective_user.id, change) if change else None
+    if share is None:
+        await query.answer("That link is gone.", show_alert=True)
+        return
+    await query.answer("🔒 Only people signed in to the web app can open it now." if action == "login"
+                       else "1️⃣ It works for one download, then it's gone.", show_alert=True)
+
+
+def _flags(item) -> str:
+    return "".join((" 🔒" if item.access == web_shares.LOGIN else " 👤" if item.access == web_shares.OWNER else "",
+                    " 🔑" if item.pw_hash else "", " 1️⃣" if item.max_downloads == 1 else ""))
+
+
+def _links_view(user_id: int):
+    items = web_shares.list_for(user_id)
+    if not items:
+        return "🔗 You have no active links. Tap <b>Get a link</b> under a finished download to make one.", None
+    lines, rows = ["🔗 <b>Your links</b>"], []
+    for number, item in enumerate(items[:10], 1):
+        limit = f" · {item.downloads}/{item.max_downloads}" if item.max_downloads else f" · {item.downloads} downloads"
+        lines.append(f"{number}. {esc(item.name[:50])}{_flags(item)} ({item.size / 1_000_000:.1f} MB, {_left_text(item.expires)} left{limit})\n"
+                     f"{esc(web_shares.absolute(item))}")
+        rows.append([InlineKeyboardButton(f"🗑 Delete {number}", callback_data=f"ul|{item.id}")])
+    return "\n\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+async def links_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await gate(update, context):
+        return
+    if not web_shares.available():
+        await update.message.reply_text("Links aren't switched on here.")
+        return
+    text, markup = _links_view(update.effective_user.id)
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup, disable_web_page_preview=True)
+
+
+async def links_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not await gate_callback(update, context):
+        return
+    user_id = update.effective_user.id
+    try:
+        share_id = int((query.data or "").split("|")[1])
+    except (IndexError, ValueError):
+        await query.answer()
+        return
+    await query.answer("Deleted" if await asyncio.to_thread(web_shares.delete, share_id, user_id) else "Already gone")
+    text, markup = _links_view(user_id)
+    await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup, disable_web_page_preview=True)
+
+
+_uploading: set[int] = set()
 
 
 async def _show_cookies_screen(query, user_id: int) -> None:
@@ -1159,11 +1313,7 @@ async def _start_tool(bot, user_id: int, chat_id: int, message_id: int, rid: str
     """Queue a toolbox job for the stored file. False = already working on it."""
     if job_manager.is_active(rid):
         return False
-    settings = dict(get_settings(user_id))
-    settings.update(tool=tool, tool_input=str(item.path), tool_name=item.name, tool_duration=item.info.duration,
-                    tool_has_video=item.info.has_video, tool_height=item.info.height, adhd_mode=False, **params)
-    if item.srt is not None:
-        settings["tool_srt"] = str(item.srt)
+    settings = tools.tool_settings(get_settings(user_id), item, tool, **params)
     url = f"tool://{tool}"
     last_download[rid] = (user_id, url, settings)
     _touch_rid(rid)
@@ -1988,8 +2138,11 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
 async def post_init(application: Application) -> None:
     global job_manager
     sweep_orphaned_workspaces()
-    job_manager = JobManager(application.bot, config.MAX_CONCURRENT_DOWNLOADS)
+    job_manager = JobManager(RoutingBot(application.bot), config.MAX_CONCURRENT_DOWNLOADS)
     job_manager.start()
+    if config.WEB_ENABLED:
+        from web import server as web_server          # only loaded when the web app is on
+        application.bot_data["web_tasks"] = await web_server.start(job_manager, application.bot)
     asyncio.create_task(run_update_once(application.bot, notify_admins=False))
     asyncio.create_task(daily_update_loop(application.bot, config.AUTO_UPDATE_HOUR_UTC))
     asyncio.create_task(_sweep_stale_link_state_loop())
@@ -2034,6 +2187,12 @@ def main() -> None:
     app.add_handler(CommandHandler("potcheck", potcheck_cmd))
     app.add_handler(CommandHandler("cookies", cookies_cmd))
     app.add_handler(CommandHandler(config.OWNER_ADMIN_COMMAND, owner_admin_cmd))
+    app.add_handler(CommandHandler("weblogin", weblogin_cmd))
+    app.add_handler(CommandHandler("webaccount", webaccount_cmd))
+    app.add_handler(CallbackQueryHandler(uploader_callback, pattern=r"^up\|"))
+    app.add_handler(CallbackQueryHandler(links_callback, pattern=r"^ul\|"))
+    app.add_handler(CallbackQueryHandler(link_options_callback, pattern=r"^ua\|"))
+    app.add_handler(CommandHandler("links", links_cmd))
     app.add_handler(MessageHandler(filters.Document.FileExtension("txt"), cookies_file_handler))
     app.add_handler(MessageHandler(filters.Document.FileExtension("srt"), srt_handler))
     app.add_handler(MessageHandler(

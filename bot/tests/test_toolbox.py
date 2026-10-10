@@ -727,6 +727,8 @@ class Handlers(unittest.IsolatedAsyncioTestCase):
 
         async def allow(*a, **k):
             return True
+        self.addCleanup(setattr, main, "gate", main.gate)
+        self.addCleanup(setattr, main, "gate_callback", main.gate_callback)
         main.gate, main.gate_callback = allow, allow
 
         async def noop(message):
@@ -1091,6 +1093,7 @@ class MiscMenu(unittest.IsolatedAsyncioTestCase):
 
         async def allow(*a, **k):
             return True
+        self.addCleanup(setattr, main, "gate_callback", main.gate_callback)
         main.gate_callback = allow
         await main.misc_callback(FakeUpdate(bot, FakeQuery("misc|tools", bot)), FakeContext(bot))
         self.assertIn("Tools", bot.last["text"])

@@ -8,3 +8,6 @@ aiosqlite==0.20.0
 aiofiles==24.1.0
 # gallery-dl talks through requests, which needs this to use a SOCKS proxy (the bundled WARP container)
 PySocks
+# web app (see web/): the HTTP server and encryption for the uploader key
+starlette
+uvicorn

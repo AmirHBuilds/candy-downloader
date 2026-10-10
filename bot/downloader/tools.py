@@ -438,6 +438,16 @@ class StoredInput:
     extra: dict = field(default_factory=dict)
 
 
+def tool_settings(base: dict, item, tool: str, **params) -> dict:
+    """The job settings for running one tool on a stored upload (shared by the bot and the web app)."""
+    settings = dict(base)
+    settings.update(tool=tool, tool_input=str(item.path), tool_name=item.name, tool_duration=item.info.duration,
+                    tool_has_video=item.info.has_video, tool_height=item.info.height, adhd_mode=False, **params)
+    if item.srt is not None:
+        settings["tool_srt"] = str(item.srt)
+    return settings
+
+
 class InputStore:
     """The files people sent, kept on disk while they choose a tool. Keyed by the request id (rid) that the
     toolbox buttons carry. Removed after a successful job, when the person walks away (TTL), and at startup

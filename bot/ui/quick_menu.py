@@ -180,14 +180,21 @@ def _markup(*rows) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([row for row in rows if row])
 
 
-def send_as_file_menu(rid: str, url: str, label: str = "▤ Send as file instead") -> InlineKeyboardMarkup:
-    return _markup([InlineKeyboardButton(label, callback_data=f"dl|asfile|{rid}")], link_row(url))
+def get_link_row(rid: str) -> list[InlineKeyboardButton]:
+    """"Get a link": keep the delivered file(s) on this server and send a download link (see web/shares.py)."""
+    return [InlineKeyboardButton("🔗 Get a link", callback_data=f"up|link|{rid}")]
 
 
-def sent_menu(url: str) -> InlineKeyboardMarkup:
+def send_as_file_menu(rid: str, url: str, label: str = "▤ Send as file instead",
+                      get_link: bool = False) -> InlineKeyboardMarkup:
+    return _markup([InlineKeyboardButton(label, callback_data=f"dl|asfile|{rid}")],
+                   get_link_row(rid) if get_link else [], link_row(url))
+
+
+def sent_menu(url: str, get_link_rid: str | None = None) -> InlineKeyboardMarkup:
     """Attached to audio/document sends, which have no "send as file"
     choice of their own - just keeps the source link copyable."""
-    return _markup(link_row(url))
+    return _markup(get_link_row(get_link_rid) if get_link_rid else [], link_row(url))
 
 
 def redo_menu(rid: str, url: str) -> InlineKeyboardMarkup:

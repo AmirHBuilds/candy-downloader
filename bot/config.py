@@ -79,3 +79,23 @@ BOT_API_CLEANUP = os.getenv("BOT_API_CLEANUP", "on").strip().lower() != "off"
 WARP_CONTROL_URL = os.getenv("WARP_CONTROL_URL", "").strip().rstrip("/")
 WARP_CONTROL_TOKEN = os.getenv("WARP_CONTROL_TOKEN", "").strip()
 WARP_ROTATE_COOLDOWN_SECONDS = int(os.getenv("WARP_ROTATE_COOLDOWN_SECONDS", "120"))
+
+# --- Web app (see web/ and the Caddy service in docker-compose.yml) -------------------------------------------------
+# The web server lives inside the bot process (one queue, one set of workers). It listens on the Docker network only;
+# Caddy is what the internet talks to, and it does the HTTPS.
+WEB_ENABLED = os.getenv("WEB_ENABLED", "off").strip().lower() in ("on", "1", "true", "yes")
+WEB_HOST = os.getenv("WEB_HOST", "0.0.0.0").strip()
+WEB_PORT = int(os.getenv("WEB_PORT", "8080"))
+# The browser must send the session cookie only over HTTPS. Turn off ONLY to try it over plain http on localhost.
+WEB_COOKIE_SECURE = os.getenv("WEB_COOKIE_SECURE", "on").strip().lower() not in ("off", "0", "false", "no")
+# Behind Caddy the client's address is the last X-Forwarded-For entry. Off = use the socket address.
+WEB_TRUST_PROXY = os.getenv("WEB_TRUST_PROXY", "on").strip().lower() not in ("off", "0", "false", "no")
+# https://downloads.example.com : the address people open. Optional; a request whose Origin matches it (or its own
+# Host) is accepted, anything else is refused (cross-site protection).
+WEB_PUBLIC_URL = os.getenv("WEB_PUBLIC_URL", "").strip().rstrip("/")
+# First start only: creates this admin when no admin exists yet. Remove the password from .env afterwards.
+WEB_ADMIN_USER = os.getenv("WEB_ADMIN_USER", "").strip()
+WEB_ADMIN_PASSWORD = os.getenv("WEB_ADMIN_PASSWORD", "")
+WEB_FILE_TTL_MINUTES = int(os.getenv("WEB_FILE_TTL_MINUTES", "120"))       # finished files stay downloadable this long
+WEB_QUOTA_MB = int(os.getenv("WEB_QUOTA_MB", "4096"))                      # per account, files waiting to be downloaded
+WEB_MAX_ACTIVE_JOBS = int(os.getenv("WEB_MAX_ACTIVE_JOBS", "3"))           # per account, queued + running

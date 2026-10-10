@@ -1,0 +1,22 @@
+# HTTPS for the CandyDownloader web app. {$WEB_DOMAIN} comes from .env (WEB_DOMAIN=downloads.example.com).
+# With WEB_DOMAIN=localhost Caddy serves a local test certificate instead.
+{$WEB_DOMAIN:localhost} {
+	encode zstd gzip
+
+	# uploads for the Toolbox go up to 2 GB; nothing else needs more than a few KB (the app enforces its own limits too)
+	request_body {
+		max_size 2GB
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		-Server
+	}
+
+	reverse_proxy bot:8080 {
+		# live progress is Server-Sent Events: don't buffer it
+		flush_interval -1
+		# Caddy sets X-Forwarded-For to the real client address; the app takes the LAST entry
+		header_up X-Forwarded-For {remote_host}
+	}
+}
