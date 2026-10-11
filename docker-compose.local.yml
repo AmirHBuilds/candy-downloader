@@ -1,16 +1,12 @@
-# LOCAL DEBUGGING of the web app, on your own computer (no domain, no HTTPS, no Caddy):
+# OPTIONAL. You no longer need this file: docker-compose.yml already publishes the web app on 127.0.0.1:8080, so
+# for local use just put the LOCAL block from .env.example into .env and run:   docker compose up --build
 #
-#   docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build
-#   then open  http://localhost:8080   (change the port with WEB_LOCAL_PORT in .env)
+# This file only sets the local-friendly web settings WITHOUT touching .env. It is an ADD-ON, so it must be used
+# together with the main file (using it alone gives: service "bot" has neither an image nor a build context):
 #
-# Needs WEB_ADMIN_USER / WEB_ADMIN_PASSWORD in .env for the first admin. The port is published on 127.0.0.1 ONLY,
-# so other machines on your network can't reach it. Don't use this file on the VPS: there, use the `web` profile
-# (Caddy gives you HTTPS) as described in .env.example.
-# No Telegram token or Docker at all? Run just the web app with:  cd bot && python web_dev.py
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml up --build
 services:
   bot:
-    ports:
-      - "127.0.0.1:${WEB_LOCAL_PORT:-8080}:8080"
     environment:
       WEB_ENABLED: "on"
       WEB_COOKIE_SECURE: "off"            # plain http on localhost

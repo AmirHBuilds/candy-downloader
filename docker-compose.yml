@@ -107,10 +107,11 @@ services:
       WEB_FILE_TTL_MINUTES: ${WEB_FILE_TTL_MINUTES:-120}
       WEB_QUOTA_MB: ${WEB_QUOTA_MB:-4096}
       WEB_MAX_ACTIVE_JOBS: ${WEB_MAX_ACTIVE_JOBS:-3}
-    # The web app listens on 8080 INSIDE the Docker network only (no `ports:` on purpose): the only way in from the
-    # internet is the caddy service, which adds HTTPS. Nothing else about this container is exposed.
-    expose:
-      - "8080"
+    # The web app (WEB_ENABLED=on in .env) listens on 8080 inside the container. It is published on THIS machine's
+    # loopback only (127.0.0.1), so you can open http://localhost:8080 here, and nobody else on your network or the
+    # internet can reach it. On a VPS the only way in from outside is the caddy service below, which adds HTTPS.
+    ports:
+      - "127.0.0.1:${WEB_LOCAL_PORT:-8080}:8080"
     # Keeps a heavy ffmpeg job (converting, exact clip cuts) from taking over your PC. Raise or remove
     # these on a bigger machine; Docker Desktop also has its own CPU/RAM caps under Settings > Resources.
     # The bot runs as PID 1 and starts ffmpeg/aria2c/gallery-dl; without a real init, any child that gets
